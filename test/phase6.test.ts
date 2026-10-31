@@ -236,6 +236,32 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     await expect(remote.removeConnector("mock-github-members")).rejects.toThrow(/not found/);
   });
 
+  it("dashboard builder routes: inline test (no-auth only) and remove; page has the new buttons", async () => {
+    const admin = "admin-token-for-builder-1";
+    const app = buildApi({ pool: appPool, env, adminToken: admin, broker: remote, admin: remote });
+    const h = { authorization: `Bearer ${admin}`, "content-type": "text/yaml" };
+    const kev = fixture("cisa-kev.yaml")
+      .replace("base_url: https://www.cisa.gov", "base_url: http://localhost:${env.MOCK_PORT}")
+      .replace("allowed_hosts: [www.cisa.gov]", "allowed_hosts: [localhost]")
+      .replace("/sites/default/files/feeds/known_exploited_vulnerabilities.json", "/public/kev.json");
+    expect((await app.inject({ method: "POST", url: "/v1/configs/test", headers: { "content-type": "text/yaml" }, payload: kev })).statusCode).toBe(401);
+    const t = await app.inject({ method: "POST", url: "/v1/configs/test", headers: h, payload: kev });
+    expect(t.json()).toMatchObject({ ok: true, streams: [{ recordsOnPage: 25 }] });
+    expect((await app.inject({ method: "POST", url: "/v1/configs/test", headers: h, payload: fixture("mock-github-members.yaml") })).statusCode).toBe(409);
+
+    await remote.register(fixture("mock-github-members.yaml"), "add");
+    const del = await app.inject({ method: "DELETE", url: "/v1/connectors/mock-github-members", headers: { authorization: `Bearer ${admin}` } });
+    expect(del.json()).toEqual({ id: "mock-github-members", removed: true, records: 0 });
+    expect((await app.inject({ method: "DELETE", url: "/v1/connectors/mock-github-members", headers: { authorization: `Bearer ${admin}` } })).statusCode).toBe(404);
+
+    const page = (await app.inject({ url: "/" })).body;
+    expect(page).toContain("＋ Add connector");
+    expect(page).toContain('id="open-remove"');
+    const js = await app.inject({ url: "/builder.js" });
+    expect(js.statusCode).toBe(200);
+    expect(js.body).not.toContain("innerHTML");
+  });
+
   it("ledger: chain verifies, and an edited row is detected (run last: it tampers)", async () => {
     await remote.register(fixture("mock-github-members.yaml"), "add");
     expect(await remote.verifyLedger()).toMatchObject({ ok: true });

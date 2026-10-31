@@ -25,6 +25,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/": { file: "index.html", type: "text/html; charset=utf-8" },
   "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
   "/style.css": { file: "style.css", type: "text/css; charset=utf-8" },
+  "/builder.js": { file: "builder.js", type: "text/javascript; charset=utf-8" },
 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
@@ -138,6 +139,17 @@ export function buildApi(opts: ApiOptions) {
     if (typeof value !== "string") throw Object.assign(new Error('send JSON { "value": "..." }'), { statusCode: 400 });
     const r = await needAdmin().putSecret(tenant, ref, value);
     return { stored: true, tenant, ref, chars: r.chars };
+  });
+
+  // Test an unregistered config. The broker allows this only for configs that use no secrets.
+  app.post("/v1/configs/test", { preHandler: requireAdmin }, async (req) => needAdmin().testInline(yamlBody(req)));
+
+  // Remove a connector and its records (through the broker; the app role cannot delete connectors).
+  app.delete("/v1/connectors/:id", { preHandler: requireAdmin }, async (req) => {
+    const { id } = req.params as { id: string };
+    const r = await needAdmin().removeConnector(id);
+    await opts.pool.query("delete from pgboss.job where data->>'connectorId' = $1 and state in ('created', 'retry')", [id]).catch(() => {});
+    return { id, ...r };
   });
 
   app.post("/v1/connectors/:id/test", { preHandler: requireAdmin }, async (req, reply) => {

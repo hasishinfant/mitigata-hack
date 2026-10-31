@@ -6,6 +6,7 @@
   <title>IntegrateX · Health</title>
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
+  <script src="/builder.js" defer></script>
 </head>
 <body>
   <header>
@@ -14,6 +15,9 @@
       <button class="tab active" data-tab="connectors">Connectors</button>
       <button class="tab" data-tab="records">Records</button>
       <button class="tab" data-tab="quarantine">Quarantine</button>
+      <span class="sep" aria-hidden="true">|</span>
+      <button class="tab" data-tab="add">＋ Add connector</button>
+      <button id="open-remove">Remove connector</button>
     </nav>
     <div class="right">
       <span id="updated" class="muted"></span>
@@ -43,7 +47,135 @@
       <p class="muted">Records that failed mapping. Raw payloads are secret-scanned before storage.</p>
       <div id="quarantine"></div>
     </section>
+    <section id="tab-add" class="hidden">
+      <div class="builder">
+        <form id="b-form" class="b-form" autocomplete="off">
+          <fieldset>
+            <legend>Start from</legend>
+            <select id="b-template">
+              <option value="blank">Blank</option>
+              <option value="cisa">CISA KEV (public feed, no auth)</option>
+              <option value="github">GitHub org members (Bearer token)</option>
+              <option value="nvd">NVD CVEs (API key, offset paging)</option>
+            </select>
+          </fieldset>
+
+          <fieldset>
+            <legend>Source</legend>
+            <label>Connector id <input name="id" placeholder="cisa-kev"></label>
+            <label>Source name <input name="source" placeholder="cisa_kev"></label>
+            <label>Tenant <input name="tenant" value="demo"></label>
+            <label>Base URL <input name="base_url" placeholder="https://www.cisa.gov"></label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Authentication</legend>
+            <label>Type
+              <select name="auth">
+                <option value="none">none</option>
+                <option value="api_key">API key</option>
+                <option value="bearer">Bearer token</option>
+                <option value="basic">Basic (username + password)</option>
+                <option value="oauth2_client_credentials">OAuth2 client credentials</option>
+              </select>
+            </label>
+            <div data-auth="api_key">
+              <label>Send in <select name="key_in"><option>header</option><option>query</option></select></label>
+              <label>Header / param name <input name="key_name" placeholder="apiKey"></label>
+              <label>Prefix (optional) <input name="key_prefix" placeholder="e.g. SSWS "></label>
+            </div>
+            <div data-auth="oauth2_client_credentials">
+              <label>Token URL <input name="token_url" placeholder="/oauth2/v1/token"></label>
+              <label>Client auth <select name="client_auth"><option>client_secret_basic</option><option>client_secret_post</option></select></label>
+              <label>Scopes (space-separated) <input name="scopes" placeholder="okta.users.read"></label>
+            </div>
+            <div id="b-secrets"></div>
+            <p class="muted small">Secrets go straight to the broker (write-only). They are never shown, logged or put in the config.</p>
+          </fieldset>
+
+          <fieldset>
+            <legend>Endpoint</legend>
+            <label>Entity
+              <select name="entity"><option value="event">event / alert</option><option value="user">user</option><option value="device">device</option></select>
+            </label>
+            <label>Stream name <input name="stream" value="main"></label>
+            <label>GET path <input name="path" placeholder="/sites/default/files/feeds/known_exploited_vulnerabilities.json"></label>
+            <label>Query params (one per line, key=value) <textarea name="params" rows="2" placeholder="per_page=100"></textarea></label>
+            <label>Records path <input name="records_path" placeholder="vulnerabilities[*]  ($ = whole body)"></label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Pagination</legend>
+            <label>Style
+              <select name="pagination">
+                <option value="none">none (single page)</option>
+                <option value="link_header">Link header (next link)</option>
+                <option value="offset">offset / limit</option>
+                <option value="page_number">page number</option>
+                <option value="cursor">cursor token in body</option>
+                <option value="body_link">next URL in body</option>
+              </select>
+            </label>
+            <div data-page="offset">
+              <label>Offset param <input name="offset_param" placeholder="startIndex"></label>
+              <label>Limit param <input name="limit_param" placeholder="resultsPerPage"></label>
+              <label>Page size <input name="limit" placeholder="100"></label>
+              <label>Total path (optional) <input name="total_path" placeholder="totalResults"></label>
+            </div>
+            <div data-page="page_number">
+              <label>Page param <input name="page_param" placeholder="page"></label>
+              <label>Size param <input name="size_param" placeholder="per_page"></label>
+              <label>Page size <input name="size" placeholder="100"></label>
+            </div>
+            <div data-page="cursor">
+              <label>Token path in body <input name="token_path" placeholder="nextPageToken"></label>
+              <label>Token query param <input name="token_param" placeholder="nextPageToken"></label>
+              <label>Is-last path (optional) <input name="is_last_path" placeholder="isLast"></label>
+            </div>
+            <div data-page="body_link">
+              <label>Next URL path in body <input name="next_path" placeholder="nextLink"></label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Mapping to the common schema</legend>
+            <p class="muted small">Source path in the record (a.b.c, a[0], a[*]). Start with = for a constant, e.g. =critical.</p>
+            <div id="b-mapping"></div>
+            <label>Extra attributes to keep (comma-separated paths) <input name="attributes" placeholder="dueDate, requiredAction"></label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Schedule and policy</legend>
+            <label>Run every <input name="every" value="1h" placeholder="15m, 1h, 24h"></label>
+            <label>Allowed hosts (auto from base URL) <input name="allowed_hosts" placeholder="www.cisa.gov"></label>
+          </fieldset>
+        </form>
+
+        <div class="b-right">
+          <div class="b-head"><strong>Generated config</strong><span id="b-valid" class="muted">fill in the form…</span></div>
+          <textarea id="b-yaml" spellcheck="false" aria-label="Generated connector YAML (editable)"></textarea>
+          <div class="muted small">Editable. Editing here takes over from the form; pick a template to start again.</div>
+          <div id="b-issues"></div>
+          <div class="b-actions">
+            <button id="b-test" type="button" title="Only for configs without secrets">Test (no secrets)</button>
+            <button id="b-register" type="button" class="primary">Save secrets · register · test</button>
+            <button id="b-run" type="button" disabled>Run now</button>
+          </div>
+          <div class="b-log-head">Live output</div>
+          <pre id="b-log" aria-live="polite"></pre>
+        </div>
+      </div>
+    </section>
   </main>
+
+  <dialog id="remove">
+    <div class="dialog-head"><strong>Remove a connector</strong><button id="remove-close">Close</button></div>
+    <p class="muted">Deletes the connector, its config versions, runs and every record it stored. Secrets are kept (remove them with <code>ix secret rm</code>).</p>
+    <label>Connector <select id="remove-select"></select></label>
+    <label>Type the connector id to confirm <input id="remove-confirm" autocomplete="off"></label>
+    <div class="b-actions"><button id="remove-go" class="danger" disabled>Remove</button></div>
+    <pre id="remove-log"></pre>
+  </dialog>
 
   <dialog id="panic-result">
     <div class="dialog-head"><strong>Panic: revocation checklist</strong><button id="panic-close">Close</button></div>

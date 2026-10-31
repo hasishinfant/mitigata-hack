@@ -207,7 +207,7 @@ async function loadQuarantine() {
 for (const b of document.querySelectorAll(".tab"))
   b.addEventListener("click", () => {
     for (const x of document.querySelectorAll(".tab")) x.classList.toggle("active", x === b);
-    for (const t of ["connectors", "records", "quarantine"]) $(`tab-${t}`).classList.toggle("hidden", t !== b.dataset.tab);
+    for (const t of ["connectors", "records", "quarantine", "add"]) $(`tab-${t}`).classList.toggle("hidden", t !== b.dataset.tab);
     if (b.dataset.tab === "records") loadRecords();
     if (b.dataset.tab === "quarantine") loadQuarantine();
   });
