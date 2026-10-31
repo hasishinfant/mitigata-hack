@@ -9,7 +9,7 @@ code { background: var(--panel); padding: 1px 5px; border-radius: 4px; }
 .hidden { display: none !important; }
 header { display: flex; align-items: center; gap: 24px; padding: 14px 24px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 2; }
 .brand { font-weight: 700; font-size: 16px; }
-nav { display: flex; gap: 4px; }
+nav { display: flex; gap: 4px; align-items: center; }
 .right { margin-left: auto; display: flex; gap: 12px; align-items: center; }
 button, select, input { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font: inherit; }
 button { cursor: pointer; }
@@ -58,7 +58,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 .kv div:nth-child(odd) { color: var(--muted); }
 .scope-bad { color: var(--red); font-weight: 600; } .scope-extra { color: var(--amber); }
 
-.sep { color: var(--line); padding: 0 4px; align-self: center; user-select: none; }
+.sep { display: inline-block; width: 0; height: 26px; border-left: 2px solid var(--muted); margin: 0 12px; align-self: center; font-size: 0; user-select: none; }
 .small { font-size: 12px; }
 .primary { border-color: var(--blue); background: #172554; }
 .builder { display: grid; grid-template-columns: minmax(340px, 460px) 1fr; gap: 18px; align-items: start; }
