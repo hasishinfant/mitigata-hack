@@ -28,7 +28,7 @@ Engine features added in Phase 4 because of this list. All are generic and conta
 
 | Product | Auth | Paging / shape | Status |
 |---|---|---|---|
-| Elastic Security | `Authorization: ApiKey …` | `POST _search`, `from`/`size` in body, `hits.total.value` | ✅ 🧪 `elastic-security-alerts.yaml` (read-only POST) |
+| Elastic Security | `Authorization: ApiKey …` (project API key, read-only on `.alerts-security.alerts-*`) | `POST _search`, `from`/`size` in body, `hits.total.value` | ✅ 🟢 **verified live** on an Elastic Cloud Serverless Security project: real detection alerts, mapped with no config change. `elastic-security-alerts.yaml` (read-only POST) |
 | Palo Alto Cortex XSIAM | API key header + non-secret key-id header | POST search with `search_from`/`search_to` in body | ✅ read-only POST; key id goes in `request.headers` |
 | ManageEngine Log360 | API key | REST, mostly on-prem | 🔴 on-prem, varies by version |
 | LogRhythm | Bearer token | REST (search API is async: submit, then poll) | 🟡 async search jobs |
