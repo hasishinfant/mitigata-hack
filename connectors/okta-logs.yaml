@@ -12,8 +12,9 @@ connection:
     type: oauth2_client_credentials
     token_url: /oauth2/v1/token
     client_id_ref: okta_client_id
-    client_auth: private_key_jwt
-    private_key_ref: okta_private_key
+    client_auth: client_secret_basic          # Okta API Service Integration: client secret
+    client_secret_ref: okta_client_secret
+    revocation_url: /oauth2/v1/revoke         # lets ix panic revoke the token at Okta
     scopes: [okta.logs.read]
 
 streams:
