@@ -1,0 +1,30 @@
+# Netskope alerts -> events. API token in a custom header, offset paging with no total (stops on a short page).
+# Endpoint and field names from Netskope's public REST v2 docs; verify before live use.
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: netskope-alerts, source: netskope, tenant: demo, owner: secops@example.com }
+connection:
+  base_url: ${env.NETSKOPE_API:-https://example.goskope.com}
+  auth: { type: api_key, in: header, name: Netskope-Api-Token, secret_ref: netskope_token }
+streams:
+  - name: alerts
+    entity: event
+    request: { method: GET, path: /api/v2/events/data/alert }
+    records_path: "result[*]"
+    pagination: { type: offset, offset_param: offset, limit_param: limit, limit: 100 }
+    mapping:
+      id:          { path: _id, required: true }
+      type:        { path: alert_type, required: true }
+      severity:    { path: severity, map_enum: { low: low, medium: medium, high: high, critical: critical }, default: info }
+      timestamp:   { path: timestamp, transform: from_epoch_s, required: true }
+      description: { concat: [alert_name, { lit: " - " }, user] }
+      attributes:  { pick: [user, app, alert_name] }
+schedule: { every: 15m }
+reliability: { rate_limit: { requests_per_minute: 60 } }
+policy:
+  allowed_hosts: ["${env.NETSKOPE_HOST:-example.goskope.com}"]
+  allowed_paths: [/api/v2/events/data/alert]
+  methods: [GET]
+  max_requests_per_run: 100
+credential: { max_age_days: 90, idle_disable_days: 14 }
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }

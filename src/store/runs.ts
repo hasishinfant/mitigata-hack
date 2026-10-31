@@ -90,7 +90,10 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
     },
 
     async pause(connectorId, until, reason) {
-      await pool.query("update connectors set status = 'paused', paused_until = $2, disabled_reason = $3 where id = $1", [connectorId, until, reason]);
+      // Never over a disabled connector: a breaker must not turn "disabled" into "paused" (and later "enabled").
+      await pool.query("update connectors set status = 'paused', paused_until = $2, disabled_reason = $3 where id = $1 and status <> 'disabled'", [
+        connectorId, until, reason,
+      ]);
     },
 
     async resume(connectorId) {

@@ -77,3 +77,19 @@ export async function loadConnectorFile(file: string, env = process.env): Promis
   if (!res.ok || !res.config) throw new ConfigError(file, res.errors);
   return resolveConnector(res.config, res.configHash);
 }
+
+/** Secret refs a connector sends to its provider (auth credentials). */
+export function credentialRefs(conn: Pick<ConnectorConfig, "connection">): string[] {
+  const a = conn.connection.auth;
+  switch (a.type) {
+    case "api_key":
+    case "bearer":
+      return [a.secret_ref];
+    case "basic":
+      return [a.username_ref, a.password_ref];
+    case "oauth2_client_credentials":
+      return [a.client_id_ref, a.client_auth === "private_key_jwt" ? a.private_key_ref : a.client_secret_ref].filter((x): x is string => Boolean(x));
+    default:
+      return [];
+  }
+}

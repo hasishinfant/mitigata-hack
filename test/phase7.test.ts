@@ -63,6 +63,8 @@ describe.skipIf(!hasDb)("breach features", () => {
   let boss: PgBoss;
   let env: Record<string, string | undefined>;
   const socketPath = join(tmpdir(), `ixb7-${process.pid}.sock`);
+  const adminSocketPath = join(tmpdir(), `ixb7a-${process.pid}.sock`);
+  const adminToken = randomBytes(16).toString("hex");
 
   beforeAll(async () => {
     mock = buildMock();
@@ -71,14 +73,16 @@ describe.skipIf(!hasDb)("breach features", () => {
     appPool = createPool(testUrl("DATABASE_URL_APP"));
     adminPool = createPool(testUrl("DATABASE_URL_ADMIN"));
     brokerPool = createPool(testUrl("DATABASE_URL_BROKER"));
-    server = createBrokerServer({ pool: brokerPool, masterKey: randomBytes(32), env, alertHosts: ["localhost"] });
+    server = createBrokerServer({ pool: brokerPool, masterKey: randomBytes(32), env, alertHosts: ["localhost"], adminToken });
     await listenOnSocket(server.app, socketPath);
-    remote = createRemoteBroker(socketPath);
+    await listenOnSocket(server.adminApp, adminSocketPath);
+    remote = createRemoteBroker(socketPath, { adminSocketPath, adminToken });
     boss = await startBoss(testUrl("DATABASE_URL_APP"));
   }, 60_000);
   afterAll(async () => {
     await boss?.stop({ graceful: false });
     await server?.app.close();
+    await server?.adminApp.close();
     await Promise.all([appPool?.end(), adminPool?.end(), brokerPool?.end()]);
     await mock?.app.close();
   });
@@ -165,8 +169,13 @@ describe.skipIf(!hasDb)("breach features", () => {
     expect((await appPool.query("select kind from alerts where kind = 'panic'")).rowCount).toBe(1);
     expect((await appPool.query("select decision from audit_ledger where action = 'panic'")).rows[0].decision).toBe("allow: 1 revoked, 0 secrets purged");
 
-    // Recovery: re-enable one; the broker has to mint a fresh token (the old one is gone everywhere).
-    await setConnectorEnabled(appPool, "mock-okta-oauth", true);
+    // The kill switch can't be undone with the app DB role (a compromised worker or API).
+    await expect(setConnectorEnabled(appPool, "mock-okta-oauth", true)).rejects.toThrow(/only the broker can re-enable/);
+    await expect(appPool.query("update connectors set status = 'paused' where id = 'mock-okta-oauth'")).rejects.toThrow(/only the broker/);
+
+    // Recovery: re-enable one through the broker; it has to mint a fresh token (the old one is gone everywhere).
+    await remote.enableConnector("mock-okta-oauth");
+    expect((await appPool.query("select decision from audit_ledger where action = 'enable' and connector_id = 'mock-okta-oauth'")).rows).toEqual([{ decision: "allow" }]);
     await remote.forget("mock-okta-oauth");
     expect((await run("mock-okta-oauth")).status).toBe("success");
     expect(mock.oauth.tokenCalls).toBe(2);
@@ -200,7 +209,7 @@ describe.skipIf(!hasDb)("breach features", () => {
     expect(c.disabled_reason).toMatch(/^idle for 15 days \(idle_disable_days: 14\)/);
     expect((await appPool.query("select kind from alerts")).rows).toEqual([{ kind: "idle_disabled" }]);
 
-    await setConnectorEnabled(appPool, "mock-github-members", true);
+    await remote.enableConnector("mock-github-members");
     expect((await runHygiene(appPool, { now: Date.now() + 1 * DAY, env })).disabled).toEqual([]);
 
     await remote.register(ghWith("credential: { max_age_days: 90 }"), "update");

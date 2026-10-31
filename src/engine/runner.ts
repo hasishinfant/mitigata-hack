@@ -3,12 +3,12 @@
 // Failed runs resume from the checkpoint; repeated failures open a circuit breaker;
 // a sudden drop in field hit rate marks the run degraded (schema drift).
 // Provider-agnostic: everything provider-specific comes from the config.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ResolvedConnector } from "../config/load.ts";
 import type { Entity, StreamConfig } from "../config/schema.ts";
 import { log } from "../log.ts";
 import { mapRecord, type MappedRecord } from "../mapping/mapper.ts";
-import { resolvePath } from "../mapping/paths.ts";
+import { hasWildcard, probePath, resolvePath } from "../mapping/paths.ts";
 import { redactValue } from "../mapping/scanner.ts";
 import { toIso } from "../mapping/transforms.ts";
 import { BrokerError, type Broker } from "../broker/types.ts";
@@ -71,6 +71,7 @@ export type RunSummary = {
   resumed: boolean;
   incrementalFrom?: string; // watermark injected for this run
   watermark?: string; // new watermark saved after this run
+  watermarkHeld?: string; // why the watermark did not advance (fully or partly)
   lastError?: string;
 };
 
@@ -111,11 +112,31 @@ export function buildBaseUrl(conn: ResolvedConnector, stream: StreamConfig): URL
   return url;
 }
 
+const kindOf = (v: unknown) => (v === null ? "null" : Array.isArray(v) ? "array" : typeof v);
+
+/**
+ * Records from one response, with the envelope checked. A 200 whose shape is not what the config
+ * declares (missing records key, empty body, error object) is a failure, never "0 records, success":
+ *   - the key path up to the first [*] must exist (`data: null` is accepted as an explicit empty);
+ *   - with [*], the value at that point must be an array;
+ *   - with `$`, the body must be a JSON array (an empty body is a failure).
+ */
 export function extractRecords(body: unknown, recordsPath: string | undefined): unknown[] {
-  const v = resolvePath(body, recordsPath ?? "$");
+  const path = recordsPath ?? "$";
+  const keys = body && typeof body === "object" && !Array.isArray(body) ? Object.keys(body).slice(0, 8) : [];
+  const hint = keys.length ? ` (response keys: ${keys.join(", ")})` : "";
+  if (body === null && path === "$") throw new RunFailure("failed", "response envelope invalid: empty body, expected a JSON array");
+  const probe = probePath(body, path);
+  if (!probe.found) throw new RunFailure("failed", `response envelope invalid: records_path "${path}" not found, stopped at ${probe.at}${hint}`);
+  if (hasWildcard(path)) {
+    if (!Array.isArray(probe.value))
+      throw new RunFailure("failed", `response envelope invalid: ${probe.at} is ${kindOf(probe.value)}, expected an array for records_path "${path}"${hint}`);
+    return resolvePath(body, path) as unknown[];
+  }
+  const v = probe.value;
   if (Array.isArray(v)) return v;
-  if (v === undefined || v === null) return [];
-  throw new RunFailure("failed", `records_path "${recordsPath ?? "$"}" resolved to ${typeof v}, expected an array`);
+  if (v === null && path !== "$") return []; // the provider said "nothing" explicitly
+  throw new RunFailure("failed", `response envelope invalid: records_path "${path}" is ${kindOf(v)}, expected an array${hint}`);
 }
 
 function classifyHttp(status: number, body: string, retries: number): RunFailure {
@@ -178,6 +199,8 @@ export async function runStream(opts: {
     req = paginator.start({ url: base, ...(stream.request.body ? { body: structuredClone(stream.request.body) } : {}) });
   }
   let maxCursor: string | undefined;
+  let minQuarantined: string | undefined; // earliest cursor among quarantined records
+  let quarantinedWithoutCursor = 0; // quarantined records we can't place in time
   let completed = false;
 
   const summary: RunSummary = {
@@ -190,6 +213,12 @@ export async function runStream(opts: {
   if (resumed) log.info({ ...ctx, path: req?.url.pathname }, "resuming from checkpoint");
 
   let stopReason: string | undefined;
+  // Pagination integrity: a request we already sent, or a page whose content repeats an earlier page,
+  // means the provider is looping (or ignoring our paging params). That is never "complete".
+  const reqKey = (r: PageRequest) => `${r.url.href} ${r.body ? JSON.stringify(r.body) : ""}`;
+  const seenRequests = new Map<string, number>();
+  const seenBodies = new Map<string, number>();
+  if (req) seenRequests.set(reqKey(req), 1);
   try {
     while (req) {
       if (summary.requests >= conn.runtime.maxRequestsPerRun) {
@@ -224,9 +253,14 @@ export async function runStream(opts: {
         const r = mapRecord(raw, stream.entity, stream.mapping);
         stats.records++;
         for (const f of r.present) stats.hits[f] = (stats.hits[f] ?? 0) + 1;
+        // Watermark candidates: only records we accepted. A quarantined record caps the watermark just
+        // below its own cursor, so it is fetched again once the mapping is fixed instead of being skipped forever.
         if (inc) {
           const c = cursorOf(raw, inc.cursor_field);
-          if (c && (!maxCursor || Date.parse(c) > Date.parse(maxCursor))) maxCursor = c;
+          if (r.ok) {
+            if (c && (!maxCursor || Date.parse(c) > Date.parse(maxCursor))) maxCursor = c;
+          } else if (!c) quarantinedWithoutCursor++;
+          else if (!minQuarantined || Date.parse(c) < Date.parse(minQuarantined)) minQuarantined = c;
         }
         if (r.ok) {
           // Data minimisation: raw payloads are kept only if the config opts in, and always secret-redacted.
@@ -238,15 +272,30 @@ export async function runStream(opts: {
           records.push(r.record);
         } else quarantined.push({ raw, errors: r.errors });
       }
-      const next = paginator.next({ req, headers: res.headers, body, records: raws.length });
+      const step = paginator.step({ req, headers: res.headers, body, records: raws.length });
+      let anomaly = step.next === null && step.end === "anomaly" ? step.reason : undefined;
+      if (raws.length > 0) {
+        const digest = createHash("sha256").update(res.body).digest("hex");
+        const earlier = seenBodies.get(digest);
+        if (earlier !== undefined) anomaly ??= `page ${summary.requests} has the same content as page ${earlier} (provider ignoring paging params?)`;
+        else seenBodies.set(digest, summary.requests);
+      }
+      if (!anomaly && step.next) {
+        const earlier = seenRequests.get(reqKey(step.next));
+        if (earlier !== undefined) anomaly = `pagination cycle: the next request is page ${earlier} again`;
+        else seenRequests.set(reqKey(step.next), summary.requests + 1);
+      }
+      const next = anomaly ? null : step.next;
       await store.commitPage({
         runId, connectorId, stream: stream.name, tenant: conn.metadata.tenant, source: conn.metadata.source,
         entity: stream.entity, fetchedAt: new Date(), records, quarantined, requests: 1,
+        // On an anomaly the position is cleared: resuming into a loop would only repeat it.
         checkpoint: next ? { nextUrl: next.url.href, ...(next.body ? { nextBody: next.body } : {}), configHash: conn.configHash } : null,
       });
       summary.recordsOk += records.length;
       summary.recordsQuarantined += quarantined.length;
       log.debug({ ...ctx, page: summary.requests, ok: records.length, quarantined: quarantined.length }, "page committed");
+      if (anomaly) throw new RunFailure("failed", `pagination incomplete after page ${summary.requests}: ${anomaly}`);
 
       if (summary.recordsOk + summary.recordsQuarantined >= conn.runtime.maxRecordsPerRun && next) {
         stopReason = `stopped at policy.max_records_per_run (${conn.runtime.maxRecordsPerRun}); next run continues from checkpoint`;
@@ -278,11 +327,28 @@ export async function runStream(opts: {
     }
   }
 
-  // Advance the watermark only after a run that saw every page: a partial run may have skipped newer records.
-  if (inc && completed && maxCursor && !FAILURE.includes(summary.status) && (!cp?.cursorValue || Date.parse(maxCursor) > Date.parse(cp.cursorValue))) {
-    await store.saveWatermark(connectorId, stream.name, maxCursor);
-    summary.watermark = maxCursor;
-  }
+  // Watermark rules (incremental streams). Advance only when:
+  //   - every page was seen (no cap hit, no pagination anomaly, no failure);
+  //   - the run is not degraded (schema drift: the mapping may be silently dropping data);
+  //   - no quarantined record is missing its cursor (we couldn't tell where it sits).
+  // And never past a quarantined record: stop 1 ms before the earliest one.
+  if (inc && completed && maxCursor && (summary.status === "success" || summary.status === "partial")) {
+    let candidate: string | undefined = maxCursor;
+    let held: string | undefined;
+    if (quarantinedWithoutCursor > 0) {
+      candidate = undefined;
+      held = `${quarantinedWithoutCursor} quarantined record(s) have no ${inc.cursor_field}`;
+    } else if (minQuarantined && Date.parse(minQuarantined) <= Date.parse(maxCursor)) {
+      candidate = new Date(Date.parse(minQuarantined) - 1).toISOString();
+      held = `capped before the earliest quarantined record (${minQuarantined})`;
+    }
+    if (candidate && (!cp?.cursorValue || Date.parse(candidate) > Date.parse(cp.cursorValue))) {
+      await store.saveWatermark(connectorId, stream.name, candidate);
+      summary.watermark = candidate;
+    }
+    if (held) summary.watermarkHeld = held;
+  } else if (inc && summary.status === "degraded") summary.watermarkHeld = "run degraded (schema drift): watermark not advanced";
+  if (summary.watermarkHeld && summary.status !== "degraded") summary.lastError = `${summary.lastError ?? ""}${summary.lastError ? "; " : ""}watermark held: ${summary.watermarkHeld}`;
 
   await store.finishRun({
     runId, connectorId, status: summary.status, requests: summary.requests, retries: summary.retries,

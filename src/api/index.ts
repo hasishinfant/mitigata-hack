@@ -1,13 +1,13 @@
 // API process entry. Binds to loopback only.
-import { assertNoBrokerSecrets, loadAppEnv } from "../envfiles.ts";
+import { assertNoBrokerSecrets, loadAdminEnv } from "../envfiles.ts";
 import { log } from "../log.ts";
 import { createRemoteBroker } from "../broker/remote.ts";
 import { startBoss } from "../scheduler/queue.ts";
 import { createPool } from "../store/db.ts";
 import { buildApi } from "./server.ts";
 
-loadAppEnv();
-assertNoBrokerSecrets("api");
+loadAdminEnv();
+assertNoBrokerSecrets("api", process.env, { adminTokenAllowed: true });
 
 const pool = createPool(process.env.DATABASE_URL_APP);
 const boss = await startBoss(process.env.DATABASE_URL_APP!);

@@ -88,3 +88,27 @@ export function resolvePath(root: unknown, path: string): unknown {
   if (multi) return current.filter((v) => v !== undefined);
   return current[0];
 }
+
+/**
+ * Does the path exist in the document? Walks keys and indexes up to the first `[*]` (or the whole path)
+ * and tells a missing key apart from a key whose value is null. Used to validate a response envelope.
+ */
+export function probePath(root: unknown, path: string): { found: boolean; value: unknown; at: string } {
+  const segs = parsePath(path);
+  let v: unknown = root;
+  let at = "$";
+  for (const seg of segs) {
+    if (seg.kind === "all") break;
+    if (seg.kind === "index") {
+      if (!Array.isArray(v) || seg.index >= v.length) return { found: false, value: undefined, at };
+      v = v[seg.index];
+      at += `[${seg.index}]`;
+    } else {
+      if (v === null || typeof v !== "object" || Array.isArray(v) || !Object.hasOwn(v as object, seg.key))
+        return { found: false, value: undefined, at };
+      v = (v as Record<string, unknown>)[seg.key];
+      at += `.${seg.key}`;
+    }
+  }
+  return { found: true, value: v, at };
+}

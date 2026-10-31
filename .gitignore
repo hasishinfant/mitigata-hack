@@ -4,9 +4,10 @@ dist/
 .env.*
 !.env.example
 !.env.broker.example
+!.env.admin.example
 *.pem
 *.key
 fixtures/**/raw-*
 mock/fixtures/**/raw-*
-coverage/
+/coverage/
 *.log

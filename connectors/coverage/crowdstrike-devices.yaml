@@ -1,0 +1,37 @@
+# CrowdStrike Falcon hosts -> devices. OAuth2 client credentials, offset paging.
+# Endpoint and field names from CrowdStrike's public API docs; verify against your tenant before live use.
+# Set CROWDSTRIKE_API / CROWDSTRIKE_HOST for a regional cloud (e.g. api.us-2.crowdstrike.com) or a mock.
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: crowdstrike-devices, source: crowdstrike, tenant: demo, owner: secops@example.com }
+connection:
+  base_url: ${env.CROWDSTRIKE_API:-https://api.crowdstrike.com}
+  auth:
+    type: oauth2_client_credentials
+    token_url: /oauth2/token
+    client_id_ref: crowdstrike_client_id
+    client_auth: client_secret_post
+    client_secret_ref: crowdstrike_client_secret
+streams:
+  - name: devices
+    entity: device
+    request: { method: GET, path: /devices/combined/devices/v1, params: { sort: last_seen.desc } }
+    records_path: "resources[*]"
+    pagination: { type: offset, offset_param: offset, limit_param: limit, limit: 100, total_path: meta.pagination.total }
+    mapping:
+      id:         { path: device_id, required: true }
+      hostname:   { path: hostname }
+      ip:         { path: local_ip }
+      os:         { concat: [platform_name, { lit: " " }, os_version] }
+      owner:      { path: last_login_user }
+      last_seen:  { path: last_seen, transform: to_iso8601 }
+      attributes: { pick: [platform_name, agent_version, status] }
+schedule: { every: 1h, jitter: 2m }
+reliability: { timeout: 30s, rate_limit: { requests_per_minute: 120, max_wait: 120s } }
+policy:
+  allowed_hosts: ["${env.CROWDSTRIKE_HOST:-api.crowdstrike.com}"]
+  allowed_paths: [/devices/combined/devices/v1, /oauth2/token]
+  methods: [GET]
+  max_requests_per_run: 200
+credential: { expected_scopes: ["hosts:read"], forbid_scopes: ["*:write"], max_age_days: 90, idle_disable_days: 14 }
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }

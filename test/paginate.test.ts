@@ -43,7 +43,7 @@ describe("pagination", () => {
     const p = createPaginator({ type: "page_number", page_param: "page", size_param: "size", size: 10 });
     expect(drive(p, (u) => ({ body: [], records: Number(u.searchParams.get("page")) <= 2 ? 10 : 0 }))).toHaveLength(3);
   });
-  it("cursor stops on isLast and on a repeated token", () => {
+  it("cursor stops on isLast; a repeated token is an anomaly, not the end", () => {
     const p = createPaginator({ type: "cursor", token_path: "next", token_param: "t", stop_when: "is_last_path", is_last_path: "isLast" });
     expect(drive(p, (u) => {
       const n = Number(u.searchParams.get("t") ?? 0);
@@ -51,6 +51,29 @@ describe("pagination", () => {
     })).toHaveLength(3);
     const stuck = createPaginator({ type: "cursor", token_path: "next", token_param: "t" });
     expect(drive(stuck, () => ({ body: { next: "same" }, records: 5 }))).toHaveLength(2);
+    const req = { url: new URL("https://api.example.test/items?t=same") };
+    expect(stuck.step({ req, headers: {}, body: { next: "same" }, records: 5 })).toEqual({ next: null, end: "anomaly", reason: "provider returned the same cursor again" });
+    expect(stuck.step({ req, headers: {}, body: {}, records: 5 })).toEqual({ next: null, end: "complete" });
+  });
+  it("is_last_path: no token while isLast is not true is an anomaly", () => {
+    const p = createPaginator({ type: "cursor", token_path: "next", token_param: "t", stop_when: "is_last_path", is_last_path: "isLast" });
+    expect(p.step({ req: { url: base }, headers: {}, body: { isLast: false }, records: 5 })).toMatchObject({ end: "anomaly" });
+    expect(p.step({ req: { url: base }, headers: {}, body: { isLast: true }, records: 5 })).toEqual({ next: null, end: "complete" });
+  });
+  it("offset with total_path: a missing total or an early empty page is an anomaly", () => {
+    const p = createPaginator({ type: "offset", offset_param: "startIndex", limit_param: "n", limit: 100, total_path: "totalResults" });
+    const req = p.start({ url: base });
+    expect(p.step({ req, headers: {}, body: { message: "x" }, records: 100 })).toMatchObject({ end: "anomaly", reason: expect.stringMatching(/totalResults/) });
+    expect(p.step({ req, headers: {}, body: { totalResults: 500 }, records: 0 })).toMatchObject({ end: "anomaly", reason: expect.stringMatching(/empty page/) });
+    expect(p.step({ req, headers: {}, body: { totalResults: 100 }, records: 100 })).toEqual({ next: null, end: "complete" });
+  });
+  it("link_header / body_link pointing at the same page is an anomaly", () => {
+    const l = createPaginator({ type: "link_header" });
+    expect(l.step({ req: { url: base }, headers: { link: `<${base.href}>; rel="next"` }, body: [], records: 3 })).toMatchObject({ end: "anomaly" });
+    const b = createPaginator({ type: "body_link", next_path: "next" });
+    expect(b.step({ req: { url: base }, headers: {}, body: { next: base.href }, records: 3 })).toMatchObject({ end: "anomaly" });
+    expect(b.step({ req: { url: base }, headers: {}, body: { next: 42 }, records: 3 })).toMatchObject({ end: "anomaly" });
+    expect(b.step({ req: { url: base }, headers: {}, body: { next: null }, records: 3 })).toEqual({ next: null, end: "complete" });
   });
   it("offset without total stops on a short page", () => {
     const p = createPaginator({ type: "offset", offset_param: "offset", limit_param: "limit", limit: 100 });

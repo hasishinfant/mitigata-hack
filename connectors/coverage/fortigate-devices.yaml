@@ -1,0 +1,31 @@
+# Fortinet FortiGate detected devices -> devices. REST API admin token as Bearer, single page.
+# Endpoint and field names from FortiOS REST API docs; verify against your FortiOS version.
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: fortigate-devices, source: fortigate, tenant: demo, owner: netops@example.com }
+connection:
+  base_url: ${env.FORTIGATE_API:-https://fortigate.example.internal}
+  auth: { type: bearer, secret_ref: fortigate_token }
+streams:
+  - name: devices
+    entity: device
+    request: { method: GET, path: /api/v2/monitor/user/device/query }
+    records_path: "results[*]"
+    pagination: { type: none }
+    mapping:
+      id:         { path: mac, required: true }
+      hostname:   { path: hostname }
+      ip:         { path: ipv4_address }
+      os:         { concat: [os_name, { lit: " " }, os_version] }
+      owner:      { path: user }
+      last_seen:  { path: last_seen, transform: from_epoch_s }
+      attributes: { pick: [hardware_vendor] }
+schedule: { every: 30m }
+reliability: { timeout: 20s, rate_limit: { requests_per_minute: 30 } }
+policy:
+  allowed_hosts: ["${env.FORTIGATE_HOST:-fortigate.example.internal}"]
+  allowed_paths: [/api/v2/monitor/user/device/query]
+  methods: [GET]
+  max_requests_per_run: 100
+credential: { max_age_days: 90, idle_disable_days: 14, provider_ip_restriction: yes }
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }

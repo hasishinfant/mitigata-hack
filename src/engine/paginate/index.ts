@@ -5,8 +5,17 @@ import { resolvePath } from "../../mapping/paths.ts";
 
 export type PageRequest = { url: URL; body?: Record<string, unknown> };
 export type PageContext = { req: PageRequest; headers: Record<string, string>; body: unknown; records: number };
+/**
+ * What comes after a page: another request, or the end of the stream and why.
+ *   complete: the provider signalled the last page in the way the config declares.
+ *   anomaly:  paging stopped, but not in a way that proves we saw every page (repeated cursor, missing
+ *             total, a "next" link pointing back at the same page). The run must not count as complete.
+ */
+export type PageStep = { next: PageRequest } | { next: null; end: "complete" } | { next: null; end: "anomaly"; reason: string };
 export interface Paginator {
   start(base: PageRequest): PageRequest;
+  step(page: PageContext): PageStep;
+  /** Next request or null (any kind of end). Kept for callers that only peek, like test connection. */
   next(page: PageContext): PageRequest | null;
 }
 type Pg = StreamConfig["pagination"];
@@ -46,19 +55,31 @@ function withParams(req: PageRequest, where: ParamsIn, params: Record<string, st
   return { url, ...(req.body ? { body: req.body } : {}) };
 }
 
+const go = (next: PageRequest): PageStep => ({ next });
+const done: PageStep = { next: null, end: "complete" };
+const anomaly = (reason: string): PageStep => ({ next: null, end: "anomaly", reason });
+const keep = (req: PageRequest) => (req.body ? { body: req.body } : {});
+
 export function createPaginator(pg: Pg, paramsIn: ParamsIn = "query"): Paginator {
+  const p = strategy(pg, paramsIn);
+  return { start: p.start, step: p.step, next: (page) => p.step(page).next };
+}
+
+function strategy(pg: Pg, paramsIn: ParamsIn): Pick<Paginator, "start" | "step"> {
   switch (pg.type) {
     case "none":
-      return { start: (b) => b, next: () => null };
+      return { start: (b) => b, step: () => done };
 
     case "link_header": {
       const rel = (pg.rel ?? "next").toLowerCase();
       return {
         start: (b) => b,
-        next: ({ req, headers, records }) => {
-          if (records === 0) return null;
+        step: ({ req, headers, records }) => {
+          if (records === 0) return done;
           const next = parseLinkHeader(headers.link, req.url)[rel];
-          return next && next.href !== req.url.href ? { url: next, ...(req.body ? { body: req.body } : {}) } : null;
+          if (!next) return done;
+          if (next.href === req.url.href) return anomaly(`Link rel="${rel}" points at the page just fetched`);
+          return go({ url: next, ...keep(req) });
         },
       };
     }
@@ -66,17 +87,19 @@ export function createPaginator(pg: Pg, paramsIn: ParamsIn = "query"): Paginator
     case "body_link":
       return {
         start: (b) => b,
-        next: ({ req, body, records }) => {
-          if (records === 0) return null;
+        step: ({ req, body, records }) => {
+          if (records === 0) return done;
           const raw = resolvePath(body, pg.next_path);
-          if (typeof raw !== "string" || raw === "") return null;
+          if (raw === undefined || raw === null || raw === "") return done;
+          if (typeof raw !== "string") return anomaly(`${pg.next_path} is ${typeof raw}, expected a URL string`);
           let next: URL;
           try {
             next = new URL(raw, req.url);
           } catch {
-            return null;
+            return anomaly(`${pg.next_path} is not a valid URL`);
           }
-          return next.href !== req.url.href ? { url: next, ...(req.body ? { body: req.body } : {}) } : null;
+          if (next.href === req.url.href) return anomaly(`${pg.next_path} points at the page just fetched`);
+          return go({ url: next, ...keep(req) });
         },
       };
 
@@ -84,15 +107,16 @@ export function createPaginator(pg: Pg, paramsIn: ParamsIn = "query"): Paginator
       const start = pg.start ?? 0;
       return {
         start: (b) => withParams(b, paramsIn, { [pg.offset_param]: start, [pg.limit_param]: pg.limit }),
-        next: ({ req, body, records }) => {
-          if (records === 0) return null;
+        step: ({ req, body, records }) => {
           const offset = num(getParam(req, paramsIn, pg.offset_param)) ?? start;
           const nextOffset = offset + records; // advance by what we actually got (providers may cap page size)
           if (pg.total_path) {
             const total = num(resolvePath(body, pg.total_path));
-            if (total === undefined || nextOffset >= total) return null;
-          } else if (records < pg.limit) return null; // no total: a short page is the last page
-          return withParams(req, paramsIn, { [pg.offset_param]: nextOffset });
+            if (total === undefined) return anomaly(`total_path "${pg.total_path}" missing or not a number: can't tell whether more pages exist`);
+            if (nextOffset >= total) return done;
+            if (records === 0) return anomaly(`empty page at ${pg.offset_param}=${offset}, but ${pg.total_path} says ${total}`);
+          } else if (records < pg.limit) return done; // no total: a short (or empty) page is the last page
+          return go(withParams(req, paramsIn, { [pg.offset_param]: nextOffset }));
         },
       };
     }
@@ -101,10 +125,10 @@ export function createPaginator(pg: Pg, paramsIn: ParamsIn = "query"): Paginator
       const start = pg.start ?? 1;
       return {
         start: (b) => withParams(b, paramsIn, { [pg.page_param]: start, [pg.size_param]: pg.size }),
-        next: ({ req, records }) => {
-          if (records === 0) return null; // stop_when: empty_page
+        step: ({ req, records }) => {
+          if (records === 0) return done; // stop_when: empty_page
           const page = num(getParam(req, paramsIn, pg.page_param)) ?? start;
-          return withParams(req, paramsIn, { [pg.page_param]: page + 1 });
+          return go(withParams(req, paramsIn, { [pg.page_param]: page + 1 }));
         },
       };
     }
@@ -112,14 +136,19 @@ export function createPaginator(pg: Pg, paramsIn: ParamsIn = "query"): Paginator
     case "cursor":
       return {
         start: (b) => b,
-        next: ({ req, headers, body, records }) => {
-          if (pg.is_last_path && resolvePath(body, pg.is_last_path) === true) return null;
-          if (pg.stop_when !== "is_last_path" && records === 0) return null;
+        step: ({ req, headers, body, records }) => {
+          const lastFlag = pg.is_last_path ? resolvePath(body, pg.is_last_path) : undefined;
+          if (lastFlag === true) return done;
+          if (pg.stop_when !== "is_last_path" && records === 0) return done;
           const raw = pg.token_path ? resolvePath(body, pg.token_path) : headers[(pg.token_header ?? "").toLowerCase()];
-          if (raw === undefined || raw === null || raw === "") return null;
+          if (raw === undefined || raw === null || raw === "") {
+            if (pg.stop_when === "is_last_path")
+              return anomaly(`no next cursor, but ${pg.is_last_path} is ${JSON.stringify(lastFlag) ?? "missing"} (expected true on the last page)`);
+            return done;
+          }
           const token = String(raw);
-          if (String(getParam(req, paramsIn, pg.token_param) ?? "") === token) return null; // repeated cursor: stop, don't loop
-          return withParams(req, paramsIn, { [pg.token_param]: token });
+          if (String(getParam(req, paramsIn, pg.token_param) ?? "") === token) return anomaly("provider returned the same cursor again");
+          return go(withParams(req, paramsIn, { [pg.token_param]: token }));
         },
       };
   }

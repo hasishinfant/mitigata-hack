@@ -14,7 +14,7 @@ MOCK_PORT=4010 npx pnpm@10.28.0 dev:mock
 ix rm cisa-kev --yes                 # so step 3 can add it from a blank file
 for c in github-members github-issues okta-users okta-logs nvd-cves; do ix run $c; done
 ix rehearse                          # dry-run: broker, ledger, posture, panic preview (changes nothing)
-open http://localhost:7070           # paste the admin token (IX_ADMIN_TOKEN in .env) into the box
+open http://localhost:7070           # the Kill switch button asks for the admin token (IX_ADMIN_TOKEN in .env)
 ```
 
 Have ready: `test/fixtures/configs/cisa-kev.yaml` open in a side window (the file you will type).
@@ -55,6 +55,8 @@ curl "localhost:4010/__fault?mode=drop&count=100&after=1"; ix run mock-nvd-cves
 #   -> retries 1 s / 2 s / 4 s, fails, keeps checkpoint
 curl "localhost:4010/__fault?mode=clear"; ix run mock-nvd-cves
 #   -> "resumed from checkpoint"
+curl "localhost:4010/__fault?mode=envelope&count=1&after=1"; ix run mock-nvd-cves
+#   -> 200 OK but the wrong shape: failed, "records_path vulnerabilities[*] not found", never "0 records, success"
 ix quarantine                        # bad records with reasons; run was "partial", not crashed
 ```
 Bad key: `ix secret set github_org_pat` (type junk) → `ix run github-members` → `auth_failed`, one attempt, alert raised. Then store the real token again.
@@ -78,6 +80,6 @@ After the demo: `for c in $(psql -d integratex -tAc "select id from connectors")
 **Honest limit, if asked:** none of this stops someone who already stole a provider token from replaying it from their own machine. It shrinks what a breach of the hub itself can hand over.
 
 ## Numbers to quote
-- 139 automated tests; all 4 PRD failure tests pass
+- 163 automated tests; all 4 PRD failure tests pass
 - 6 real connectors (GitHub ×2, Okta ×2, NVD, CISA KEV) plus 5 vendor coverage connectors from the mentors' list
 - 35 mentor products rated in `docs/coverage.md`: 12 fit today, 14 need a small generic feature, 9 out of scope

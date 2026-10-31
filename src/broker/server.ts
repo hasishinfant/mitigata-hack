@@ -1,9 +1,15 @@
-// Broker process API, served on a Unix socket (mode 0600: only this OS user can connect).
+// Broker process API, served on two Unix sockets (mode 0600: only this OS user can connect).
+//   request socket (IX_BROKER_SOCKET): what workers and the scheduler need, and nothing else:
+//     provider calls for already-signed connectors, credential info, cache drops, alert delivery.
+//   admin socket (IX_BROKER_ADMIN_SOCKET): registration and signing, secrets, removal, panic, ledger.
+//     Every call needs the x-ix-broker-admin header (IX_BROKER_ADMIN_TOKEN, held by the API and CLI only).
+// So a compromised worker cannot get a config signed, and cannot point a stored secret at a new host.
 // The broker is the only process with the master key and the broker DB role. It:
 //   - executes provider requests for registered, broker-signed connectors only;
 //   - accepts secrets write-only (there is no route that returns a secret value);
 //   - registers and signs config versions;
 //   - appends every outbound call, denial, secret write and registration to the audit ledger.
+import { timingSafeEqual } from "node:crypto";
 import { chmod, stat, unlink } from "node:fs/promises";
 import { connect } from "node:net";
 import Fastify from "fastify";
@@ -14,9 +20,10 @@ import { validateConfigText } from "../config/validate.ts";
 import { testConnection } from "../engine/testConnection.ts";
 import { log } from "../log.ts";
 import { credentialRefs } from "../security/posture.ts";
-import { ConnectorConfigError, loadSignedConnector, registerConnector } from "../store/connectors.ts";
+import { ConnectorConfigError, loadSignedConnector, registerConnector, setConnectorEnabled } from "../store/connectors.ts";
 import { createLocalBroker, type LocalBroker } from "./client.ts";
 import { httpCall } from "./http.ts";
+import { ADMIN_HEADER } from "./remote.ts";
 import { hostAllowed } from "./policy.ts";
 import { configSigKey, signConfig, verifyConfigSig } from "./configSig.ts";
 import { appendLedger, verifyLedger } from "./ledger.ts";
@@ -38,7 +45,10 @@ export type BrokerServerOptions = {
   random?: () => number;
   /** Hosts alert webhooks may point at (IX_ALERT_WEBHOOK_HOSTS, default hooks.slack.com). */
   alertHosts?: string[];
+  /** Token required on every admin-socket call. Without it the admin routes are disabled (503). */
+  adminToken?: string;
 };
+
 
 /** The credential ref that identifies a connector's credential (where learned scopes are recorded). */
 export function primaryRef(conn: ResolvedConnector): string | undefined {
@@ -99,36 +109,60 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     else cache.clear();
   };
 
-  const app = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
-  app.setErrorHandler((err: Error & { statusCode?: number }, _req, reply) => {
-    if (err instanceof BrokerError)
-      return reply.code(err.kind === "policy_denied" ? 403 : 502).send({ error: { kind: err.kind, message: err.message, retries: err.retries, rateLimitedMs: err.rateLimitedMs } });
-    if (err instanceof ConnectorConfigError) return reply.code(422).send({ error: { kind: "invalid_config", message: err.message, issues: err.issues } });
-    const code = err.statusCode && err.statusCode < 500 ? err.statusCode : 500;
-    if (code === 500) log.error({ err: err.message }, "broker internal error");
-    return reply.code(code).send({ error: { kind: "error", message: code === 500 ? "internal broker error" : err.message } });
-  });
+  const makeApp = () => {
+    const a = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
+    a.setErrorHandler((err: Error & { statusCode?: number }, _req, reply) => {
+      if (err instanceof BrokerError)
+        return reply.code(err.kind === "policy_denied" ? 403 : 502).send({ error: { kind: err.kind, message: err.message, retries: err.retries, rateLimitedMs: err.rateLimitedMs } });
+      if (err instanceof ConnectorConfigError) return reply.code(422).send({ error: { kind: "invalid_config", message: err.message, issues: err.issues } });
+      const code = err.statusCode && err.statusCode < 500 ? err.statusCode : 500;
+      if (code === 500) log.error({ err: err.message }, "broker internal error");
+      return reply.code(code).send({ error: { kind: "error", message: code === 500 ? "internal broker error" : err.message } });
+    });
+    a.get("/v1/ping", async () => ({ ok: true }));
+    return a;
+  };
 
-  app.get("/v1/ping", async () => ({ ok: true }));
+  // ---- request socket: workers and scheduler ----
+  const app = makeApp();
 
   app.post("/v1/request", async (req) => broker.request(req.body as BrokerRequest));
 
   app.get("/v1/credential-info/:id", async (req) => broker.credentialInfo((req.params as { id: string }).id));
 
+  // Dropping caches only makes the broker re-read signed configs and secrets: harmless to expose.
   app.post("/v1/forget", async (req) => {
     forget((req.body as { connectorId?: string } | undefined)?.connectorId);
     return { ok: true };
   });
 
-  app.post("/v1/connectors", async (req) => {
-    const { yaml, mode, createdBy } = req.body as { yaml: string; mode: "add" | "update"; createdBy?: string };
+  // ---- admin socket: API and CLI, with the admin token ----
+  const adminApp = makeApp();
+  const want = opts.adminToken ? Buffer.from(opts.adminToken) : undefined;
+  adminApp.addHook("onRequest", async (req, reply) => {
+    if (req.url === "/v1/ping") return;
+    if (!want) return reply.code(503).send({ error: { kind: "error", message: "broker admin routes are disabled: set IX_BROKER_ADMIN_TOKEN" } });
+    const h = req.headers[ADMIN_HEADER];
+    const got = Buffer.from(typeof h === "string" ? h : "");
+    if (got.length !== want.length || !timingSafeEqual(got, want)) {
+      await audit({ action: "admin", path: req.url.split("?")[0] ?? null, decision: "deny: bad or missing broker admin token" });
+      return reply.code(401).send({ error: { kind: "error", message: "broker admin token required" } });
+    }
+  });
+
+  adminApp.post("/v1/connectors", async (req) => {
+    const { yaml, mode, createdBy, confirmHosts } = req.body as { yaml: string; mode: "add" | "update"; createdBy?: string; confirmHosts?: boolean };
     if (typeof yaml !== "string") throw Object.assign(new Error("yaml is required"), { statusCode: 400 });
     const r = await registerConnector(opts.pool, yaml, {
       env, createdBy: createdBy ?? "broker", mustNotExist: mode === "add", mustExist: mode === "update",
       sign: (id, version, hash) => signConfig(sigKey, id, version, hash),
+      confirmHosts: confirmHosts === true,
     });
     forget(r.id);
-    await audit({ connectorId: r.id, action: "register", decision: r.changed ? `allow: v${r.version}` : `allow: v${r.version} unchanged` });
+    await audit({
+      connectorId: r.id, action: "register",
+      decision: `${r.changed ? `allow: v${r.version}` : `allow: v${r.version} unchanged`}${r.newHosts?.length ? `; secrets now also sent to ${r.newHosts.join(", ")} (confirmed)` : ""}`,
+    });
     return r;
   });
 
@@ -142,7 +176,7 @@ export function createBrokerServer(opts: BrokerServerOptions) {
 
   // Remove a connector: its config versions, runs, checkpoints, quarantine, alerts and every record it
   // stored. With purge_secrets, also delete its secrets, except refs another connector still uses.
-  app.delete("/v1/connectors/:id", async (req) => {
+  adminApp.delete("/v1/connectors/:id", async (req) => {
     const { id } = req.params as { id: string };
     const purge = (req.query as { purge_secrets?: string }).purge_secrets === "1";
     const client = await opts.pool.connect();
@@ -186,7 +220,16 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     return { removed: true, records, ...(purge ? { secrets } : {}) };
   });
 
-  app.put("/v1/secrets/:tenant/:ref", async (req) => {
+  // Re-enabling is broker-only (the app role can disable, never re-enable): undoing a kill switch is an admin act.
+  adminApp.post("/v1/connectors/:id/enable", async (req) => {
+    const { id } = req.params as { id: string };
+    if (!(await setConnectorEnabled(opts.pool, id, true))) throw Object.assign(new Error(`connector ${id} not found`), { statusCode: 404 });
+    forget(id);
+    await audit({ connectorId: id, action: "enable", decision: "allow" });
+    return { id, status: "enabled" };
+  });
+
+  adminApp.put("/v1/secrets/:tenant/:ref", async (req) => {
     const { tenant, ref } = req.params as { tenant: string; ref: string };
     const value = (req.body as { value?: unknown } | undefined)?.value;
     if (!TENANT_RE.test(tenant) || !REF_RE.test(ref)) throw Object.assign(new Error("bad tenant or ref"), { statusCode: 400 });
@@ -197,9 +240,9 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     return { ok: true, tenant, ref, chars: value.length };
   });
 
-  app.get("/v1/secrets", async (req) => ({ secrets: await listSecrets(opts.pool, (req.query as { tenant?: string }).tenant) }));
+  adminApp.get("/v1/secrets", async (req) => ({ secrets: await listSecrets(opts.pool, (req.query as { tenant?: string }).tenant) }));
 
-  app.delete("/v1/secrets/:tenant/:ref", async (req) => {
+  adminApp.delete("/v1/secrets/:tenant/:ref", async (req) => {
     const { tenant, ref } = req.params as { tenant: string; ref: string };
     const deleted = await deleteSecret(opts.pool, tenant, ref);
     forget();
@@ -209,7 +252,7 @@ export function createBrokerServer(opts: BrokerServerOptions) {
 
   // Testing an unregistered file is only safe when it uses no secrets: otherwise an ad-hoc config could
   // point a stored secret at any host. Configs with auth must be registered (and signed) first.
-  app.post("/v1/test-inline", async (req) => {
+  adminApp.post("/v1/test-inline", async (req) => {
     const { yaml } = req.body as { yaml: string };
     const res = validateConfigText(String(yaml ?? ""), { env });
     if (!res.ok || !res.config) throw new ConnectorConfigError("config is invalid", res.errors);
@@ -221,12 +264,12 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     return testConnection(conn, tmp);
   });
 
-  app.get("/v1/ledger/verify", async () => verifyLedger(opts.pool));
+  adminApp.get("/v1/ledger/verify", async () => verifyLedger(opts.pool));
 
   // Panic: revoke every cached OAuth token that has a revocation endpoint, wipe all in-memory tokens and
   // config caches, and optionally delete every stored secret. Connectors are disabled by the caller (app DB);
   // the broker then refuses their calls on the next request.
-  app.post("/v1/panic", async (req) => {
+  adminApp.post("/v1/panic", async (req) => {
     const { purgeSecrets, actor } = (req.body ?? {}) as { purgeSecrets?: boolean; actor?: string };
     const revocations = await broker.revokeAll();
     forget();
@@ -267,7 +310,7 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     return { delivered: res.status >= 200 && res.status < 300, channel: "slack", detail: `HTTP ${res.status}` };
   });
 
-  return { app, broker, forget };
+  return { app, adminApp, broker, forget };
 }
 
 /** Listen on a Unix socket with 0600 permissions, replacing a stale socket file if nothing is listening. */

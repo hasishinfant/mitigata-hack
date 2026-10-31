@@ -1,0 +1,31 @@
+# Trend Micro Vision One workbench alerts -> events. Bearer API key, nextLink in the response body.
+# Endpoint and field names from Trend's public v3.0 API docs; verify before live use.
+# VISIONONE_API / VISIONONE_HOST select the regional endpoint (e.g. api.eu.xdr.trendmicro.com) or a mock.
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: visionone-alerts, source: trendmicro_visionone, tenant: demo, owner: secops@example.com }
+connection:
+  base_url: ${env.VISIONONE_API:-https://api.xdr.trendmicro.com}
+  auth: { type: bearer, secret_ref: visionone_token }
+streams:
+  - name: alerts
+    entity: event
+    request: { method: GET, path: /v3.0/workbench/alerts, params: { top: 50 } }
+    records_path: "items[*]"
+    pagination: { type: body_link, next_path: nextLink }
+    mapping:
+      id:          { path: id, required: true }
+      type:        { path: model, required: true }
+      severity:    { path: severity, map_enum: { low: low, medium: medium, high: high, critical: critical }, default: info }
+      timestamp:   { path: createdDateTime, transform: to_iso8601, required: true }
+      description: { path: description }
+      attributes:  { pick: [investigationStatus, score] }
+schedule: { every: 15m, jitter: 1m }
+reliability: { rate_limit: { requests_per_minute: 60 } }
+policy:
+  allowed_hosts: ["${env.VISIONONE_HOST:-api.xdr.trendmicro.com}"]
+  allowed_paths: [/v3.0/workbench/alerts]
+  methods: [GET]
+  max_requests_per_run: 100
+credential: { max_age_days: 90, idle_disable_days: 14 }
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }

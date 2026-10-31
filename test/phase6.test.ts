@@ -29,6 +29,12 @@ describe("env separation", () => {
     expect(() => assertNoBrokerSecrets("worker", { IX_MASTER_KEY: "k" })).toThrow(/worker refuses to start.*IX_MASTER_KEY/);
     expect(() => assertNoBrokerSecrets("api", { DATABASE_URL_BROKER: "u", IX_SECRET_GITHUB_PAT: "t" })).toThrow(/DATABASE_URL_BROKER, IX_SECRET_GITHUB_PAT/);
   });
+  it("workers and the scheduler refuse the broker admin token; the API may hold it", () => {
+    expect(() => assertNoBrokerSecrets("worker", { IX_BROKER_ADMIN_TOKEN: "t" })).toThrow(/worker refuses to start.*IX_BROKER_ADMIN_TOKEN/);
+    expect(() => assertNoBrokerSecrets("scheduler", { IX_BROKER_ADMIN_TOKEN: "t" })).toThrow(/IX_BROKER_ADMIN_TOKEN/);
+    expect(() => assertNoBrokerSecrets("api", { IX_BROKER_ADMIN_TOKEN: "t" }, { adminTokenAllowed: true })).not.toThrow();
+    expect(withoutBrokerSecrets({ PATH: "/bin", IX_BROKER_ADMIN_TOKEN: "t" })).toEqual({ PATH: "/bin" });
+  });
   it("spawned app processes get an environment without them", () => {
     const env = withoutBrokerSecrets({ PATH: "/bin", IX_MASTER_KEY: "k", DATABASE_URL_ADMIN: "a", IX_SECRET_X: "s", DATABASE_URL_APP: "app" });
     expect(env).toEqual({ PATH: "/bin", DATABASE_URL_APP: "app" });
@@ -75,6 +81,8 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
   let remote: RemoteBroker;
   let env: Record<string, string | undefined>;
   const socketPath = join(tmpdir(), `ixb-${process.pid}.sock`);
+  const adminSocketPath = join(tmpdir(), `ixba-${process.pid}.sock`);
+  const adminToken = randomBytes(16).toString("hex");
   const masterKey = randomBytes(32);
   let ledgerStart = 0; // the ledger is append-only and shared by all test files: only look at this test's rows
 
@@ -85,12 +93,14 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     appPool = createPool(testUrl("DATABASE_URL_APP"));
     brokerPool = createPool(testUrl("DATABASE_URL_BROKER"));
     adminPool = createPool(testUrl("DATABASE_URL_ADMIN"));
-    server = createBrokerServer({ pool: brokerPool, masterKey, env });
+    server = createBrokerServer({ pool: brokerPool, masterKey, env, adminToken });
     await listenOnSocket(server.app, socketPath);
-    remote = createRemoteBroker(socketPath);
+    await listenOnSocket(server.adminApp, adminSocketPath);
+    remote = createRemoteBroker(socketPath, { adminSocketPath, adminToken });
   });
   afterAll(async () => {
     await server?.app.close();
+    await server?.adminApp.close();
     await Promise.all([appPool?.end(), brokerPool?.end(), adminPool?.end()]);
     await mock?.app.close();
   });
@@ -105,8 +115,41 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     (await appPool.query("select action, connector_id, method, host, path, status, decision from audit_ledger where seq > $1 order by seq", [ledgerStart])).rows;
   const port = () => env.MOCK_PORT;
 
-  it("socket is private to this OS user (0600)", () => {
+  it("sockets are private to this OS user (0600)", () => {
     expect(statSync(socketPath).mode & 0o777).toBe(0o600);
+    expect(statSync(adminSocketPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("the request socket serves no admin routes; the admin socket needs the token", async () => {
+    const yaml = fixture("mock-github-members.yaml");
+    // A worker that somehow learned a token still can't reach admin routes on the socket it is given.
+    const onRequestSocket = createRemoteBroker(socketPath, { adminSocketPath: socketPath, adminToken });
+    await expect(onRequestSocket.register(yaml, "add")).rejects.toMatchObject({ statusCode: 404 });
+    await expect(onRequestSocket.putSecret("demo", "mock_bearer", "x")).rejects.toMatchObject({ statusCode: 404 });
+    await expect(onRequestSocket.panic({ purgeSecrets: true })).rejects.toMatchObject({ statusCode: 404 });
+    // Wrong or missing token on the admin socket: refused and written to the ledger.
+    const wrong = createRemoteBroker(socketPath, { adminSocketPath, adminToken: "not-the-token" });
+    await expect(wrong.register(yaml, "add")).rejects.toMatchObject({ statusCode: 401 });
+    await expect(createRemoteBroker(socketPath, { adminSocketPath, adminToken: "" }).register(yaml, "add")).rejects.toThrow(/IX_BROKER_ADMIN_TOKEN is not set/);
+    expect((await appPool.query("select count(*)::int as n from connectors")).rows[0].n).toBe(0);
+    expect(await ledger()).toContainEqual(expect.objectContaining({ action: "admin", path: "/v1/connectors", decision: "deny: bad or missing broker admin token" }));
+    // Request-socket routes still work for workers.
+    expect(await onRequestSocket.ping()).toBe(true);
+  });
+
+  it("a config that would send an existing secret to a new host needs --confirm-hosts", async () => {
+    const yaml = fixture("mock-github-members.yaml");
+    await remote.register(yaml, "add", "test");
+    const moved = yaml.replace("allowed_hosts: [localhost]", "allowed_hosts: [localhost, evil.example.net]");
+    await expect(remote.register(moved, "update", "test")).rejects.toMatchObject({ statusCode: 409, message: expect.stringMatching(/mock_bearer.*evil\.example\.net.*--confirm-hosts/) });
+    // A brand-new connector reusing the ref against another host is refused the same way.
+    const copy = moved.replace("id: mock-github-members", "id: copy-of-members");
+    await expect(remote.register(copy, "add", "test")).rejects.toMatchObject({ statusCode: 409 });
+    expect((await appPool.query("select count(*)::int as n from connector_versions")).rows[0].n).toBe(1);
+    // Confirmed by the operator: allowed, and the ledger says so.
+    const r = await remote.register(moved, "update", "test", { confirmHosts: true });
+    expect(r).toMatchObject({ version: 2, changed: true, newHosts: ["evil.example.net"] });
+    expect((await ledger()).map((e) => e.decision)).toContain("allow: v2; secrets now also sent to evil.example.net (confirmed)");
   });
 
   it("register -> broker signs; secret is write-only; sync runs through the socket", async () => {
@@ -174,6 +217,22 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     ).rejects.toThrow(/not approved by the broker/);
     expect(mock.calls).toHaveLength(0);
     expect((await ledger()).at(-1)!.decision).toMatch(/^deny: connector mock-github-members v2 was not approved by the broker/);
+  });
+
+  it("the app DB role can disable and pause, but not re-enable or switch the active config version", async () => {
+    await remote.register(fixture("mock-github-members.yaml"), "add");
+    await remote.register(fixture("mock-github-members.yaml").replace("max_requests_per_run: 50", "max_requests_per_run: 40"), "update");
+    await expect(appPool.query("update connectors set active_version = 1")).rejects.toThrow(/permission denied/);
+    await appPool.query("update connectors set status = 'paused', paused_until = now() + interval '1 minute'"); // breaker: allowed
+    await appPool.query("update connectors set status = 'enabled', paused_until = null"); // half-open: allowed
+    await appPool.query("update connectors set status = 'disabled'"); // kill switch: allowed
+    await expect(appPool.query("update connectors set status = 'enabled'")).rejects.toThrow(/only the broker can re-enable/);
+    // The breaker can't turn a disabled connector into a paused one either.
+    await createPgRunStore(appPool).pause("mock-github-members", new Date(Date.now() + 60_000), "test");
+    expect((await appPool.query("select status, active_version from connectors")).rows[0]).toEqual({ status: "disabled", active_version: 2 });
+    await expect(createRemoteBroker(socketPath, { adminSocketPath, adminToken: "nope" }).enableConnector("mock-github-members")).rejects.toMatchObject({ statusCode: 401 });
+    expect(await remote.enableConnector("mock-github-members")).toEqual({ id: "mock-github-members", status: "enabled" });
+    await expect(remote.enableConnector("no-such")).rejects.toMatchObject({ statusCode: 404 });
   });
 
   it("disabling a connector stops the broker from calling out for it", async () => {

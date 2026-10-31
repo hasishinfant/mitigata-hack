@@ -1,0 +1,252 @@
+// Data integrity of a run, without a database: a scripted provider and an in-memory run store.
+//   - a 200 with the wrong envelope is a failure, never "0 records, success";
+//   - pagination that stops without proof of the last page (cycle, repeated page, missing total) is a failure;
+//   - the incremental watermark only moves for complete, non-degraded runs, and never past a quarantined record.
+import { describe, expect, it } from "vitest";
+import type { Broker, BrokerRequest } from "../src/broker/types.ts";
+import { resolveConnector, type ResolvedConnector } from "../src/config/load.ts";
+import { validateConfigText } from "../src/config/validate.ts";
+import { extractRecords, runStream, RunFailure, type Checkpoint, type FieldStats, type FinishRun, type PageCommit, type RunStore } from "../src/engine/runner.ts";
+
+type Reply = { status?: number; body: unknown; headers?: Record<string, string> };
+
+function connector(stream: string): ResolvedConnector {
+  const yaml = `apiVersion: ix/v1
+kind: Connector
+metadata: { id: t-conn, source: test, tenant: demo }
+connection: { base_url: "https://api.example.test", auth: { type: none } }
+streams:
+${stream}
+policy: { allowed_hosts: [api.example.test], max_requests_per_run: 20 }
+`;
+  const v = validateConfigText(yaml, { env: {} });
+  if (!v.ok || !v.config) throw new Error(JSON.stringify(v.errors));
+  return resolveConnector(v.config, v.configHash);
+}
+
+function fakeBroker(respond: (url: URL, n: number) => Reply) {
+  const calls: URL[] = [];
+  const broker: Broker = {
+    async request(req: BrokerRequest) {
+      const url = new URL(req.url);
+      calls.push(url);
+      const r = respond(url, calls.length);
+      return { status: r.status ?? 200, headers: r.headers ?? {}, body: r.body === "" ? "" : JSON.stringify(r.body), durationMs: 1, retries: 0, rateLimitedMs: 0 };
+    },
+    async credentialInfo() {
+      return {};
+    },
+  };
+  return { broker, calls };
+}
+
+function memStore() {
+  const s = { watermark: undefined as string | undefined, checkpoint: null as Checkpoint | null, pages: [] as PageCommit[], runs: [] as FinishRun[] };
+  const store: RunStore = {
+    async startRun() {},
+    async commitPage(p) {
+      s.pages.push(p);
+      s.checkpoint = p.checkpoint;
+    },
+    async finishRun(r) {
+      s.runs.push(r);
+    },
+    async loadCheckpoint() {
+      if (!s.checkpoint && !s.watermark) return null;
+      return { ...(s.checkpoint ?? { configHash: "" }), ...(s.watermark ? { cursorValue: s.watermark } : {}) };
+    },
+    async saveWatermark(_c, _s, v) {
+      s.watermark = v;
+    },
+    async previousFieldStats(): Promise<FieldStats | null> {
+      return [...s.runs].reverse().find((r) => r.status === "success" || r.status === "partial")?.fieldStats ?? null;
+    },
+    async connectorState() {
+      return { status: "enabled", pausedUntil: null, reason: null };
+    },
+    async recentStatuses() {
+      return s.runs.map((r) => r.status).reverse();
+    },
+    async pause() {},
+    async resume() {},
+    async raiseAlert() {},
+  };
+  return { s, store };
+}
+
+const run = (conn: ResolvedConnector, broker: Broker, store: RunStore) => runStream({ connector: conn, stream: conn.streams[0]!, broker, store });
+
+describe("response envelope", () => {
+  const fails = (body: unknown, path?: string) => expect(() => extractRecords(body, path)).toThrow(RunFailure);
+  it("a missing records key, an empty body or an error object is a failure", () => {
+    fails({ message: "Service is under maintenance" }, "vulnerabilities[*]");
+    fails({ vulnerabilities: { a: 1 } }, "vulnerabilities[*]");
+    fails({ message: "x" }, "data");
+    fails(null, "$");
+    fails(null, undefined);
+    fails({ errorCode: "E0000011" }, "$");
+    expect(() => extractRecords({ message: "x" }, "data")).toThrow(/records_path "data" not found.*response keys: message/);
+  });
+  it("a present envelope with no records is a valid empty page", () => {
+    expect(extractRecords({ vulnerabilities: [] }, "vulnerabilities[*]")).toEqual([]);
+    expect(extractRecords({ data: null }, "data")).toEqual([]);
+    expect(extractRecords([], "$")).toEqual([]);
+    expect(extractRecords({ hits: { hits: [{ a: 1 }] } }, "hits.hits[*]")).toEqual([{ a: 1 }]);
+  });
+  it("run: a maintenance page on page 2 fails the run; no success with partial data", async () => {
+    const conn = connector(`  - name: cves
+    entity: event
+    request: { method: GET, path: /cves }
+    records_path: "vulnerabilities[*]"
+    pagination: { type: offset, offset_param: start, limit_param: n, limit: 2, total_path: total }
+    mapping:
+      id: { path: id, required: true }
+      type: { const: vulnerability }`);
+    const { broker } = fakeBroker((u) =>
+      u.searchParams.get("start") === "0" ? { body: { total: 4, vulnerabilities: [{ id: "a" }, { id: "b" }] } } : { body: { message: "Service is under maintenance" } },
+    );
+    const { s, store } = memStore();
+    const r = await run(conn, broker, store);
+    expect(r.status).toBe("failed");
+    expect(r.lastError).toMatch(/envelope invalid.*vulnerabilities/);
+    expect(s.checkpoint?.nextUrl).toContain("start=2"); // resumes at the page that broke
+  });
+});
+
+describe("pagination termination", () => {
+  const cursorConn = () =>
+    connector(`  - name: items
+    entity: event
+    request: { method: GET, path: /items }
+    records_path: items
+    pagination: { type: cursor, token_path: next, token_param: c }
+    mapping:
+      id: { path: id, required: true }
+      type: { const: x }`);
+
+  it("a cursor cycle A -> B -> A is detected: failed, position cleared", async () => {
+    const next: Record<string, string> = { "": "A", A: "B", B: "A" };
+    const { broker, calls } = fakeBroker((u) => {
+      const c = u.searchParams.get("c") ?? "";
+      return { body: { items: [{ id: `${c}-1` }], next: next[c] } };
+    });
+    const { s, store } = memStore();
+    const r = await run(cursorConn(), broker, store);
+    expect(r.status).toBe("failed");
+    expect(r.lastError).toMatch(/pagination cycle/);
+    expect(calls).toHaveLength(3);
+    expect(s.checkpoint).toBeNull();
+  });
+
+  it("a repeated cursor is a failure, not a completed run", async () => {
+    const { broker } = fakeBroker(() => ({ body: { items: [{ id: "x" }], next: "same" } }));
+    const r = await run(cursorConn(), broker, memStore().store);
+    expect(r.status).toBe("failed");
+    expect(r.lastError).toMatch(/same cursor/);
+  });
+
+  it("a provider that ignores the page parameter is caught on the second page", async () => {
+    const conn = connector(`  - name: items
+    entity: event
+    request: { method: GET, path: /items }
+    records_path: $
+    pagination: { type: page_number, page_param: page, size_param: size, size: 2 }
+    mapping:
+      id: { path: id, required: true }
+      type: { const: x }`);
+    const { broker, calls } = fakeBroker(() => ({ body: [{ id: "1" }, { id: "2" }] }));
+    const r = await run(conn, broker, memStore().store);
+    expect(r.status).toBe("failed");
+    expect(r.lastError).toMatch(/page 2 has the same content as page 1/);
+    expect(calls).toHaveLength(2); // not 20 identical requests up to max_requests_per_run
+  });
+
+  it("a missing total_path is a failure", async () => {
+    const conn = connector(`  - name: items
+    entity: event
+    request: { method: GET, path: /items }
+    records_path: items
+    pagination: { type: offset, offset_param: start, limit_param: n, limit: 2, total_path: total }
+    mapping:
+      id: { path: id, required: true }
+      type: { const: x }`);
+    const { broker } = fakeBroker(() => ({ body: { items: [{ id: "1" }, { id: "2" }] } }));
+    const r = await run(conn, broker, memStore().store);
+    expect(r).toMatchObject({ status: "failed", lastError: expect.stringMatching(/total_path "total" missing/) });
+  });
+
+  it("a natural end still completes", async () => {
+    const { broker } = fakeBroker((u) => (u.searchParams.get("c") ? { body: { items: [{ id: "2" }] } } : { body: { items: [{ id: "1" }], next: "A" } }));
+    expect((await run(cursorConn(), broker, memStore().store)).status).toBe("success");
+  });
+});
+
+describe("incremental watermark", () => {
+  const incConn = () =>
+    connector(`  - name: logs
+    entity: event
+    request: { method: GET, path: /logs }
+    records_path: $
+    pagination: { type: none }
+    incremental: { cursor_field: published, param: since, template: "{{cursor}}" }
+    mapping:
+      id: { path: uuid, required: true }
+      type: { path: eventType, required: true }
+      timestamp: { path: published, transform: to_iso8601 }
+      description: { path: msg }`);
+  const ev = (n: number, extra: Record<string, unknown> = {}) => ({ uuid: `u${n}`, eventType: "login", published: `2026-01-0${n}T00:00:00.000Z`, msg: "m", ...extra });
+
+  it("a clean run advances to the newest accepted record", async () => {
+    const { broker } = fakeBroker(() => ({ body: [ev(1), ev(3), ev(2)] }));
+    const { s, store } = memStore();
+    const r = await run(incConn(), broker, store);
+    expect(r.status).toBe("success");
+    expect(s.watermark).toBe("2026-01-03T00:00:00.000Z");
+  });
+
+  it("never moves past a quarantined record: the next run fetches it again", async () => {
+    const bad = ev(2, { eventType: undefined }); // no type -> quarantined
+    let body: unknown[] = [ev(1), bad, ev(3)];
+    const { broker, calls } = fakeBroker(() => ({ body }));
+    const { s, store } = memStore();
+    const r1 = await run(incConn(), broker, store);
+    expect(r1.status).toBe("partial");
+    expect(s.watermark).toBe("2026-01-01T23:59:59.999Z"); // 1 ms before the quarantined record
+    expect(r1.lastError).toMatch(/watermark held: capped before the earliest quarantined record/);
+    body = [{ ...bad, eventType: "login" }, ev(3)]; // provider (or mapping) fixed
+    const r2 = await run(incConn(), broker, store);
+    expect(calls[1]!.searchParams.get("since")).toBe("2026-01-01T23:59:59.999Z");
+    expect(r2.status).toBe("success");
+    expect(s.watermark).toBe("2026-01-03T00:00:00.000Z");
+  });
+
+  it("a quarantined record without a cursor holds the watermark", async () => {
+    const { broker } = fakeBroker(() => ({ body: [ev(1), { uuid: "u9", eventType: "login", published: "not a date" }, { uuid: "u8" }] }));
+    const { s, store } = memStore();
+    const r = await run(incConn(), broker, store);
+    expect(r.status).toBe("partial");
+    expect(s.watermark).toBeUndefined();
+    expect(r.watermarkHeld).toMatch(/have no published/);
+  });
+
+  it("a degraded (schema drift) run does not advance the watermark", async () => {
+    const day = (d: number, withMsg: boolean) => Array.from({ length: 6 }, (_, i) => ({ uuid: `d${d}-${i}`, eventType: "login", published: `2026-02-0${d}T0${i}:00:00.000Z`, ...(withMsg ? { msg: "m" } : {}) }));
+    let body = day(1, true);
+    const { broker } = fakeBroker(() => ({ body }));
+    const { s, store } = memStore();
+    expect((await run(incConn(), broker, store)).status).toBe("success");
+    const before = s.watermark;
+    body = day(2, false); // provider dropped the field the mapping reads
+    const r = await run(incConn(), broker, store);
+    expect(r.status).toBe("degraded");
+    expect(s.watermark).toBe(before);
+    expect(r.watermarkHeld).toMatch(/degraded/);
+  });
+
+  it("a failed or capped run does not advance the watermark", async () => {
+    const { broker } = fakeBroker(() => ({ body: { not: "an array" } }));
+    const { s, store } = memStore();
+    expect((await run(incConn(), broker, store)).status).toBe("failed");
+    expect(s.watermark).toBeUndefined();
+  });
+});

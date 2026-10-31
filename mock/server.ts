@@ -27,7 +27,7 @@ export type MockOptions = {
   touchedUsers?: number[];
 };
 
-export type FaultMode = "429" | "500" | "503" | "timeout" | "drop" | "ratelimit403";
+export type FaultMode = "429" | "500" | "503" | "timeout" | "drop" | "ratelimit403" | "envelope" | "empty";
 export type FaultSpec = {
   mode: FaultMode;
   count: number; // how many matching requests to fault
@@ -117,10 +117,14 @@ export function buildMock(opts: MockOptions = {}): Mock {
       case "drop":
         req.raw.socket.destroy();
         return reply.hijack();
+      case "envelope": // 200 OK, but not the shape the config declares (maintenance page, error object)
+        return reply.code(200).send({ message: "Service is under maintenance" });
+      case "empty": // 200 OK with an empty body
+        return reply.code(200).header("content-type", "application/json").send("");
     }
   });
 
-  // Fault control for live demos: /__fault?mode=429&count=1&retry_after=30&after=1 ; /__fault?mode=clear
+  // Fault control for live demos: /__fault?mode=429&count=1&retry_after=30&after=1 ; mode=envelope|empty ; /__fault?mode=clear
   app.get("/__fault", async (req) => {
     const q = qp(req);
     if (!q.mode || q.mode === "clear") {

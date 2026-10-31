@@ -1,7 +1,8 @@
 // Connector registry: configs are stored as versioned YAML text (with ${env.X} left un-interpolated)
 // and re-validated against the current environment every time they're loaded.
 import type pg from "pg";
-import { resolveConnector, type ResolvedConnector } from "../config/load.ts";
+import { credentialRefs, resolveConnector, type ResolvedConnector } from "../config/load.ts";
+import type { ConnectorConfig } from "../config/schema.ts";
 import { validateConfigText, type Issue } from "../config/validate.ts";
 import { withTx } from "./db.ts";
 
@@ -13,7 +14,54 @@ export class ConnectorConfigError extends Error {
   }
 }
 
-export type RegisterResult = { id: string; version: number; changed: boolean };
+export type RegisterResult = { id: string; version: number; changed: boolean; newHosts?: string[] };
+
+const hostsOf = (cfg: ConnectorConfig) => cfg.policy.allowed_hosts.map((h) => h.toLowerCase());
+
+/**
+ * Secret-to-host binding. A stored secret may only be sent to hosts some approved config already sends it to.
+ * A new or updated config that would send an existing secret ref to a new host is refused unless the operator
+ * confirms it (ix add/update --confirm-hosts). Returns the newly reached hosts.
+ */
+async function checkSecretHosts(
+  c: pg.PoolClient, cfg: ConnectorConfig, env: Record<string, string | undefined> | undefined, confirm: boolean,
+): Promise<string[]> {
+  const refs = credentialRefs(cfg);
+  if (!refs.length) return [];
+  const rows = (
+    await c.query(
+      `select k.id, v.config_yaml from connectors k join connector_versions v on v.connector_id = k.id and v.version = k.active_version
+       where k.tenant_id = $1`,
+      [cfg.metadata.tenant],
+    )
+  ).rows as { id: string; config_yaml: string }[];
+  const known = new Map<string, Set<string>>(); // ref -> hosts it is already sent to
+  for (const r of rows) {
+    const v = validateConfigText(r.config_yaml, { env });
+    if (!v.config) continue;
+    for (const ref of credentialRefs(v.config)) {
+      const set = known.get(ref) ?? new Set<string>();
+      for (const h of hostsOf(v.config)) set.add(h);
+      known.set(ref, set);
+    }
+  }
+  const added = new Set<string>();
+  for (const ref of refs) {
+    const prior = known.get(ref);
+    if (!prior) continue; // first use of this ref: nothing to protect yet
+    for (const h of hostsOf(cfg)) if (!prior.has(h)) added.add(h);
+  }
+  const newHosts = [...added].sort();
+  if (newHosts.length && !confirm)
+    throw Object.assign(
+      new Error(
+        `this config would send existing secret(s) ${refs.filter((r) => known.has(r)).join(", ")} to new host(s) ${newHosts.join(", ")}. ` +
+          "If that is intended, re-run with --confirm-hosts (API: ?confirm_hosts=1)",
+      ),
+      { statusCode: 409 },
+    );
+  return newHosts;
+}
 
 export async function registerConnector(
   pool: pg.Pool,
@@ -25,6 +73,8 @@ export async function registerConnector(
     mustNotExist?: boolean;
     /** Broker only: signs the approved version. Without it the broker will refuse to use the config. */
     sign?: (id: string, version: number, configHash: string) => string;
+    /** Operator confirmed that existing secrets may be sent to the new hosts in this config. */
+    confirmHosts?: boolean;
   } = {},
 ): Promise<RegisterResult> {
   const res = validateConfigText(yamlText, { env: opts.env });
@@ -36,6 +86,7 @@ export async function registerConnector(
       throw Object.assign(new Error(`connector ${id} already exists; use "ix update"`), { statusCode: 409 });
     if (opts.mustExist && !existing.rowCount) throw Object.assign(new Error(`connector ${id} does not exist; use "ix add"`), { statusCode: 404 });
     await c.query("insert into tenants (id, name) values ($1, $1) on conflict do nothing", [tenant]);
+    const newHosts = await checkSecretHosts(c, res.config!, opts.env, opts.confirmHosts === true);
     if (existing.rowCount) {
       const cur = await c.query(
         "select v.config_hash from connector_versions v join connectors k on k.id = v.connector_id and k.active_version = v.version where k.id = $1",
@@ -59,7 +110,7 @@ export async function registerConnector(
       [id, version, yamlText, res.configHash, opts.createdBy ?? "cli", opts.sign ? opts.sign(id, version, res.configHash) : null],
     );
     await c.query("update connectors set active_version = $2, source = $3 where id = $1", [id, version, source]);
-    return { id, version, changed: true };
+    return { id, version, changed: true, ...(newHosts.length ? { newHosts } : {}) };
   });
 }
 

@@ -39,20 +39,8 @@ export type Posture = {
 
 const RANK: Record<Level, number> = { low: 1, medium: 2, high: 3 };
 
-export function credentialRefs(conn: ResolvedConnector): string[] {
-  const a = conn.connection.auth;
-  switch (a.type) {
-    case "api_key":
-    case "bearer":
-      return [a.secret_ref];
-    case "basic":
-      return [a.username_ref, a.password_ref];
-    case "oauth2_client_credentials":
-      return [a.client_id_ref, a.client_auth === "private_key_jwt" ? a.private_key_ref : a.client_secret_ref].filter((x): x is string => Boolean(x));
-    default:
-      return [];
-  }
-}
+import { credentialRefs } from "../config/load.ts";
+export { credentialRefs };
 
 const days = (from: string | null, now: number) => (from ? Math.floor((now - Date.parse(from)) / 86_400_000) : null);
 

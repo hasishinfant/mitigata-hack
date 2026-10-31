@@ -1,0 +1,37 @@
+# Elastic Security detection alerts -> events. ApiKey header, read-only POST _search, from/size in the body.
+# Index and field names follow Elastic's alerts-as-data schema; verify against your deployment.
+# Note: from/size is capped at 10,000 hits by Elasticsearch; larger backfills need search_after.
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: elastic-alerts, source: elastic_security, tenant: demo, owner: secops@example.com }
+connection:
+  base_url: ${env.ELASTIC_API:-https://example.es.us-east-1.aws.elastic.cloud}
+  auth: { type: api_key, in: header, name: Authorization, prefix: "ApiKey ", secret_ref: elastic_api_key }
+streams:
+  - name: alerts
+    entity: event
+    request:
+      method: POST
+      path: /.alerts-security.alerts-default/_search
+      paging_in: body
+      body:
+        query: { term: { kibana.alert.workflow_status: open } }
+        sort: [{ "@timestamp": asc }]
+    records_path: "hits.hits[*]"
+    pagination: { type: offset, offset_param: from, limit_param: size, limit: 50, total_path: hits.total.value }
+    mapping:
+      id:          { path: _id, required: true }
+      type:        { path: '_source["kibana.alert.rule.name"]', required: true }
+      severity:    { path: '_source["kibana.alert.severity"]', map_enum: { low: low, medium: medium, high: high, critical: critical }, default: info }
+      timestamp:   { path: '_source["@timestamp"]', transform: to_iso8601, required: true }
+      description: { path: '_source["kibana.alert.reason"]' }
+      attributes:  { pick: ['_source["host.name"]', '_source["kibana.alert.workflow_status"]'] }
+schedule: { every: 15m }
+reliability: { rate_limit: { requests_per_minute: 60 } }
+policy:
+  allowed_hosts: ["${env.ELASTIC_HOST:-example.es.us-east-1.aws.elastic.cloud}"]
+  read_only_post: [/.alerts-security.alerts-default/_search]
+  methods: [GET]
+  max_requests_per_run: 100
+credential: { max_age_days: 90, idle_disable_days: 14 }
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }

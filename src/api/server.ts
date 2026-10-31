@@ -119,7 +119,8 @@ export function buildApi(opts: ApiOptions) {
   // ---- writes (admin token) ----
   // Registration goes through the broker, which validates and signs the version it will honour.
   app.post("/v1/connectors", { preHandler: requireAdmin }, async (req, reply) => {
-    const r = await needAdmin().register(yamlBody(req), "add", "api");
+    const confirmHosts = (req.query as { confirm_hosts?: string }).confirm_hosts === "1";
+    const r = await needAdmin().register(yamlBody(req), "add", "api", { confirmHosts });
     return reply.code(201).send(r);
   });
 
@@ -128,7 +129,7 @@ export function buildApi(opts: ApiOptions) {
     const text = yamlBody(req);
     const v = validateConfigText(text, { env });
     if (v.config && v.config.metadata.id !== id) return reply.code(400).send({ error: `metadata.id is ${v.config.metadata.id}, URL says ${id}` });
-    return needAdmin().register(text, "update", "api");
+    return needAdmin().register(text, "update", "api", { confirmHosts: (req.query as { confirm_hosts?: string }).confirm_hosts === "1" });
   });
 
   // Write-only: the value goes to the broker; nothing ever returns it.
@@ -166,10 +167,9 @@ export function buildApi(opts: ApiOptions) {
     return { id, status: "disabled" };
   });
 
-  app.post("/v1/connectors/:id/enable", { preHandler: requireAdmin }, async (req, reply) => {
+  app.post("/v1/connectors/:id/enable", { preHandler: requireAdmin }, async (req) => {
     const { id } = req.params as { id: string };
-    if (!(await setConnectorEnabled(opts.pool, id, true))) return reply.code(404).send({ error: `connector ${id} not found` });
-    return { id, status: "enabled" };
+    return needAdmin().enableConnector(id); // broker-only: the app role cannot re-enable
   });
 
   app.post("/v1/panic", { preHandler: requireAdmin }, async (req) => {

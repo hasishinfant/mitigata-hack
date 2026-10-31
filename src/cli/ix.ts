@@ -7,7 +7,7 @@ import { connectorJsonSchema } from "../config/schema.ts";
 import { validateConfigText, type Issue } from "../config/validate.ts";
 import { createRemoteBroker, type RemoteBroker } from "../broker/remote.ts";
 import { verifyLedger } from "../broker/ledger.ts";
-import { loadAppEnv } from "../envfiles.ts";
+import { loadAdminEnv } from "../envfiles.ts";
 import { runConnector } from "../engine/runner.ts";
 import { testConnection, type ConnectionTest } from "../engine/testConnection.ts";
 import { createPool, type Pool } from "../store/db.ts";
@@ -20,8 +20,9 @@ import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
 import { listQuarantine } from "../store/quarantine.ts";
 import { createPgRunStore, listRuns } from "../store/runs.ts";
 
-// The CLI holds no secrets: it loads only .env and talks to the broker process over its socket.
-loadAppEnv();
+// The CLI holds no provider secrets: it loads .env plus the broker admin token (.env.admin)
+// and talks to the broker process over its sockets.
+loadAdminEnv();
 
 const tty = process.stdout.isTTY;
 const c = (code: number, s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
@@ -143,11 +144,13 @@ for (const [name, desc] of [
     .command(name)
     .description(desc)
     .argument("<file>")
+    .option("--confirm-hosts", "allow this config to send an already-stored secret to a host no approved config sends it to")
     .action(
-      action(async (file: string) => {
+      action(async (file: string, opts: { confirmHosts?: boolean }) => {
         const text = await readFile(file, "utf8");
-        const r = await broker().register(text, name, process.env.USER ?? "cli");
+        const r = await broker().register(text, name, process.env.USER ?? "cli", { confirmHosts: opts.confirmHosts === true });
         console.log(r.changed ? `${green("✔")} ${r.id} v${r.version} registered` : `${dim("=")} ${r.id} unchanged (v${r.version})`);
+        if (r.newHosts?.length) console.log(yellow(`  existing secrets are now also sent to: ${r.newHosts.join(", ")}`));
       }),
     );
 }
@@ -391,7 +394,7 @@ program
   .argument("<id>")
   .action(
     action(async (id: string) => {
-      if (!(await setConnectorEnabled(db(), id, true))) throw new Error(`connector ${id} not found`);
+      await broker().enableConnector(id); // through the broker: the app DB role cannot re-enable
       console.log(`${green("✔")} ${id} enabled`);
     }),
   );

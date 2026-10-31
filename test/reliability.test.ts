@@ -100,6 +100,22 @@ describe.skipIf(!hasDb)("reliability", () => {
     expect(await count("select count(*) from checkpoints where page_state is not null")).toBe(0);
   });
 
+  // ---------- 200 OK with the wrong shape (maintenance page) ----------
+  it("200 with a missing records envelope fails the run; it is never '0 records, success'", async () => {
+    const id = await register(fixture("mock-nvd-cves.yaml"));
+    mock.setFault({ mode: "envelope", path: NVD, after: 1, count: 1 });
+    const s1 = await run(id);
+    expect(s1).toMatchObject({ status: "failed", requests: 2, recordsOk: 2000 });
+    expect(s1.lastError).toMatch(/envelope invalid: records_path "vulnerabilities\[\*\]" not found.*response keys: message/);
+    const cp = (await pool.query("select page_state from checkpoints")).rows[0].page_state;
+    expect(new URL(cp.next_url).searchParams.get("startIndex")).toBe("2000"); // resumes at the broken page
+    mock.setFault({ mode: "empty", path: NVD, count: 1 });
+    expect((await run(id)).lastError).toMatch(/not found/); // empty body: no envelope either
+    const s3 = await run(id);
+    expect(s3).toMatchObject({ status: "success", resumed: true });
+    expect(await count("select count(*) from events")).toBe(4500);
+  });
+
   // ---------- PRD failure test 3: calling faster than the limit (429) ----------
   it("429 with Retry-After: 30 waits 30 s, retries the same page, no duplicates", async () => {
     const id = await register(fixture("mock-nvd-cves.yaml"));
