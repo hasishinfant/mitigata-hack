@@ -4,8 +4,12 @@ import type { ConnectorConfig } from "./schema.ts";
 import { durationMs, validateConfigText, type Issue } from "./validate.ts";
 
 export class ConfigError extends Error {
-  constructor(public file: string, public issues: Issue[]) {
+  file: string;
+  issues: Issue[];
+  constructor(file: string, issues: Issue[]) {
     super(`${file}: ${issues.length} config error(s); first: ${issues[0]?.line}:${issues[0]?.col} ${issues[0]?.message}`);
+    this.file = file;
+    this.issues = issues;
   }
 }
 

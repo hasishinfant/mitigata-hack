@@ -30,7 +30,12 @@ export function formatPath(path: P): string {
 
 // ---------- source locations ----------
 class Locator {
-  constructor(private doc: Document, private lc: LineCounter) {}
+  private doc: Document;
+  private lc: LineCounter;
+  constructor(doc: Document, lc: LineCounter) {
+    this.doc = doc;
+    this.lc = lc;
+  }
   /** Position of the deepest existing node on `path`, preferring the key token. `key` targets a child key. */
   at(path: P, key?: string): { line: number; col: number } {
     let node: unknown = this.doc.contents;

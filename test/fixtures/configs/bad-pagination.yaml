@@ -3,7 +3,7 @@ kind: Connector
 metadata: { id: cisa-kev, source: cisa_kev, tenant: demo }
 connection:
   base_url: https://www.cisa.gov
-  auth: { type: nonee }
+  auth: { type: none }
 streams:
   - name: kev
     entity: event
