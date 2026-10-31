@@ -19,8 +19,23 @@ function el(tag, attrs, ...children) {
   return node;
 }
 
+/** Ask for the admin token once per browser session (it is never stored beyond sessionStorage). */
+function ensureToken() {
+  if (tokenInput.value) return true;
+  const t = prompt("Admin token needed for this action.\nIt is IX_ADMIN_TOKEN in your .env file (run: grep IX_ADMIN_TOKEN .env).");
+  if (!t || !t.trim()) return false;
+  tokenInput.value = t.trim();
+  sessionStorage.setItem("ix_admin_token", tokenInput.value);
+  return true;
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
+  if (res.status === 401 && opts.headers && "authorization" in opts.headers) {
+    // Wrong or stale token: forget it so the next click asks again.
+    tokenInput.value = "";
+    sessionStorage.removeItem("ix_admin_token");
+  }
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
   return body;
@@ -83,11 +98,7 @@ async function refresh() {
 }
 
 async function runNow(id, btn) {
-  if (!tokenInput.value) {
-    tokenInput.focus();
-    alert("Enter the admin token (IX_ADMIN_TOKEN) first.");
-    return;
-  }
+  if (!ensureToken()) return;
   btn.disabled = true;
   try {
     const r = await api(`/v1/connectors/${encodeURIComponent(id)}/runs`, { method: "POST", headers: { authorization: `Bearer ${tokenInput.value}` } });
@@ -152,11 +163,7 @@ $("posture-close").addEventListener("click", () => $("posture").close());
 
 // ---------- panic ----------
 $("panic").addEventListener("click", async () => {
-  if (!tokenInput.value) {
-    tokenInput.focus();
-    alert("Enter the admin token (IX_ADMIN_TOKEN) first.");
-    return;
-  }
+  if (!ensureToken()) return;
   if (prompt("PANIC disables EVERY connector and wipes all tokens. Type 'panic' to confirm.") !== "panic") return;
   try {
     const r = await api("/v1/panic", { method: "POST", headers: { authorization: `Bearer ${tokenInput.value}`, "content-type": "application/json" }, body: "{}" });

@@ -65,7 +65,7 @@ function log(line, cls) {
   box.scrollTop = box.scrollHeight;
 }
 const adminHeaders = (extra = {}) => {
-  if (!tokenInput.value) throw new Error("enter the admin token (top right) first");
+  if (!ensureToken()) throw new Error("admin token needed (IX_ADMIN_TOKEN in .env)");
   return { authorization: `Bearer ${tokenInput.value}`, ...extra };
 };
 
