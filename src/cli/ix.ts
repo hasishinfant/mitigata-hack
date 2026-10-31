@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ix CLI. Phase 2: validate, schema, add, update, run, runs, query, quarantine.
+// ix CLI. Phase 3: validate, schema, add, update, run, runs, query, quarantine.
 // `run` uses the in-process broker for now; Phase 5/6 route it through the API and broker process.
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
@@ -116,16 +116,18 @@ program
   .action(
     action(async (id: string, opts: { stream?: string[] }) => {
       const conn = await loadActiveConnector(db(), id);
-      if (conn.status !== "enabled") throw new Error(`connector ${id} is ${conn.status}`);
       const broker = createLocalBroker({ getConnector: (cid) => (cid === conn.metadata.id ? conn : undefined), secrets: envSecretSource() });
       const results = await runConnector({ connector: conn, broker, store: createPgRunStore(db()), streams: opts.stream });
       for (const r of results) {
         console.log(
           `${r.stream.padEnd(12)} ${paint(r.status).padEnd(tty ? 21 : 12)} requests=${r.requests} ok=${r.recordsOk} quarantined=${r.recordsQuarantined}` +
+            (r.retries ? ` retries=${r.retries}` : "") +
+            (r.rateLimitedMs ? ` waited=${(r.rateLimitedMs / 1000).toFixed(1)}s` : "") +
+            (r.resumed ? yellow(" (resumed from checkpoint)") : "") +
             (r.lastError ? dim(`  ${r.lastError}`) : ""),
         );
       }
-      if (results.some((r) => !["success", "partial"].includes(r.status))) process.exitCode = 1;
+      if (results.some((r) => !["success", "partial", "paused"].includes(r.status))) process.exitCode = 1;
     }),
   );
 
@@ -141,6 +143,9 @@ program
       for (const r of rows)
         console.log(
           `${String(r.started_at).slice(0, 19)}  ${r.stream.padEnd(10)} ${paint(r.status).padEnd(tty ? 21 : 12)} req=${r.requests} ok=${r.records_ok} q=${r.records_quarantined}` +
+            (r.retries ? ` retries=${r.retries}` : "") +
+            (r.rate_limited_ms ? ` waited=${(r.rate_limited_ms / 1000).toFixed(1)}s` : "") +
+            (r.resumed ? " resumed" : "") +
             (r.last_error ? dim(`  ${r.last_error}`) : ""),
         );
     }),

@@ -9,6 +9,7 @@ export type MappedRecord = { sourceId: string; fields: Record<string, unknown>; 
 export type MapResult =
   | { ok: true; record: MappedRecord; present: string[] }
   | { ok: false; errors: string[]; present: string[] };
+// present: fields for which the provider supplied a value (used for schema-drift hit rates)
 
 const DATE_FIELDS = new Set(["last_login", "last_seen", "timestamp"]);
 const ALWAYS_REQUIRED: Record<Entity, string[]> = { user: ["id"], device: ["id"], event: ["id", "type"] };
@@ -40,8 +41,10 @@ function sourceValue(raw: unknown, spec: FieldSpec): unknown {
   return undefined;
 }
 
-function mapField(raw: unknown, field: string, spec: FieldSpec): unknown {
+/** Returns the final value and whether the provider actually supplied one (defaults don't count: drift detection). */
+function mapField(raw: unknown, field: string, spec: FieldSpec): { value: unknown; hit: boolean } {
   let v = sourceValue(raw, spec);
+  const hit = spec.const !== undefined || !isEmpty(v);
   const transforms = spec.transform === undefined ? [] : Array.isArray(spec.transform) ? spec.transform : [spec.transform];
   for (const t of transforms) v = applyTransform(t, v);
   if (spec.map_enum && !isEmpty(v)) {
@@ -51,7 +54,7 @@ function mapField(raw: unknown, field: string, spec: FieldSpec): unknown {
   }
   if (isEmpty(v) && spec.default !== undefined) v = spec.default;
   if (DATE_FIELDS.has(field) && !isEmpty(v)) v = toIso(v);
-  return v;
+  return { value: v, hit };
 }
 
 export function mapRecord(raw: unknown, entity: Entity, mapping: Record<string, FieldSpec>): MapResult {
@@ -71,12 +74,14 @@ export function mapRecord(raw: unknown, entity: Entity, mapping: Record<string, 
     }
     let v: unknown;
     try {
-      v = mapField(raw, field, spec);
+      const out = mapField(raw, field, spec);
+      v = out.value;
+      if (out.hit) present.push(field);
     } catch (e) {
+      present.push(field); // a value was there, it just failed to convert
       errors.push(`${field}: ${(e as Error).message}`);
       continue;
     }
-    if (!isEmpty(v)) present.push(field);
     if (isEmpty(v)) {
       if (spec.required || ALWAYS_REQUIRED[entity].includes(field)) errors.push(`${field}: required value missing (${describe(spec)})`);
       continue;

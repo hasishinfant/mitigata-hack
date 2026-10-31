@@ -12,9 +12,27 @@ export type MockOptions = {
   tokens?: { bearer?: string; apiKey?: string; ssws?: string; basicUser?: string; basicPass?: string };
   /** CVE indexes whose records are returned without an id (to exercise quarantine). */
   cveMissingIdAt?: number[];
+  /** Simulate a provider renaming profile.email -> profile.mail (schema drift). */
+  renameEmail?: boolean;
+};
+
+export type FaultMode = "429" | "500" | "503" | "timeout" | "drop" | "ratelimit403";
+export type FaultSpec = {
+  mode: FaultMode;
+  count: number; // how many matching requests to fault
+  after?: number; // let this many matching requests through first
+  path?: string; // only requests whose path starts with this
+  retryAfter?: string; // 429: Retry-After header value (seconds or HTTP date); omit for none
+  resetInSec?: number; // ratelimit403: x-ratelimit-reset = now + this
+  delayMs?: number; // timeout: how long to hang
 };
 export type MockCall = { method: string; path: string; query: Record<string, string> };
-export type Mock = { app: FastifyInstance; calls: MockCall[]; options: Required<Omit<MockOptions, "tokens">> & { tokens: Required<NonNullable<MockOptions["tokens"]>> } };
+export type Mock = {
+  app: FastifyInstance;
+  calls: MockCall[];
+  options: Required<Omit<MockOptions, "tokens">> & { tokens: Required<NonNullable<MockOptions["tokens"]>> };
+  setFault(spec: FaultSpec | null): void;
+};
 
 export const MOCK_TOKENS = {
   bearer: "mock-bearer-token-1234",
@@ -40,14 +58,66 @@ export function buildMock(opts: MockOptions = {}): Mock {
     directoryUsers: opts.directoryUsers ?? 450,
     tickets: opts.tickets ?? 120,
     cveMissingIdAt: opts.cveMissingIdAt ?? [],
+    renameEmail: opts.renameEmail ?? false,
     tokens: { ...MOCK_TOKENS, ...opts.tokens },
   };
   const t = options.tokens;
   const calls: MockCall[] = [];
-  const app = Fastify({ logger: false });
-  app.addHook("onRequest", async (req) => {
+  const app = Fastify({ logger: false, forceCloseConnections: true });
+  let fault: (FaultSpec & { seen: number }) | null = null;
+  const setFault = (spec: FaultSpec | null) => {
+    fault = spec ? { ...spec, seen: 0 } : null;
+  };
+
+  app.addHook("onRequest", async (req, reply) => {
     const u = new URL(req.url, "http://x");
     calls.push({ method: req.method, path: u.pathname, query: Object.fromEntries(u.searchParams) });
+    if (!fault || u.pathname.startsWith("/__")) return;
+    if (fault.path && !u.pathname.startsWith(fault.path)) return;
+    if (fault.seen++ < (fault.after ?? 0)) return;
+    if (fault.count <= 0) return;
+    fault.count--;
+    switch (fault.mode) {
+      case "429":
+        if (fault.retryAfter !== undefined) reply.header("retry-after", fault.retryAfter);
+        return reply.code(429).send({ message: "Too Many Requests" });
+      case "500":
+      case "503":
+        return reply.code(Number(fault.mode)).send({ message: "Service Unavailable" });
+      case "ratelimit403":
+        reply.header("x-ratelimit-remaining", "0").header("x-ratelimit-reset", String(Math.ceil(Date.now() / 1000) + (fault.resetInSec ?? 5)));
+        return reply.code(403).send({ message: "API rate limit exceeded" });
+      case "timeout":
+        await new Promise((r) => setTimeout(r, fault?.delayMs ?? 5000).unref());
+        return reply.code(504).send({ message: "late" });
+      case "drop":
+        req.raw.socket.destroy();
+        return reply.hijack();
+    }
+  });
+
+  // Fault control for live demos: /__fault?mode=429&count=1&retry_after=30&after=1 ; /__fault?mode=clear
+  app.get("/__fault", async (req) => {
+    const q = qp(req);
+    if (!q.mode || q.mode === "clear") {
+      setFault(null);
+      return { fault: null };
+    }
+    setFault({
+      mode: q.mode as FaultMode,
+      count: Number(q.count ?? 1),
+      after: q.after ? Number(q.after) : undefined,
+      path: q.path,
+      retryAfter: q.retry_after,
+      resetInSec: q.reset_in ? Number(q.reset_in) : undefined,
+      delayMs: q.delay_ms ? Number(q.delay_ms) : undefined,
+    });
+    return { fault };
+  });
+  // Schema drift toggle: /__drift?rename_email=1
+  app.get("/__drift", async (req) => {
+    options.renameEmail = qp(req).rename_email === "1";
+    return { renameEmail: options.renameEmail };
   });
 
   // ---- GitHub-like: Bearer, Link header with page numbers ----
@@ -106,7 +176,12 @@ export function buildMock(opts: MockOptions = {}): Mock {
       lastLogin: i % 7 === 0 ? null : iso(i),
       lastUpdated: iso(i + 2),
       created: iso(-i),
-      profile: { firstName: `First${i}`, lastName: `Last${i}`, email: `User${i}@Example.TEST`, login: `user${i}@example.test` },
+      profile: {
+        firstName: `First${i}`,
+        lastName: `Last${i}`,
+        [options.renameEmail ? "mail" : "email"]: `User${i}@Example.TEST`,
+        login: `user${i}@example.test`,
+      },
     }));
   app.get("/api/v1/users", async (req, reply) => {
     if (req.headers.authorization !== `SSWS ${t.ssws}`) return unauthorized(reply, "Invalid token provided");
@@ -148,7 +223,7 @@ export function buildMock(opts: MockOptions = {}): Mock {
   });
 
   app.get("/__health", async () => ({ ok: true }));
-  return { app, calls, options };
+  return { app, calls, options, setFault };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

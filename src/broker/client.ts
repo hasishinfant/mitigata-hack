@@ -1,21 +1,36 @@
-// In-process broker (Phase 2). Phase 6 moves this behind a socket in its own process;
+// In-process broker. Phase 6 moves this behind a socket in its own process;
 // the Broker interface stays the same so workers don't change.
+// Every outbound call gets: policy check, auth, token-bucket throttle, retry with backoff,
+// 429 / Retry-After handling, and response scrubbing.
 import type { ResolvedConnector } from "../config/load.ts";
 import { log, registerSecretForScrub } from "../log.ts";
 import { applyAuth } from "./auth/index.ts";
-import { httpCall } from "./http.ts";
+import { httpCall, type HttpResult } from "./http.ts";
 import { hostAllowed, methodAllowed, pathAllowed } from "./policy.ts";
+import { backoffMs, classifyResponse, providerWaitMs, realClock, TokenBucket, type Clock } from "./retry.ts";
 import { BrokerError, type Broker, type BrokerRequest, type BrokerResponse, type SecretSource } from "./types.ts";
 
 const MAX_BYTES = 64 * 1024 * 1024;
+const MAX_RATE_LIMIT_WAITS = 5;
 const FORBIDDEN_HEADERS = new Set(["authorization", "proxy-authorization", "cookie", "host", "x-api-key"]);
 
 export type LocalBrokerOptions = {
   getConnector: (id: string) => ResolvedConnector | undefined;
   secrets: SecretSource;
+  clock?: Clock;
+  random?: () => number;
 };
 
 export function createLocalBroker(opts: LocalBrokerOptions): Broker {
+  const clock = opts.clock ?? realClock;
+  const buckets = new Map<string, TokenBucket>();
+  const bucketFor = (conn: ResolvedConnector): TokenBucket => {
+    const rpm = conn.runtime.rateLimit.requestsPerMinute;
+    let b = buckets.get(conn.metadata.id);
+    if (!b || b.rpm !== rpm) buckets.set(conn.metadata.id, (b = new TokenBucket(rpm, clock.now())));
+    return b;
+  };
+
   return {
     async request(req: BrokerRequest): Promise<BrokerResponse> {
       const conn = opts.getConnector(req.connectorId);
@@ -31,13 +46,74 @@ export function createLocalBroker(opts: LocalBrokerOptions): Broker {
       const used = await applyAuth(conn.connection.auth, conn.metadata.tenant, { url, headers }, opts.secrets);
       used.forEach(registerSecretForScrub);
 
-      const started = Date.now();
-      const res = await httpCall("GET", url, headers, { timeoutMs: conn.runtime.timeoutMs, maxBytes: MAX_BYTES });
-      const durationMs = Date.now() - started;
-      log.info({ connector: conn.metadata.id, method: "GET", host: url.host, path: url.pathname, status: res.status, ms: durationMs }, "outbound");
+      const { retries: retryCfg, rateLimit, timeoutMs } = conn.runtime;
+      const where = { connector: conn.metadata.id, host: url.host, path: url.pathname };
+      let errorAttempts = 0; // consumed by timeouts / network errors / 5xx
+      let rateWaits = 0; // consumed by 429 / rate-limit 403
+      let rateLimitedMs = 0;
+      const retries = () => errorAttempts + rateWaits;
+      const started = clock.now();
 
-      // A provider may echo a credential back (e.g. a query-string key inside a Link header). Strip it.
-      return { status: res.status, headers: scrubValues(res.headers, used), body: scrubText(res.body, used), durationMs };
+      for (;;) {
+        await bucketFor(conn).take(clock);
+        let res: HttpResult;
+        try {
+          res = await httpCall("GET", url, headers, { timeoutMs, maxBytes: MAX_BYTES });
+        } catch (e) {
+          if (e instanceof BrokerError && (e.kind === "timeout" || e.kind === "network") && errorAttempts < retryCfg.max) {
+            const wait = backoffMs(errorAttempts, retryCfg.baseMs, retryCfg.jitter, opts.random);
+            log.warn({ ...where, error: e.kind, attempt: errorAttempts + 1, wait_ms: wait }, "retrying");
+            await clock.sleep(wait, "backoff");
+            errorAttempts++;
+            continue;
+          }
+          if (e instanceof BrokerError) {
+            if (errorAttempts) e.message += ` (after ${errorAttempts} retries)`;
+            e.retries = retries();
+            e.rateLimitedMs = rateLimitedMs;
+          }
+          throw e;
+        }
+
+        const cls = classifyResponse(res.status, res.headers);
+        log.info({ ...where, method: "GET", status: res.status, attempt: retries() + 1 }, "outbound");
+
+        if (cls === "rate_limited") {
+          const asked = rateLimit.respectRetryAfter ? providerWaitMs(res.headers, clock.now()) : undefined;
+          const wait = asked ?? backoffMs(rateWaits, retryCfg.baseMs, retryCfg.jitter, opts.random);
+          const fail = (msg: string) => {
+            const err = new BrokerError("rate_limited", msg);
+            err.retries = retries();
+            err.rateLimitedMs = rateLimitedMs;
+            return err;
+          };
+          if (wait > rateLimit.maxWaitMs)
+            throw fail(`provider asked to wait ${Math.ceil(wait / 1000)} s, more than max_wait ${Math.ceil(rateLimit.maxWaitMs / 1000)} s`);
+          if (rateWaits >= MAX_RATE_LIMIT_WAITS) throw fail(`still rate limited after ${rateWaits} waits`);
+          log.warn({ ...where, status: res.status, wait_ms: wait, source: asked === undefined ? "backoff" : "provider" }, "rate limited, waiting");
+          await clock.sleep(wait, "rate_limit");
+          rateLimitedMs += wait;
+          rateWaits++;
+          continue;
+        }
+        if (cls === "retryable" && errorAttempts < retryCfg.max) {
+          const wait = backoffMs(errorAttempts, retryCfg.baseMs, retryCfg.jitter, opts.random);
+          log.warn({ ...where, status: res.status, attempt: errorAttempts + 1, wait_ms: wait }, "retrying");
+          await clock.sleep(wait, "backoff");
+          errorAttempts++;
+          continue;
+        }
+
+        // A provider may echo a credential back (e.g. a query-string key inside a Link header). Strip it.
+        return {
+          status: res.status,
+          headers: scrubValues(res.headers, used),
+          body: scrubText(res.body, used),
+          durationMs: clock.now() - started,
+          retries: retries(),
+          rateLimitedMs,
+        };
+      }
     },
   };
 }

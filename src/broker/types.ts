@@ -13,12 +13,17 @@ export type BrokerResponse = {
   headers: Record<string, string>; // lower-cased names, set-cookie removed
   body: string;
   durationMs: number;
+  retries: number; // retries performed inside the broker for this request
+  rateLimitedMs: number; // time spent waiting because the provider said so
 };
 
-export type BrokerErrorKind = "policy_denied" | "secret_missing" | "timeout" | "network" | "too_large" | "unknown_connector";
+export type BrokerErrorKind =
+  | "policy_denied" | "secret_missing" | "timeout" | "network" | "too_large" | "unknown_connector" | "rate_limited";
 
 export class BrokerError extends Error {
   kind: BrokerErrorKind;
+  retries = 0;
+  rateLimitedMs = 0;
   constructor(kind: BrokerErrorKind, message: string) {
     super(message);
     this.kind = kind;
