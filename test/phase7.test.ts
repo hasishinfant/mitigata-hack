@@ -32,6 +32,7 @@ describe("scope assessment and flags", () => {
   it("separates expected, extra, forbidden and write-like scopes", () => {
     const a = assessScopes(["read:org", "repo", "admin:org", "gist"], ["read:org", "members:read"], ["admin:*"]);
     expect(a).toMatchObject({ extra: ["repo", "admin:org", "gist"], missing: ["members:read"], forbidden: ["admin:org"], writeLike: ["repo", "admin:org"] });
+    expect(assessScopes(["write:events"], ["write:events"]).writeLike).toEqual(["write:events"]);
     expect(assessScopes(null, ["x"]).granted).toBeNull();
   });
   it("initial cursor: relative or absolute", () => {
@@ -118,6 +119,7 @@ describe.skipIf(!hasDb)("breach features", () => {
     expect(p.flags.map((f) => f.message)).toContain("token works from any IP: a stolen copy is usable anywhere");
     expect(p.credentials[0]).toMatchObject({ ref: "mock_bearer", stored: true, age_days: 0 });
     expect(p.reach.allowed_hosts).toEqual(["localhost"]);
+    expect(p.streams[0]!.fields).toContainEqual({ name: "name", sources: ["login"] });
 
     const h = await getHealth(appPool, env);
     expect(h.connectors[0]!.posture).toMatchObject({ risk: "high" });
@@ -183,12 +185,14 @@ describe.skipIf(!hasDb)("breach features", () => {
     const r = await panic(appPool, { env });
     expect(r.disabled).toEqual(["mock-github-members"]);
     expect(r.broker.error).toMatch(/NOT wiped/);
+    expect(r.queued_runs_error).toMatch(/could not be confirmed as cancelled/);
   });
 
   it("hygiene: idle connector auto-disabled; re-enable restarts the clock; old credential raises a rotate alert", async () => {
     await remote.register(fixture("mock-github-members.yaml"), "add"); // idle_disable_days: 14
     await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer);
     expect((await runHygiene(appPool, { now: Date.now() + 10 * DAY, env })).disabled).toEqual([]);
+    expect((await runHygiene(appPool, { now: Date.now() + 14 * DAY, env })).disabled).toEqual([]);
     const h = await runHygiene(appPool, { now: Date.now() + 15 * DAY, env });
     expect(h.disabled).toEqual(["mock-github-members"]);
     const c = (await appPool.query("select status, disabled_reason from connectors")).rows[0];
@@ -233,6 +237,16 @@ describe.skipIf(!hasDb)("breach features", () => {
     await appPool.query("insert into alerts (connector_id, kind, message) values ('mock-github-members', 'test', 'hello')");
     expect(await deliverAlerts(appPool, remote)).toEqual({ sent: 0, noChannel: 0, failed: 1 });
     expect((await appPool.query("select delivered, channel from alerts")).rows[0]).toEqual({ delivered: false, channel: "error" });
+  });
+
+  it("delivers pending alerts older than a day", async () => {
+    const hook = `http://localhost:${env.MOCK_PORT}/services/T0001/B0001/old-alert`;
+    await remote.register(ghWith(GH_CRED, "alerts: { slack_webhook_ref: slack_secops }\n"), "add");
+    await remote.putSecret("demo", "slack_secops", hook);
+    await appPool.query(
+      "insert into alerts (connector_id, kind, message, created_at) values ('mock-github-members', 'old', 'still pending', now() - interval '2 days')",
+    );
+    expect(await deliverAlerts(appPool, remote)).toEqual({ sent: 1, noChannel: 0, failed: 0 });
   });
 
   it("incremental sync: watermark injected next run; only changed records fetched; never moves backwards", async () => {

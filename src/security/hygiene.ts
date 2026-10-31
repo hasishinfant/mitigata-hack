@@ -8,11 +8,11 @@ import { raiseAlertOnce } from "./alerts.ts";
 import { credentialRefs } from "./posture.ts";
 
 const DAY = 86_400_000;
-export type HygieneReport = { disabled: string[]; rotate: string[] };
+export type HygieneReport = { disabled: string[]; rotate: string[]; errors: { connector_id: string; message: string }[] };
 
 export async function runHygiene(pool: pg.Pool, opts: { now?: number; env?: Record<string, string | undefined> } = {}): Promise<HygieneReport> {
   const now = opts.now ?? Date.now();
-  const report: HygieneReport = { disabled: [], rotate: [] };
+  const report: HygieneReport = { disabled: [], rotate: [], errors: [] };
   const rows = (
     await pool.query(
       `select k.id, k.last_success_at, k.enabled_at, v.validated_at
@@ -24,7 +24,8 @@ export async function runHygiene(pool: pg.Pool, opts: { now?: number; env?: Reco
     let conn;
     try {
       conn = await loadActiveConnector(pool, row.id, opts.env);
-    } catch {
+    } catch (e) {
+      report.errors.push({ connector_id: row.id, message: (e as Error).message });
       continue;
     }
     if (conn.connection.auth.type === "none") continue;
@@ -37,7 +38,7 @@ export async function runHygiene(pool: pg.Pool, opts: { now?: number; env?: Reco
       const times = [row.last_success_at, row.validated_at, row.enabled_at, ...creds.map((c) => c.created_at)].filter(Boolean).map((t) => Date.parse(t));
       const last = Math.max(...times);
       const idle = Math.floor((now - last) / DAY);
-      if (idle >= idleDays) {
+      if (idle > idleDays) {
         const reason = `idle for ${idle} days (idle_disable_days: ${idleDays}); credential disabled to shrink blast radius`;
         await pool.query("update connectors set status = 'disabled', disabled_reason = $2, disabled_at = now(), next_run_at = null where id = $1", [row.id, reason]);
         await raiseAlertOnce(pool, row.id, "idle_disabled", reason, 0);

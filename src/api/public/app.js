@@ -131,9 +131,10 @@ async function showPosture(id) {
   $("posture-body").replaceChildren(
     el("div", { class: "kv" },
       el("div", {}, "Source / auth"), el("div", {}, `${p.source} · ${p.auth_type} · ${p.status}`),
-      el("div", {}, "Streams"), el("div", {}, p.streams.map((x) => `${x.method} ${x.path} → ${x.entity}`).join("  |  ")),
+      el("div", {}, "Streams / data"), el("div", {}, p.streams.map((x) => `${x.name}: ${x.method} ${x.path} → ${x.entity} [${x.fields.map((f) => `${f.name}${f.sources.length ? ` ← ${f.sources.join(", ")}` : ""}`).join("; ")}]`).join("  |  ")),
       el("div", {}, "Allowed hosts"), el("div", {}, p.reach.allowed_hosts.join(", ")),
       el("div", {}, "Allowed paths"), el("div", {}, [...p.reach.allowed_paths, ...p.reach.read_only_post.map((x) => `POST ${x}`)].join(", ")),
+      el("div", {}, "Allowed methods"), el("div", {}, p.reach.methods.join(", ")),
       el("div", {}, "Per-run caps"), el("div", {}, `${p.reach.max_requests_per_run} requests, ${p.reach.max_records_per_run} records`),
       el("div", {}, "Credentials"), el("div", {}, p.credentials.map((c) => (c.stored ? `${c.ref}: ${c.age_days}d old, idle ${c.idle_days}d` : `${c.ref}: not stored`)).join("  |  ") || "none"),
       el("div", {}, "Expected scopes"), el("div", {}, s.expected.join(" ") || "—"),
@@ -141,6 +142,7 @@ async function showPosture(id) {
       el("div", {}, "Revocable by API"), el("div", {}, String(p.revocable_by_api)),
       el("div", {}, "Provider IP restriction"), el("div", {}, p.provider_ip_restriction),
       el("div", {}, "Policy violations (7d)"), el("div", {}, String(p.violations_7d)),
+      el("div", {}, "Last policy violation"), el("div", {}, p.last_violation ? `${ago(p.last_violation.ts)} · ${p.last_violation.decision}` : "none"),
     ),
     ...p.flags.map((f) => el("div", { class: `flag flag-${f.level}` }, `${f.level.toUpperCase()}  ${f.message}`)),
   );
@@ -160,6 +162,7 @@ $("panic").addEventListener("click", async () => {
     const r = await api("/v1/panic", { method: "POST", headers: { authorization: `Bearer ${tokenInput.value}`, "content-type": "application/json" }, body: "{}" });
     $("panic-body").replaceChildren(
       el("p", {}, `${r.disabled.length} connectors disabled · ${r.queued_runs_cancelled} queued runs cancelled · ${r.broker.tokens_revoked} tokens revoked at the provider`),
+      r.queued_runs_error ? el("div", { class: "error" }, r.queued_runs_error) : null,
       r.broker.error ? el("div", { class: "error" }, r.broker.error) : el("p", { class: "muted" }, "All in-memory tokens in the broker were wiped."),
       el("div", { class: "table-wrap" }, el("table", {},
         el("thead", {}, el("tr", {}, ["", "connector", "auth", "what to do"].map((h) => el("th", {}, h)))),

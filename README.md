@@ -35,6 +35,9 @@ ix secret set github_pat                # hidden prompt; or: ix secret set okta_
 ix test connectors/github-members.yaml  # auth + first page + 3 mapped records + granted scopes; writes nothing
 ix add connectors/github-members.yaml
 ix run github-members
+ix posture github-members                 # blast radius, granted scopes and policy history
+ix rehearse                              # dry-run incident response checks; no changes made
+ix panic --yes                            # disable all connectors and show a revocation checklist
 ix query users --source github
 ix runs github-members
 ix quarantine
@@ -58,16 +61,23 @@ open http://localhost:7070    # dashboard: health cards, run history, records, q
 - **Scheduler:** turns each config's `schedule.every` (plus jitter) into queued runs. Paused connectors are skipped until their cool-down ends.
 - **Worker:** runs the queued jobs. Only one run per connector can be queued or active at a time.
 - **API:** read routes are open on localhost. Routes that change state need `Authorization: Bearer $IX_ADMIN_TOKEN`; the dashboard's "Run now" button asks for the token.
+- **Hygiene and alerts:** the scheduler disables connectors past `credential.idle_disable_days`, flags credentials past `max_age_days`, and delivers failure, auth, drift, breaker and panic alerts through the broker. Store webhook URLs as broker secrets; only `hooks.slack.com` is allowed by default (`IX_ALERT_WEBHOOK_HOSTS` can add approved hosts).
+- **Incremental sync:** streams can define `incremental.cursor_field`, `param`, `template` and `initial`; successful complete runs persist a watermark. `{{now}}` is available for bounded windows such as NVD's `lastModEndDate`.
+- **Raw payloads:** `data.store_raw: true` stores a secret-redacted raw record under `attributes._raw`; it is off by default and requires `data.redact_secrets: true`.
+- **Incident-response rehearsal:** `ix rehearse` checks broker reachability, audit-ledger integrity and connector posture, then previews the panic actions and manual-revocation checklist. It does not disable connectors, cancel jobs, revoke tokens, send alerts, or purge secrets. Use `ix rehearse --json` for machine-readable output.
 
 | Route | Purpose |
 |---|---|
 | `GET /v1/health` | Status, last run, records pulled, last error and next run for every connector |
 | `GET /v1/records/:entity?source=&since=&type=` | users / devices / events from the common store |
 | `GET /v1/connectors/:id/runs` | Run history |
+| `GET /v1/connectors/:id/posture` | Reach, mapped fields, credential age/scopes, and policy violations |
+| `GET /v1/alerts` | Recent alerts and delivery state |
 | `GET /v1/quarantine` | Records that failed mapping, with the reasons |
 | `POST /v1/configs/validate` | Validate YAML: line-numbered errors and warnings |
 | `POST /v1/connectors`, `PUT /v1/connectors/:id` | Register a connector or store a new version (admin) |
 | `POST /v1/connectors/:id/runs` | Run now (admin) |
+| `POST /v1/panic` | Disable every connector, cancel queued runs, wipe broker token caches, and return a revocation checklist (admin; accepts `{"purge_secrets":true}`) |
 
 ## Security model (what a breached hub gives up)
 
@@ -97,7 +107,7 @@ Limit: none of this stops someone who already stole a provider token from replay
 | `connectors/coverage/` | Vendor coverage configs: CrowdStrike, Trend Vision One, Netskope, FortiGate, Elastic. See `docs/coverage.md`. |
 | `src/config` | Zod schema, validator, `${env.X}` interpolation |
 | `src/broker` | Broker process (socket server and client), policy, auth, OAuth2, retries, rate limits, encrypted secrets, signed configs, audit ledger. **No provider-specific code.** |
-| `src/security` | Leak check |
+| `src/security` | Posture, credential hygiene, panic, alert delivery and leak check |
 | `src/engine` | Runner, paging, checkpoints, drift, breaker. **No provider-specific code.** |
 | `src/mapping` | Path resolver, transforms, mapper, secret scanner |
 | `src/store` | Postgres: upserts, runs, quarantine, connector versions, health |

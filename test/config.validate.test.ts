@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { validateConfigText } from "../src/config/validate.ts";
 
-const env = { GITHUB_ORG: "acme", GITHUB_REPO: "web", OKTA_ORG: "integrator-123" };
+const env = { GITHUB_ORG: "acme", GITHUB_REPO: "web", GITHUB_REPO_OWNER: "acme", OKTA_ORG: "integrator-123" };
 const fx = (name: string) => readFileSync(join(import.meta.dirname, "fixtures/configs", name), "utf8");
 const v = (name: string) => validateConfigText(fx(name), { env });
 const first = (name: string) => v(name).errors[0]!;

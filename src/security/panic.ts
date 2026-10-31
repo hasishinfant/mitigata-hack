@@ -23,6 +23,7 @@ export type PanicReport = {
   at: string;
   disabled: string[];
   queued_runs_cancelled: number;
+  queued_runs_error?: string;
   broker: { tokens_revoked: number; secrets_purged: number; error?: string };
   checklist: ChecklistItem[];
 };
@@ -41,7 +42,14 @@ export async function panic(
   ).rows.map((r) => r.id as string);
 
   let cancelled = 0;
-  if (opts.boss) cancelled = await opts.boss.deleteQueuedJobs(RUN_QUEUE).catch(() => 0);
+  let queuedRunsError: string | undefined;
+  if (opts.boss) {
+    try {
+      cancelled = await opts.boss.deleteQueuedJobs(RUN_QUEUE);
+    } catch (e) {
+      queuedRunsError = `queued run cancellation failed: ${(e as Error).message}`;
+    }
+  } else queuedRunsError = "job queue unavailable; queued runs could not be confirmed as cancelled";
 
   const broker: PanicReport["broker"] = { tokens_revoked: 0, secrets_purged: 0 };
   let revocations: { connectorId: string; revoked: boolean; detail: string }[] = [];
@@ -79,5 +87,5 @@ export async function panic(
   await pool.query("insert into alerts (connector_id, kind, message) values (null, 'panic', $1)", [
     `panic by ${actor}: ${disabled.length} connectors disabled, ${broker.tokens_revoked} tokens revoked${broker.error ? `; ${broker.error}` : ""}`,
   ]);
-  return { at, disabled, queued_runs_cancelled: cancelled, broker, checklist };
+  return { at, disabled, queued_runs_cancelled: cancelled, ...(queuedRunsError ? { queued_runs_error: queuedRunsError } : {}), broker, checklist };
 }

@@ -15,12 +15,12 @@ export async function raiseAlertOnce(pool: pg.Pool, connectorId: string, kind: s
 
 export type DeliveryReport = { sent: number; noChannel: number; failed: number };
 
-/** Deliver pending alerts (last 24 h) through the broker. Failed deliveries are retried on the next call. */
+/** Deliver pending alerts through the broker. Failed deliveries are retried on the next call. */
 export async function deliverAlerts(pool: pg.Pool, admin: BrokerAdmin, limit = 20): Promise<DeliveryReport> {
   const rows = (
     await pool.query(
       `select id, connector_id, kind, message from alerts
-       where delivered = false and created_at > now() - interval '1 day' order by id limit $1`,
+       where delivered = false order by id limit $1`,
       [limit],
     )
   ).rows as { id: number; connector_id: string | null; kind: string; message: string }[];

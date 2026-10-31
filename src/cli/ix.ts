@@ -14,6 +14,7 @@ import { createPool, type Pool } from "../store/db.ts";
 import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "../store/connectors.ts";
 import { panic } from "../security/panic.ts";
 import { getPosture, type Level } from "../security/posture.ts";
+import { runRehearsal } from "../security/rehearsal.ts";
 import { startBoss } from "../scheduler/queue.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
 import { listQuarantine } from "../store/quarantine.ts";
@@ -325,9 +326,13 @@ program
       const badge = LEVEL_PAINT[p.risk](`${p.risk.toUpperCase()} RISK`);
       console.log(`${p.connector_id}  (${p.source}, ${p.auth_type}, ${p.status})  ${badge}`);
       console.log(dim("  reach"));
-      for (const st of p.streams) console.log(`    ${st.method} ${st.path}  -> ${st.entity}`);
+      for (const st of p.streams) {
+        console.log(`    ${st.method} ${st.path}  -> ${st.entity}`);
+        for (const f of st.fields) console.log(`      ${f.name}${f.sources.length ? ` <- ${f.sources.join(", ")}` : ""}`);
+      }
       console.log(`    hosts: ${p.reach.allowed_hosts.join(", ")}`);
       console.log(`    paths: ${p.reach.allowed_paths.join(", ")}${p.reach.read_only_post.length ? `  read-only POST: ${p.reach.read_only_post.join(", ")}` : ""}`);
+      console.log(`    methods: ${p.reach.methods.join(", ")}`);
       console.log(`    caps:  ${p.reach.max_requests_per_run} requests, ${p.reach.max_records_per_run} records per run`);
       console.log(dim("  credential"));
       for (const c of p.credentials)
@@ -388,6 +393,7 @@ program
       console.log(red(`■ PANIC at ${r.at}`));
       console.log(`  connectors disabled: ${r.disabled.length}${r.disabled.length ? dim(` (${r.disabled.join(", ")})`) : ""}`);
       console.log(`  queued runs cancelled: ${r.queued_runs_cancelled}`);
+      if (r.queued_runs_error) console.log(red(`  ${r.queued_runs_error}`));
       if (r.broker.error) console.log(red(`  ${r.broker.error}`));
       else console.log(`  broker: in-memory tokens wiped, ${r.broker.tokens_revoked} revoked at the provider, ${r.broker.secrets_purged} stored secrets purged`);
       console.log(dim("\n  revocation checklist"));
@@ -396,6 +402,41 @@ program
         console.log(`  ${mark} ${c.connector_id.padEnd(22)} ${c.detail}`);
       }
       console.log(dim("\n  Re-enable one at a time after rotating its credential: ix secret set <ref> && ix enable <id>"));
+    }),
+  );
+
+program
+  .command("rehearse")
+  .description("run a non-destructive incident-response rehearsal; no connectors or secrets are changed")
+  .option("--json", "machine-readable output")
+  .action(
+    action(async (opts: { json?: boolean }) => {
+      const report = await runRehearsal({ pool: db(), broker: broker() });
+      if (opts.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(`Incident-response rehearsal  ${report.ready ? green("READY") : red("NOT READY")}`);
+        console.log(dim(`  generated ${report.generated_at}; no changes were made`));
+        for (const check of report.checks) {
+          const color = check.status === "pass" ? green : check.status === "attention" ? yellow : check.status === "fail" ? red : dim;
+          console.log(`  ${color(check.status.toUpperCase().padEnd(11))} ${check.name}: ${check.detail}`);
+        }
+        console.log(dim("\n  panic plan (not executed)"));
+        console.log(`    disable: ${report.panic_plan.disable_connectors.join(", ") || "no enabled connectors"}`);
+        console.log("    cancel queued runs and clear the broker's in-memory token cache");
+        console.log("    stored secrets will not be purged");
+        for (const c of report.connectors) {
+          const method = c.revocation === "api_revocation_declared"
+            ? "config declares OAuth API revocation (not exercised; only cached tokens are revoked)"
+            : c.revocation === "manual_provider_revocation"
+              ? `manual provider revocation${c.revoke_hint ? `: ${c.revoke_hint}` : ""}`
+              : c.revocation === "nothing_to_revoke" ? "no credential" : `posture unavailable: ${c.error}`;
+          console.log(`    ${c.id}: ${method}`);
+          for (const flag of c.flags) console.log(`      ${yellow(flag)}`);
+        }
+        if (!report.ready) process.exitCode = 1;
+      }
+      if (opts.json && !report.ready) process.exitCode = 1;
     }),
   );
 

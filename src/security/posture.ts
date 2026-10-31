@@ -22,7 +22,7 @@ export type Posture = {
   source: string;
   status: string;
   auth_type: string;
-  streams: { name: string; entity: string; method: string; path: string }[];
+  streams: { name: string; entity: string; method: string; path: string; fields: { name: string; sources: string[] }[] }[];
   reach: { allowed_hosts: string[]; allowed_paths: string[]; read_only_post: string[]; methods: string[]; max_requests_per_run: number; max_records_per_run: number };
   credentials: CredentialState[];
   scopes: ScopeAssessment & { source: "token_response" | "response_header" | "unknown" };
@@ -118,7 +118,19 @@ export async function getPosture(pool: pg.Pool, id: string, env: Record<string, 
     source: conn.metadata.source,
     status,
     auth_type: a.type,
-    streams: conn.streams.map((s) => ({ name: s.name, entity: s.entity, method: s.request.method, path: s.request.path })),
+    streams: conn.streams.map((s) => ({
+      name: s.name,
+      entity: s.entity,
+      method: s.request.method,
+      path: s.request.path,
+      fields: Object.entries(s.mapping).map(([name, spec]) => ({
+        name,
+        sources: [
+          ...(typeof spec.path === "string" ? [spec.path] : spec.path ?? []),
+          ...(spec.pick ?? []),
+        ],
+      })),
+    })),
     reach: {
       allowed_hosts: conn.policy.allowed_hosts, allowed_paths: conn.runtime.allowedPaths, read_only_post: conn.runtime.readOnlyPost,
       methods: conn.runtime.methods, max_requests_per_run: conn.runtime.maxRequestsPerRun, max_records_per_run: conn.runtime.maxRecordsPerRun,

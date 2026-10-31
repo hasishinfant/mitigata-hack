@@ -24,6 +24,7 @@ async function loop(): Promise<void> {
   try {
     const h = await runHygiene(pool);
     for (const id of h.disabled) log.warn({ connector: id }, "idle connector auto-disabled");
+    for (const e of h.errors) log.warn({ connector: e.connector_id, err: e.message }, "credential hygiene skipped connector");
     const r = await scheduler.tick();
     for (const s of r.skipped) if (!s.reason.startsWith("no schedule")) log.debug({ connector: s.id, reason: s.reason }, "not scheduled");
     const d = await deliverAlerts(pool, broker).catch((e: Error) => {

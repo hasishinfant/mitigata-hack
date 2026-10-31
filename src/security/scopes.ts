@@ -22,6 +22,6 @@ export function assessScopes(granted: string[] | null | undefined, expected: str
     extra,
     missing: expected.filter((e) => !granted.includes(e)),
     forbidden: granted.filter((g) => forbid.some((f) => globToRe(f).test(g))),
-    writeLike: extra.filter((g) => WRITE_SCOPE_RE.test(g)),
+    writeLike: granted.filter((g) => WRITE_SCOPE_RE.test(g)),
   };
 }
