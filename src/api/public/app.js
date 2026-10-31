@@ -98,10 +98,9 @@ async function refresh() {
 }
 
 async function runNow(id, btn) {
-  if (!ensureToken()) return;
   btn.disabled = true;
   try {
-    const r = await api(`/v1/connectors/${encodeURIComponent(id)}/runs`, { method: "POST", headers: { authorization: `Bearer ${tokenInput.value}` } });
+    const r = await api(`/v1/connectors/${encodeURIComponent(id)}/runs`, { method: "POST", headers: { "x-ix-dashboard": "1" } });
     btn.textContent = r.queued ? "Queued" : "Already running";
     setTimeout(refresh, 1500);
   } catch (e) {

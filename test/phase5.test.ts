@@ -195,6 +195,15 @@ describe.skipIf(!hasDb)("scheduler, worker, API", () => {
     const run2 = await app.inject({ method: "POST", url: "/v1/connectors/mock-github-members/runs", headers: { authorization: `Bearer ${ADMIN}` } });
     expect(run2.json()).toEqual({ queued: false, reason: "a run is already queued or running" });
     expect((await app.inject({ method: "POST", url: "/v1/connectors/nope/runs", headers: { authorization: `Bearer ${ADMIN}` } })).statusCode).toBe(404);
+
+    // Run now from the dashboard: no token, but only with the dashboard header (blocks cross-site requests).
+    await boss.deleteAllJobs(RUN_QUEUE);
+    expect((await app.inject({ method: "POST", url: "/v1/connectors/mock-github-members/runs" })).statusCode).toBe(401);
+    const dash = await app.inject({ method: "POST", url: "/v1/connectors/mock-github-members/runs", headers: { "x-ix-dashboard": "1" } });
+    expect(dash.statusCode).toBe(202);
+    expect(dash.json().queued).toBe(true);
+    // ...but the kill switch still needs the token.
+    expect((await app.inject({ method: "POST", url: "/v1/panic", headers: { "x-ix-dashboard": "1" } })).statusCode).toBe(401);
   });
 
   it("dashboard is served with a strict CSP and no inline script", async () => {

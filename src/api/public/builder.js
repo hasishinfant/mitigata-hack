@@ -317,7 +317,7 @@ $("b-run").addEventListener("click", async () => {
   const id = registeredId;
   const since = Date.now() - 2000;
   try {
-    const q = await api(`/v1/connectors/${encodeURIComponent(id)}/runs`, { method: "POST", headers: adminHeaders() });
+    const q = await api(`/v1/connectors/${encodeURIComponent(id)}/runs`, { method: "POST", headers: { "x-ix-dashboard": "1" } });
     log(q.queued ? `run queued for ${id}, waiting for the worker…` : `a run is already queued or running for ${id}, watching it…`);
     for (let i = 0; i < 90; i++) {
       await new Promise((r) => setTimeout(r, 2000));

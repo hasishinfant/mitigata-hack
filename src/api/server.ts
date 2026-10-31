@@ -177,7 +177,15 @@ export function buildApi(opts: ApiOptions) {
     return panic(opts.pool, { admin: opts.admin, boss: opts.boss, purgeSecrets: body.purge_secrets === true, actor: "api", env });
   });
 
-  app.post("/v1/connectors/:id/runs", { preHandler: requireAdmin }, async (req, reply) => {
+  // "Run now" is low-risk (the scheduler does the same; one run per connector at a time), so the dashboard may
+  // call it without the admin token. The custom header blocks cross-site requests: browsers won't send it to
+  // localhost from another origin without a CORS preflight, which this API never approves.
+  const requireRunAllowed = async (req: FastifyRequest, reply: FastifyReply) => {
+    if (req.headers["x-ix-dashboard"] === "1") return;
+    return requireAdmin(req, reply);
+  };
+
+  app.post("/v1/connectors/:id/runs", { preHandler: requireRunAllowed }, async (req, reply) => {
     const { id } = req.params as { id: string };
     if (!opts.boss) return reply.code(503).send({ error: "job queue not available" });
     const c = (await opts.pool.query("select status from connectors where id = $1", [id])).rows[0];
