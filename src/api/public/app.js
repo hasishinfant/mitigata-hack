@@ -3,9 +3,8 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const tokenInput = $("token");
-tokenInput.value = sessionStorage.getItem("ix_admin_token") || "";
-tokenInput.addEventListener("change", () => sessionStorage.setItem("ix_admin_token", tokenInput.value));
+// Admin token: never shown on the page; asked for by prompt when an action needs it, kept for this tab only.
+const tokenInput = { value: sessionStorage.getItem("ix_admin_token") || "" };
 
 /** Build an element: el("div", { class: "x", title: "y" }, child, "text", ...). */
 function el(tag, attrs, ...children) {
@@ -160,10 +159,13 @@ async function showPosture(id) {
 }
 $("posture-close").addEventListener("click", () => $("posture").close());
 
-// ---------- panic ----------
+// ---------- kill switch ----------
 $("panic").addEventListener("click", async () => {
-  if (!ensureToken()) return;
-  if (prompt("PANIC disables EVERY connector and wipes all tokens. Type 'panic' to confirm.") !== "panic") return;
+  // Always ask for the token here: entering it is the confirmation for an emergency stop.
+  const t = prompt("KILL SWITCH: disables EVERY connector, cancels queued runs and wipes all tokens.\n\nEnter the admin token to confirm (IX_ADMIN_TOKEN in .env):");
+  if (!t || !t.trim()) return;
+  tokenInput.value = t.trim();
+  sessionStorage.setItem("ix_admin_token", tokenInput.value);
   try {
     const r = await api("/v1/panic", { method: "POST", headers: { authorization: `Bearer ${tokenInput.value}`, "content-type": "application/json" }, body: "{}" });
     $("panic-body").replaceChildren(
@@ -179,7 +181,7 @@ $("panic").addEventListener("click", async () => {
     $("panic-result").showModal();
     refresh();
   } catch (e) {
-    alert(`Panic failed: ${e.message}`);
+    alert(`Kill switch failed: ${e.message}`);
   }
 });
 $("panic-close").addEventListener("click", () => $("panic-result").close());

@@ -66,7 +66,7 @@ ix add test/fixtures/configs/bad-delete.yaml    # refused: connectors are read-o
 ix audit log --deny -n 5                        # runtime calls outside the allow-list, denied and logged
 ix posture okta-users                           # blast radius: hosts, paths, scopes, age, revocability
 ```
-- Dashboard: click **Posture** on a card; click **Panic** → every connector disabled, Okta token revoked at Okta, checklist for the rest.
+- Dashboard: click **Posture** on a card; click **Kill switch** → every connector disabled, Okta token revoked at Okta, checklist for the rest.
 ```sh
 ix audit verify                                 # hash chain intact; an edited row would be detected
 ```
