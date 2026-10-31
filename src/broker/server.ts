@@ -131,6 +131,35 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     return r;
   });
 
+  // Remove a connector: its config versions, runs, checkpoints, quarantine, alerts and every record it
+  // stored. Secrets are kept (other connectors may share a ref); remove them with ix secret rm.
+  app.delete("/v1/connectors/:id", async (req) => {
+    const { id } = req.params as { id: string };
+    const client = await opts.pool.connect();
+    let records = 0;
+    try {
+      await client.query("begin");
+      const found = await client.query("select 1 from connectors where id = $1 for update", [id]);
+      if (!found.rowCount) {
+        await client.query("rollback");
+        throw Object.assign(new Error(`connector ${id} not found`), { statusCode: 404 });
+      }
+      for (const t of ["users", "devices", "events"]) records += (await client.query(`delete from ${t} where connector_id = $1`, [id])).rowCount ?? 0;
+      await client.query("delete from quarantine where connector_id = $1", [id]);
+      await client.query("delete from alerts where connector_id = $1", [id]);
+      await client.query("delete from connectors where id = $1", [id]); // cascades versions, runs, checkpoints
+      await client.query("commit");
+    } catch (e) {
+      await client.query("rollback").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+    forget(id);
+    await audit({ connectorId: id, action: "remove", decision: `allow: ${records} records deleted` });
+    return { removed: true, records };
+  });
+
   app.put("/v1/secrets/:tenant/:ref", async (req) => {
     const { tenant, ref } = req.params as { tenant: string; ref: string };
     const value = (req.body as { value?: unknown } | undefined)?.value;

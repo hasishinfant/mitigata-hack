@@ -223,6 +223,19 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     expect(test.json()).toMatchObject({ ok: true, connectorId: "mock-nvd-cves" });
   });
 
+  it("remove: connector, its config versions, runs and records are gone; secret is kept", async () => {
+    await remote.register(fixture("mock-github-members.yaml"), "add");
+    await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer);
+    const conn = await loadActiveConnector(appPool, "mock-github-members", env);
+    await runConnector({ connector: conn, broker: remote, store: createPgRunStore(appPool) });
+    expect(await remote.removeConnector("mock-github-members")).toEqual({ removed: true, records: 250 });
+    for (const t of ["connectors", "connector_versions", "runs", "users"])
+      expect(Number((await appPool.query(`select count(*) from ${t}`)).rows[0].count)).toBe(0);
+    expect((await remote.listSecrets()).map((x) => x.ref)).toEqual(["mock_bearer"]);
+    expect((await ledger()).at(-1)).toMatchObject({ action: "remove", decision: "allow: 250 records deleted" });
+    await expect(remote.removeConnector("mock-github-members")).rejects.toThrow(/not found/);
+  });
+
   it("ledger: chain verifies, and an edited row is detected (run last: it tampers)", async () => {
     await remote.register(fixture("mock-github-members.yaml"), "add");
     expect(await remote.verifyLedger()).toMatchObject({ ok: true });

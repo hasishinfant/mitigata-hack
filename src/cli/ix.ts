@@ -351,6 +351,26 @@ program
   );
 
 program
+  .command("rm")
+  .description("remove a connector and every record it stored (secrets are kept: ix secret rm)")
+  .argument("<id>")
+  .option("--yes", "do not ask for confirmation")
+  .action(
+    action(async (id: string, opts: { yes?: boolean }) => {
+      if (!opts.yes) {
+        if (!process.stdin.isTTY) throw new Error("refusing to remove without --yes in a non-interactive shell");
+        process.stderr.write(yellow(`remove ${id} and all its records? type the id to confirm: `));
+        const answer = await new Promise<string>((resolve) => process.stdin.once("data", (d) => resolve(String(d).trim())));
+        process.stdin.pause();
+        if (answer !== id) throw new Error("cancelled");
+      }
+      const r = await broker().removeConnector(id);
+      await db().query("delete from pgboss.job where data->>'connectorId' = $1 and state in ('created', 'retry')", [id]).catch(() => {});
+      console.log(`${green("✔")} ${id} removed (${r.records} records deleted)`);
+    }),
+  );
+
+program
   .command("disable")
   .description("disable a connector and drop its cached token in the broker")
   .argument("<id>")
