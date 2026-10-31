@@ -4,6 +4,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import pg from "pg";
+import { startBoss } from "../scheduler/queue.ts";
 
 const MIGRATIONS_DIR = join(import.meta.dirname, "../../migrations");
 
@@ -11,6 +12,7 @@ export async function migrate(
   adminUrl: string,
   rolePasswords: { app?: string; broker?: string } = {},
   say: (msg: string) => void = () => {},
+  appUrl?: string,
 ): Promise<void> {
   const client = new pg.Client({ connectionString: adminUrl });
   await client.connect();
@@ -37,8 +39,27 @@ export async function migrate(
       await client.query(`alter role ${role} password ${client.escapeLiteral(password)}`);
       say(`set password for ${role}`);
     }
+    if (appUrl) await installQueue(client, appUrl, say);
   } finally {
     await client.end();
+  }
+}
+
+/**
+ * Install the pg-boss job-queue schema as ix_app, so ix_app owns its queue tables. pg-boss issues
+ * CREATE SCHEMA on first install, which needs database-level CREATE; ix_app gets it only for the
+ * duration of the install. At runtime pg-boss only checks its version, so the grant isn't needed.
+ */
+async function installQueue(admin: pg.Client, appUrl: string, say: (msg: string) => void): Promise<void> {
+  const db = (await admin.query("select current_database() as d")).rows[0].d as string;
+  const ident = admin.escapeIdentifier(db);
+  await admin.query(`grant create on database ${ident} to ix_app`);
+  try {
+    const boss = await startBoss(appUrl);
+    await boss.stop({ graceful: false });
+    say("job queue schema ready");
+  } finally {
+    await admin.query(`revoke create on database ${ident} from ix_app`);
   }
 }
 
@@ -55,6 +76,7 @@ async function main(): Promise<void> {
     admin,
     { app: passwordFromUrl(process.env.DATABASE_URL_APP), broker: passwordFromUrl(process.env.DATABASE_URL_BROKER) },
     (m) => console.log(m),
+    process.env.DATABASE_URL_APP,
   );
 }
 

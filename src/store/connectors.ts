@@ -25,8 +25,9 @@ export async function registerConnector(
   const { id, tenant, source } = res.config.metadata;
   return withTx(pool, async (c) => {
     const existing = await c.query("select active_version from connectors where id = $1 for update", [id]);
-    if (opts.mustNotExist && existing.rowCount) throw new Error(`connector ${id} already exists; use "ix update"`);
-    if (opts.mustExist && !existing.rowCount) throw new Error(`connector ${id} does not exist; use "ix add"`);
+    if (opts.mustNotExist && existing.rowCount)
+      throw Object.assign(new Error(`connector ${id} already exists; use "ix update"`), { statusCode: 409 });
+    if (opts.mustExist && !existing.rowCount) throw Object.assign(new Error(`connector ${id} does not exist; use "ix add"`), { statusCode: 404 });
     await c.query("insert into tenants (id, name) values ($1, $1) on conflict do nothing", [tenant]);
     if (existing.rowCount) {
       const cur = await c.query(

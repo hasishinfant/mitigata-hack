@@ -12,6 +12,7 @@ import { resolvePath } from "../mapping/paths.ts";
 import { BrokerError, type Broker } from "../broker/types.ts";
 import { createPaginator, type PageRequest } from "./paginate/index.ts";
 
+export type RunTrigger = "manual" | "schedule" | "api";
 export type RunStatus = "running" | "success" | "partial" | "failed" | "auth_failed" | "degraded" | "paused";
 export type FieldStats = { records: number; hits: Record<string, number> };
 export type Checkpoint = { nextUrl: string; nextBody?: Record<string, unknown>; configHash: string };
@@ -42,7 +43,7 @@ export type FinishRun = {
 };
 
 export interface RunStore {
-  startRun(r: { runId: string; connectorId: string; stream: string; configHash: string; startedAt: Date; resumed: boolean }): Promise<void>;
+  startRun(r: { runId: string; connectorId: string; stream: string; configHash: string; startedAt: Date; resumed: boolean; trigger: RunTrigger }): Promise<void>;
   commitPage(p: PageCommit): Promise<void>;
   finishRun(r: FinishRun): Promise<void>;
   loadCheckpoint(connectorId: string, stream: string): Promise<Checkpoint | null>;
@@ -123,6 +124,7 @@ export async function runStream(opts: {
   stream: StreamConfig;
   broker: Broker;
   store: RunStore;
+  trigger?: RunTrigger;
 }): Promise<RunSummary> {
   const { connector: conn, stream, broker, store } = opts;
   const connectorId = conn.metadata.id;
@@ -140,7 +142,7 @@ export async function runStream(opts: {
   };
   const stats: FieldStats = { records: 0, hits: {} };
   const ctx = { connector: connectorId, stream: stream.name, run: runId };
-  await store.startRun({ runId, connectorId, stream: stream.name, configHash: conn.configHash, startedAt: new Date(), resumed });
+  await store.startRun({ runId, connectorId, stream: stream.name, configHash: conn.configHash, startedAt: new Date(), resumed, trigger: opts.trigger ?? "manual" });
   if (resumed) log.info({ ...ctx, path: req?.url.pathname }, "resuming from checkpoint");
 
   let stopReason: string | undefined;
@@ -251,6 +253,7 @@ export async function runConnector(opts: {
   broker: Broker;
   store: RunStore;
   streams?: string[];
+  trigger?: RunTrigger;
 }): Promise<RunSummary[]> {
   const { connector: conn, store } = opts;
   const state = await store.connectorState(conn.metadata.id);

@@ -13,13 +13,20 @@
     "db:up": "docker compose up -d postgres",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "check:no-provider-code": "! grep -riE 'github|okta|nvd|cisa' src/engine src/broker"
+    "check:no-provider-code": "! grep -riE 'github|okta|nvd|cisa' src/engine src/broker",
+    "dev": "tsx src/dev.ts",
+    "dev:mock": "tsx src/dev.ts --mock",
+    "api": "tsx src/api/index.ts",
+    "scheduler": "tsx src/scheduler/index.ts",
+    "worker": "tsx src/worker/index.ts",
+    "mock": "tsx mock/server.ts"
   },
   "dependencies": {
     "commander": "^13.1.0",
     "fastify": "^5.12.7",
     "jose": "^6.2.14",
     "pg": "^8.13.1",
+    "pg-boss": "^12.38.0",
     "pino": "^10.4.0",
     "undici": "^8.12.3",
     "yaml": "^2.7.0",

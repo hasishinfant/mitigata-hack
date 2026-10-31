@@ -45,6 +45,28 @@ npx tsx mock/server.ts                                           # mock provider
 ```
 The mock server also has `/__fault?mode=429|503|timeout|drop&count=N&retry_after=S&after=K` and `/__drift?rename_email=1`.
 
+## Running the platform (scheduler, worker, API, dashboard)
+
+```sh
+npx pnpm@10.28.0 dev          # api + scheduler + worker as separate processes
+npx pnpm@10.28.0 dev:mock     # same, plus the mock providers on :4010
+open http://localhost:7070    # dashboard: health cards, run history, records, quarantine
+```
+
+- **Scheduler:** turns each config's `schedule.every` (plus jitter) into queued runs. Paused connectors are skipped until their cool-down ends.
+- **Worker:** runs the queued jobs. Only one run per connector can be queued or active at a time.
+- **API:** read routes are open on localhost. Routes that change state need `Authorization: Bearer $IX_ADMIN_TOKEN`; the dashboard's "Run now" button asks for the token.
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/health` | Status, last run, records pulled, last error and next run for every connector |
+| `GET /v1/records/:entity?source=&since=&type=` | users / devices / events from the common store |
+| `GET /v1/connectors/:id/runs` | Run history |
+| `GET /v1/quarantine` | Records that failed mapping, with the reasons |
+| `POST /v1/configs/validate` | Validate YAML: line-numbered errors and warnings |
+| `POST /v1/connectors`, `PUT /v1/connectors/:id` | Register a connector or store a new version (admin) |
+| `POST /v1/connectors/:id/runs` | Run now (admin) |
+
 ## Where things are
 
 | Path | What |
@@ -55,7 +77,9 @@ The mock server also has `/__fault?mode=429|503|timeout|drop&count=N&retry_after
 | `src/broker` | Policy, auth, OAuth2, retries, rate limits, encrypted secrets. **No provider-specific code.** |
 | `src/engine` | Runner, paging, checkpoints, drift, breaker. **No provider-specific code.** |
 | `src/mapping` | Path resolver, transforms, mapper, secret scanner |
-| `src/store` | Postgres: upserts, runs, quarantine, connector versions |
+| `src/store` | Postgres: upserts, runs, quarantine, connector versions, health |
+| `src/scheduler`, `src/worker` | Job queue (pg-boss), schedule ticks, run execution |
+| `src/api` | Fastify API and the static dashboard (`public/`) |
 
 Check that the engine and broker stay provider-neutral:
 ```sh

@@ -9,8 +9,8 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
   return {
     async startRun(r) {
       await pool.query(
-        "insert into runs (id, connector_id, stream, status, started_at, config_hash, resumed) values ($1, $2, $3, 'running', $4, $5, $6)",
-        [r.runId, r.connectorId, r.stream, r.startedAt, r.configHash, r.resumed],
+        "insert into runs (id, connector_id, stream, status, started_at, config_hash, resumed, trigger) values ($1, $2, $3, 'running', $4, $5, $6, $7)",
+        [r.runId, r.connectorId, r.stream, r.startedAt, r.configHash, r.resumed, r.trigger],
       );
     },
 
@@ -99,7 +99,7 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
 
 export async function listRuns(pool: pg.Pool, connectorId: string, limit = 20) {
   const res = await pool.query(
-    `select id, stream, status, started_at, finished_at, requests, records_ok, records_quarantined, retries, rate_limited_ms, resumed, last_error
+    `select id, stream, status, started_at, finished_at, requests, records_ok, records_quarantined, retries, rate_limited_ms, resumed, trigger, last_error
      from runs where connector_id = $1 order by started_at desc limit $2`,
     [connectorId, limit],
   );

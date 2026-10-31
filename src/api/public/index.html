@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IntegrateX · Health</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <div class="brand">IntegrateX <span class="muted">connection health</span></div>
+    <nav>
+      <button class="tab active" data-tab="connectors">Connectors</button>
+      <button class="tab" data-tab="records">Records</button>
+      <button class="tab" data-tab="quarantine">Quarantine</button>
+    </nav>
+    <div class="right">
+      <span id="updated" class="muted"></span>
+      <input id="token" type="password" placeholder="admin token (for Run now)" autocomplete="off">
+    </div>
+  </header>
+
+  <main>
+    <section id="tab-connectors">
+      <div id="summary" class="summary"></div>
+      <div id="cards" class="cards"></div>
+      <p id="empty" class="muted hidden">No connectors yet. Add one with <code>ix add connectors/&lt;file&gt;.yaml</code>.</p>
+    </section>
+
+    <section id="tab-records" class="hidden">
+      <div class="toolbar">
+        <select id="entity"><option>users</option><option>devices</option><option>events</option></select>
+        <input id="source" placeholder="source filter (e.g. github)">
+        <button id="load-records">Load</button>
+        <span id="records-count" class="muted"></span>
+      </div>
+      <div class="table-wrap"><table id="records"></table></div>
+    </section>
+
+    <section id="tab-quarantine" class="hidden">
+      <p class="muted">Records that failed mapping. Raw payloads are secret-scanned before storage.</p>
+      <div id="quarantine"></div>
+    </section>
+  </main>
+
+  <dialog id="history">
+    <div class="dialog-head"><strong id="history-title"></strong><button id="history-close">Close</button></div>
+    <div class="table-wrap"><table id="history-table"></table></div>
+  </dialog>
+</body>
+</html>

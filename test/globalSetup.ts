@@ -12,5 +12,5 @@ export default async function setup(): Promise<void> {
   await migrate(testUrl("DATABASE_URL_ADMIN"), {
     app: passwordFromUrl(process.env.DATABASE_URL_APP),
     broker: passwordFromUrl(process.env.DATABASE_URL_BROKER),
-  });
+  }, undefined, testUrl("DATABASE_URL_APP"));
 }
