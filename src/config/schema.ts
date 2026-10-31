@@ -51,7 +51,7 @@ const PageOffset = z.strictObject({
   offset_param: z.string().min(1),
   limit_param: z.string().min(1),
   limit: posInt,
-  total_path: z.string().min(1),
+  total_path: z.string().min(1).optional(), // without it: stop on a short or empty page
   start: z.number().int().nonnegative().optional(),
 });
 const PageNumber = z.strictObject({
@@ -70,8 +70,9 @@ const PageCursor = z.strictObject({
   stop_when: z.enum(["no_token", "is_last_path"]).optional(),
   is_last_path: z.string().optional(),
 });
+const PageBodyLink = z.strictObject({ type: z.literal("body_link"), next_path: z.string().min(1) }); // next URL inside the JSON body
 const PageNone = z.strictObject({ type: z.literal("none") });
-export const PaginationSchema = z.discriminatedUnion("type", [PageLink, PageOffset, PageNumber, PageCursor, PageNone]);
+export const PaginationSchema = z.discriminatedUnion("type", [PageLink, PageBodyLink, PageOffset, PageNumber, PageCursor, PageNone]);
 
 // ---- mapping ----
 const scalar = z.union([z.string(), z.number(), z.boolean(), z.null()]);
@@ -94,10 +95,13 @@ export const StreamSchema = z.strictObject({
   name: slug,
   entity: z.enum(["user", "device", "event"]),
   request: z.strictObject({
-    method: z.literal("GET", { error: "only GET is allowed: connectors are read-only" }),
+    // POST only for read-only search endpoints declared in policy.read_only_post
+    method: z.enum(["GET", "POST"], { error: "method must be GET (or POST for a search endpoint listed in policy.read_only_post)" }),
     path: z.string().startsWith("/", { error: 'path must start with "/"' }),
     params: z.record(z.string(), paramValue).optional(),
     headers: z.record(z.string(), z.string()).optional(),
+    body: z.record(z.string(), z.unknown()).optional(), // JSON body for POST search
+    paging_in: z.enum(["query", "body"]).optional(), // where pagination params go (default query)
   }),
   records_path: z.string().optional(),
   pagination: PaginationSchema,
@@ -156,6 +160,7 @@ export const ConnectorSchema = z.strictObject({
       .array(z.literal("GET", { error: "only GET is allowed in policy.methods (POST is used internally for token_url only)" }))
       .min(1)
       .optional(),
+    read_only_post: z.array(z.string().startsWith("/")).optional(), // search endpoints that read via POST
     max_requests_per_run: posInt.optional(),
     max_records_per_run: posInt.optional(),
     anomaly_multiplier: z.number().gt(1).optional(),
@@ -167,6 +172,7 @@ export const ConnectorSchema = z.strictObject({
       max_age_days: posInt.optional(),
       idle_disable_days: posInt.optional(),
       provider_ip_restriction: z.enum(["yes", "no", "unknown"]).optional(),
+      scopes_header: z.string().optional(), // response header listing the token's granted scopes, if the provider sends one
     })
     .optional(),
   data: z

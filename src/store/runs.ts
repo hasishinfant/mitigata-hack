@@ -30,7 +30,7 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
           await c.query(
             `insert into checkpoints (connector_id, stream, page_state, updated_at) values ($1, $2, $3, now())
              on conflict (connector_id, stream) do update set page_state = excluded.page_state, updated_at = now()`,
-            [p.connectorId, p.stream, JSON.stringify({ next_url: p.checkpoint.nextUrl, config_hash: p.checkpoint.configHash })],
+            [p.connectorId, p.stream, JSON.stringify({ next_url: p.checkpoint.nextUrl, next_body: p.checkpoint.nextBody, config_hash: p.checkpoint.configHash })],
           );
         else await c.query("delete from checkpoints where connector_id = $1 and stream = $2", [p.connectorId, p.stream]);
       });
@@ -51,8 +51,9 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
 
     async loadCheckpoint(connectorId, stream): Promise<Checkpoint | null> {
       const r = await pool.query("select page_state from checkpoints where connector_id = $1 and stream = $2", [connectorId, stream]);
-      const ps = r.rows[0]?.page_state as { next_url?: string; config_hash?: string } | undefined;
-      return ps?.next_url ? { nextUrl: ps.next_url, configHash: ps.config_hash ?? "" } : null;
+      const ps = r.rows[0]?.page_state as { next_url?: string; next_body?: Record<string, unknown>; config_hash?: string } | undefined;
+      if (!ps?.next_url) return null;
+      return { nextUrl: ps.next_url, ...(ps.next_body ? { nextBody: ps.next_body } : {}), configHash: ps.config_hash ?? "" };
     },
 
     async previousFieldStats(connectorId, stream, excludeRunId): Promise<FieldStats | null> {

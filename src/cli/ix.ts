@@ -1,13 +1,17 @@
 #!/usr/bin/env node
-// ix CLI. Phase 3: validate, schema, add, update, run, runs, query, quarantine.
+// ix CLI. Phase 4: validate, schema, add, update, run, runs, query, quarantine.
 // `run` uses the in-process broker for now; Phase 5/6 route it through the API and broker process.
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
 import { connectorJsonSchema } from "../config/schema.ts";
 import { validateConfigText, type Issue } from "../config/validate.ts";
 import { createLocalBroker } from "../broker/client.ts";
-import { envSecretSource } from "../broker/secrets.ts";
+import { chainSecretSources, dbSecretSource, deleteSecret, envSecretSource, listSecrets, parseMasterKey, putSecret } from "../broker/secrets.ts";
+import type { SecretSource } from "../broker/types.ts";
+import type { ResolvedConnector } from "../config/load.ts";
+import { resolveConnector } from "../config/load.ts";
 import { runConnector } from "../engine/runner.ts";
+import { testConnection } from "../engine/testConnection.ts";
 import { createPool, type Pool } from "../store/db.ts";
 import { ConnectorConfigError, loadActiveConnector, registerConnector } from "../store/connectors.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
@@ -33,7 +37,57 @@ function printIssue(i: Issue, lines: string[]): void {
 }
 
 let pool: Pool | undefined;
+let brokerPool: Pool | undefined;
 const db = () => (pool ??= createPool(process.env.DATABASE_URL_APP));
+// Phase 4: the CLI hosts the in-process broker, so it holds the broker DB role and master key.
+// Phase 6 moves both into the separate broker process; the CLI then only talks to its socket.
+const brokerDb = () => (brokerPool ??= createPool(process.env.DATABASE_URL_BROKER, "DATABASE_URL_BROKER"));
+
+function secretSource(): SecretSource {
+  const sources: SecretSource[] = [];
+  if (process.env.DATABASE_URL_BROKER && process.env.IX_MASTER_KEY) sources.push(dbSecretSource(brokerDb(), parseMasterKey(process.env.IX_MASTER_KEY)));
+  sources.push(envSecretSource()); // dev/mock fallback: IX_SECRET_<REF>
+  return chainSecretSources(...sources);
+}
+function brokerFor(conn: ResolvedConnector) {
+  return createLocalBroker({ getConnector: (cid) => (cid === conn.metadata.id ? conn : undefined), secrets: secretSource() });
+}
+
+/** Read a secret without echoing it: hidden prompt on a TTY, otherwise all of stdin (for PEM files). */
+async function readSecretInput(ref: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    const chunks: Buffer[] = [];
+    for await (const c of process.stdin) chunks.push(c as Buffer);
+    return Buffer.concat(chunks).toString("utf8").replace(/\r?\n$/, "");
+  }
+  process.stderr.write(`value for ${ref} (input hidden): `);
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  return new Promise((resolve, reject) => {
+    let value = "";
+    const onData = (buf: Buffer) => {
+      for (const ch of buf.toString("utf8")) {
+        if (ch === "\r" || ch === "\n") {
+          done();
+          return resolve(value);
+        }
+        if (ch === "\u0003") {
+          done();
+          return reject(new Error("cancelled"));
+        }
+        if (ch === "\u007f" || ch === "\b") value = value.slice(0, -1);
+        else value += ch;
+      }
+    };
+    const done = () => {
+      process.stdin.off("data", onData);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stderr.write("\n");
+    };
+    process.stdin.on("data", onData);
+  });
+}
 
 /** Wrap a command: friendly errors, always close the pool. */
 function action<A extends unknown[]>(fn: (...args: A) => Promise<void>) {
@@ -48,6 +102,7 @@ function action<A extends unknown[]>(fn: (...args: A) => Promise<void>) {
       process.exitCode = 1;
     } finally {
       await pool?.end();
+      await brokerPool?.end();
     }
   };
 }
@@ -116,7 +171,7 @@ program
   .action(
     action(async (id: string, opts: { stream?: string[] }) => {
       const conn = await loadActiveConnector(db(), id);
-      const broker = createLocalBroker({ getConnector: (cid) => (cid === conn.metadata.id ? conn : undefined), secrets: envSecretSource() });
+      const broker = brokerFor(conn);
       const results = await runConnector({ connector: conn, broker, store: createPgRunStore(db()), streams: opts.stream });
       for (const r of results) {
         console.log(
@@ -148,6 +203,80 @@ program
             (r.resumed ? " resumed" : "") +
             (r.last_error ? dim(`  ${r.last_error}`) : ""),
         );
+    }),
+  );
+
+const secret = program.command("secret").description("manage encrypted credentials (values are write-only)");
+secret
+  .command("set")
+  .description("store a secret; reads a hidden prompt, or stdin when piped (e.g. < key.pem)")
+  .argument("<ref>")
+  .option("-t, --tenant <tenant>", "tenant", "demo")
+  .action(
+    action(async (ref: string, opts: { tenant: string }) => {
+      if (!/^[a-z][a-z0-9_]{1,63}$/.test(ref)) throw new Error("ref: lowercase letters, digits, _ (e.g. github_pat)");
+      const value = await readSecretInput(ref);
+      if (!value) throw new Error("empty value, nothing stored");
+      await putSecret(brokerDb(), parseMasterKey(process.env.IX_MASTER_KEY), opts.tenant, ref, value);
+      console.log(`${green("✔")} ${opts.tenant}/${ref} stored encrypted (${value.length} chars)`);
+    }),
+  );
+secret
+  .command("list")
+  .description("list secret refs with age and last use (never values)")
+  .option("-t, --tenant <tenant>")
+  .action(
+    action(async (opts: { tenant?: string }) => {
+      const rows = await listSecrets(brokerDb(), opts.tenant);
+      if (!rows.length) return console.log(dim("no secrets stored"));
+      for (const r of rows)
+        console.log(`${r.tenant_id}/${r.ref}`.padEnd(32) + ` age=${r.age_days}d  last_used=${r.last_used_at ? String(r.last_used_at).slice(0, 19) : "never"}`);
+    }),
+  );
+secret
+  .command("rm")
+  .description("delete a secret")
+  .argument("<ref>")
+  .option("-t, --tenant <tenant>", "tenant", "demo")
+  .action(
+    action(async (ref: string, opts: { tenant: string }) => {
+      const ok = await deleteSecret(brokerDb(), opts.tenant, ref);
+      console.log(ok ? `${green("✔")} ${opts.tenant}/${ref} deleted` : dim(`${opts.tenant}/${ref} not found`));
+    }),
+  );
+
+program
+  .command("test")
+  .description("test a connector (registered id or config file): auth + first page + 3 mapped records; writes nothing")
+  .argument("<idOrFile>")
+  .option("--raw", "show redacted raw sample records")
+  .action(
+    action(async (idOrFile: string, opts: { raw?: boolean }) => {
+      let conn: ResolvedConnector;
+      if (/\.ya?ml$/.test(idOrFile)) {
+        const res = validateConfigText(await readFile(idOrFile, "utf8"));
+        if (!res.ok || !res.config) throw new ConnectorConfigError(`${idOrFile} is invalid (run ix validate)`, res.errors);
+        conn = resolveConnector(res.config, res.configHash);
+      } else conn = await loadActiveConnector(db(), idOrFile);
+      const t = await testConnection(conn, brokerFor(conn), { showRaw: opts.raw });
+      console.log(`${t.ok ? green("✔") : red("✖")} ${t.connectorId}`);
+      for (const s of t.streams) {
+        console.log(`  stream ${s.stream}: ${s.status ? `HTTP ${s.status} in ${s.durationMs} ms, ` : ""}${s.recordsOnPage ?? 0} records on first page${s.hasMorePages ? ", more pages" : ""}`);
+        if (s.error) console.log(red(`    ${s.error}`));
+        if (s.warning) console.log(yellow(`    ${s.warning}`));
+        for (const smp of s.samples) {
+          if (smp.result.ok) console.log(dim(`    ✔ ${JSON.stringify({ id: smp.result.record.sourceId, ...smp.result.record.fields })}`));
+          else console.log(yellow(`    ✖ ${smp.result.errors.join("; ")}`));
+          if (smp.raw) console.log(dim(`      raw: ${JSON.stringify(smp.raw).slice(0, 300)}`));
+        }
+      }
+      const expected = conn.credential?.expected_scopes;
+      if (t.credential.grantedScopes) {
+        console.log(`  granted scopes (${t.credential.scopeSource}): ${t.credential.grantedScopes.join(" ") || "(none)"}`);
+        const extra = t.credential.grantedScopes.filter((x) => expected && !expected.includes(x));
+        if (extra.length) console.log(yellow(`  more than expected: ${extra.join(" ")}`));
+      } else console.log(dim("  granted scopes: provider did not report them"));
+      if (!t.ok) process.exitCode = 1;
     }),
   );
 

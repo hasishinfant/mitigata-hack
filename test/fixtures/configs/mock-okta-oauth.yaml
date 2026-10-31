@@ -1,0 +1,28 @@
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: mock-okta-oauth, source: okta, tenant: demo }
+connection:
+  base_url: http://localhost:${env.MOCK_PORT}
+  auth:
+    type: oauth2_client_credentials
+    token_url: /oauth2/v1/token
+    client_id_ref: mock_client_id
+    client_auth: private_key_jwt
+    private_key_ref: mock_private_key
+    client_secret_ref: mock_client_secret
+    key_id: mock-kid-1
+    scopes: [okta.users.read]
+streams:
+  - name: users
+    entity: user
+    request: { method: GET, path: /api/v1/users, params: { limit: 200 } }
+    records_path: $
+    pagination: { type: link_header, rel: next }
+    mapping:
+      id:     { path: id, required: true }
+      email:  { path: profile.email, transform: lowercase, required: true }
+      status: { path: status, map_enum: { ACTIVE: active, SUSPENDED: suspended, DEPROVISIONED: disabled }, default: unknown }
+schedule: { every: 15m }
+reliability: { rate_limit: { requests_per_minute: 600 } }
+policy: { allowed_hosts: [localhost], allowed_paths: [/api/v1/users, /oauth2/v1/token], methods: [GET], max_requests_per_run: 20 }
+credential: { expected_scopes: [okta.users.read], forbid_scopes: ["okta.*.manage"], max_age_days: 90, idle_disable_days: 14 }

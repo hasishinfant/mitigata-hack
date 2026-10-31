@@ -14,6 +14,9 @@ importers:
       fastify:
         specifier: ^5.12.7
         version: 5.12.7
+      jose:
+        specifier: ^6.2.14
+        version: 6.2.14
       pg:
         specifier: ^8.13.1
         version: 8.23.1
@@ -533,6 +536,9 @@ packages:
   ipaddr.js@2.5.0:
     resolution: {integrity: sha512-aq+t5NAc+cS6rZQQVWC2x98CPqGtKKTMDd4Gaodv0wShnItdKg/51djkGJ1hqH+Oy0ivDftCbSLCQob8zso01w==}
     engines: {node: '>= 10'}
+
+  jose@6.2.14:
+    resolution: {integrity: sha512-3JasLuki1NRLQvY4wCoC37KZk4qxoBx2k2aFqLxT84IezqW0bkJKnNtxnZj/Fu1xsQivoc/lytxaRHJoGLjJ1A==}
 
   js-tokens@9.0.1:
     resolution: {integrity: sha512-mxa9E9ITFOt0ban3j6L5MpjwegGz6lBQmM1IJkWeBZGcMxto50+eWdjC/52xDbS2vy0k7vIMK0Fe2wfL9OQSpQ==}
@@ -1241,6 +1247,8 @@ snapshots:
     optional: true
 
   ipaddr.js@2.5.0: {}
+
+  jose@6.2.14: {}
 
   js-tokens@9.0.1: {}
 

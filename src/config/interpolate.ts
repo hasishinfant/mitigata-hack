@@ -1,4 +1,4 @@
-// `${env.NAME}` interpolation for NON-secret values only.
+// `${env.NAME}` / `${env.NAME:-default}` interpolation for NON-secret values only.
 // Rejected: inside any *_ref key, anywhere under connection.auth, and env names that look secret.
 
 export type InterpIssue = { path: (string | number)[]; message: string };
@@ -30,17 +30,18 @@ export function interpolate(
       return s;
     }
     return s.replace(TOKEN_RE, (whole, expr: string) => {
-      const m = /^env\.([A-Z][A-Z0-9_]*)$/.exec(expr.trim());
+      const m = /^env\.([A-Z][A-Z0-9_]*)(?::-(.*))?$/s.exec(expr.trim());
       if (!m) {
-        issues.push({ path, message: `bad interpolation ${whole}; only \${env.NAME} with an UPPER_CASE name is supported` });
+        issues.push({ path, message: `bad interpolation ${whole}; use \${env.NAME} or \${env.NAME:-default} with an UPPER_CASE name` });
         return whole;
       }
       const name = m[1]!;
+      const fallback = m[2];
       if (SECRET_NAME_RE.test(name)) {
         issues.push({ path, message: `env var ${name} looks like a secret; store it with "ix secret set" and use a *_ref` });
         return whole;
       }
-      const val = env[name];
+      const val = env[name] || fallback;
       if (val === undefined || val === "") {
         issues.push({ path, message: `env var ${name} is not set` });
         return whole;

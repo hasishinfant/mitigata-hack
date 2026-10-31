@@ -3,9 +3,10 @@
 
 export type BrokerRequest = {
   connectorId: string;
-  method: "GET";
+  method: "GET" | "POST"; // POST only to the connector's declared read-only search paths
   url: string; // absolute; must match the connector's policy
   headers?: Record<string, string>;
+  body?: unknown; // JSON body for read-only POST search
 };
 
 export type BrokerResponse = {
@@ -17,8 +18,14 @@ export type BrokerResponse = {
   rateLimitedMs: number; // time spent waiting because the provider said so
 };
 
+export type CredentialInfo = {
+  grantedScopes?: string[];
+  scopeSource?: "token_response" | "response_header";
+  tokenExpiresAt?: string;
+};
+
 export type BrokerErrorKind =
-  | "policy_denied" | "secret_missing" | "timeout" | "network" | "too_large" | "unknown_connector" | "rate_limited";
+  | "policy_denied" | "secret_missing" | "auth_failed" | "tls" | "timeout" | "network" | "too_large" | "unknown_connector" | "rate_limited";
 
 export class BrokerError extends Error {
   kind: BrokerErrorKind;
@@ -32,9 +39,11 @@ export class BrokerError extends Error {
 
 export interface Broker {
   request(req: BrokerRequest): Promise<BrokerResponse>;
+  /** What the broker learned about the credential (never the credential itself). */
+  credentialInfo(connectorId: string): CredentialInfo;
 }
 
-/** Where the broker gets secret values. Phase 2: env; Phase 6: encrypted store. */
+/** Where the broker gets secret values. */
 export interface SecretSource {
   get(tenant: string, ref: string): Promise<string | undefined>;
 }

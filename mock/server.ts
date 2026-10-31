@@ -2,7 +2,9 @@
 // the real sources (Link header + page, offset + totalResults, Link header + opaque cursor,
 // body cursor + isLast) with deterministic data. Tokens here are fake test values.
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
+import { createPublicKey } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { decodeProtectedHeader, jwtVerify } from "jose";
 
 export type MockOptions = {
   members?: number;
@@ -14,6 +16,11 @@ export type MockOptions = {
   cveMissingIdAt?: number[];
   /** Simulate a provider renaming profile.email -> profile.mail (schema drift). */
   renameEmail?: boolean;
+  /** PEM public key used to verify private_key_jwt client assertions. */
+  jwtPublicKey?: string;
+  /** Scope string returned by the token endpoint (default: the scope that was requested). */
+  grantedScope?: string;
+  tokenTtlS?: number;
 };
 
 export type FaultMode = "429" | "500" | "503" | "timeout" | "drop" | "ratelimit403";
@@ -32,9 +39,16 @@ export type Mock = {
   calls: MockCall[];
   options: Required<Omit<MockOptions, "tokens">> & { tokens: Required<NonNullable<MockOptions["tokens"]>> };
   setFault(spec: FaultSpec | null): void;
+  oauth: { tokenCalls: number; lastAssertion?: { header: Record<string, unknown>; payload: Record<string, unknown> }; revokeAll(): void };
 };
 
 export const MOCK_TOKENS = {
+  clientId: "mock-client-id",
+  clientSecret: "mock-client-secret-7890",
+  visionOne: "mock-vision-one-token-1111",
+  netskope: "mock-netskope-token-2222",
+  fortigate: "mock-fortigate-token-3333",
+  elastic: "mock-elastic-apikey-4444",
   bearer: "mock-bearer-token-1234",
   apiKey: "mock-api-key-5678",
   ssws: "mock-ssws-token-9012",
@@ -59,6 +73,9 @@ export function buildMock(opts: MockOptions = {}): Mock {
     tickets: opts.tickets ?? 120,
     cveMissingIdAt: opts.cveMissingIdAt ?? [],
     renameEmail: opts.renameEmail ?? false,
+    jwtPublicKey: opts.jwtPublicKey ?? "",
+    grantedScope: opts.grantedScope ?? "",
+    tokenTtlS: opts.tokenTtlS ?? 1799,
     tokens: { ...MOCK_TOKENS, ...opts.tokens },
   };
   const t = options.tokens;
@@ -184,7 +201,7 @@ export function buildMock(opts: MockOptions = {}): Mock {
       },
     }));
   app.get("/api/v1/users", async (req, reply) => {
-    if (req.headers.authorization !== `SSWS ${t.ssws}`) return unauthorized(reply, "Invalid token provided");
+    if (req.headers.authorization !== `SSWS ${t.ssws}` && !hasToken(req)) return unauthorized(reply, "Invalid token provided");
     const q = qp(req);
     const limit = intParam(q.limit, 200, 200) || 200;
     const all = dirUsers();
@@ -222,8 +239,161 @@ export function buildMock(opts: MockOptions = {}): Mock {
     return { issues, isLast, ...(isLast ? {} : { nextPageToken: Buffer.from(String(startIdx + count)).toString("base64url") }) };
   });
 
+
+  // ---- OAuth2 client credentials token endpoint (CrowdStrike-like path and Okta-like path) ----
+  const oauth: Mock["oauth"] = { tokenCalls: 0, revokeAll: () => validTokens.clear() };
+  const validTokens = new Set<string>();
+  const hasToken = (req: FastifyRequest) => {
+    const h = req.headers.authorization ?? "";
+    return h.startsWith("Bearer ") && validTokens.has(h.slice(7));
+  };
+  app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_req, body, done) => {
+    done(null, Object.fromEntries(new URLSearchParams(body as string)));
+  });
+  const tokenHandler = async (req: FastifyRequest, reply: FastifyReply) => {
+    oauth.tokenCalls++;
+    const f = (req.body ?? {}) as Record<string, string>;
+    if (f.grant_type !== "client_credentials") return reply.code(400).send({ error: "unsupported_grant_type" });
+    let clientOk = false;
+    const basic = req.headers.authorization?.startsWith("Basic ") ? Buffer.from(req.headers.authorization.slice(6), "base64").toString() : "";
+    if (basic) {
+      const [id, secret] = basic.split(":").map(decodeURIComponent);
+      clientOk = id === t.clientId && secret === t.clientSecret;
+    } else if (f.client_assertion) {
+      if (f.client_assertion_type !== "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" || !options.jwtPublicKey)
+        return reply.code(401).send({ error: "invalid_client", error_description: "bad assertion type" });
+      try {
+        const { payload, protectedHeader } = await jwtVerify(f.client_assertion, createPublicKey(options.jwtPublicKey), {
+          issuer: t.clientId, subject: t.clientId, audience: `${origin(req)}${new URL(req.url, "http://x").pathname}`,
+        });
+        oauth.lastAssertion = { header: { ...protectedHeader, ...decodeProtectedHeader(f.client_assertion) }, payload: payload as Record<string, unknown> };
+        clientOk = true;
+      } catch (e) {
+        return reply.code(401).send({ error: "invalid_client", error_description: `assertion rejected: ${(e as Error).message}` });
+      }
+    } else {
+      clientOk = f.client_id === t.clientId && f.client_secret === t.clientSecret;
+    }
+    if (!clientOk) return reply.code(401).send({ error: "invalid_client", error_description: "Client authentication failed" });
+    const token = `mock-access-${oauth.tokenCalls}-${Math.random().toString(36).slice(2, 10)}`;
+    validTokens.add(token);
+    return { access_token: token, token_type: "Bearer", expires_in: options.tokenTtlS, scope: options.grantedScope || f.scope || "" };
+  };
+  app.post("/oauth2/token", tokenHandler);
+  app.post("/oauth2/v1/token", tokenHandler);
+
+  // ---- CrowdStrike-like hosts: OAuth2 bearer, offset + meta.pagination.total ----
+  app.get("/devices/combined/devices/v1", async (req, reply) => {
+    if (!hasToken(req)) return reply.code(401).send({ errors: [{ code: 401, message: "access denied, invalid bearer token" }] });
+    const q = qp(req);
+    const limit = intParam(q.limit, 100, 100) || 100;
+    const offset = intParam(q.offset, 0, 1e6);
+    const total = 230;
+    const resources = Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, i) => {
+      const n = offset + i;
+      return {
+        device_id: `cs${String(n).padStart(8, "0")}`,
+        hostname: `WS-${1000 + n}`,
+        local_ip: `10.20.${Math.floor(n / 250)}.${(n % 250) + 1}`,
+        platform_name: ["Windows", "Mac", "Linux"][n % 3],
+        os_version: ["Windows 11", "macOS 15", "Ubuntu 24.04"][n % 3],
+        last_seen: iso(n),
+        last_login_user: `user${n % 40}`,
+        agent_version: "7.20.18905.0",
+        status: "normal",
+      };
+    });
+    return { meta: { pagination: { offset, limit, total } }, resources, errors: [] };
+  });
+
+  // ---- Trend Micro Vision One-like workbench alerts: bearer, nextLink in body ----
+  app.get("/v3.0/workbench/alerts", async (req, reply) => {
+    if (req.headers.authorization !== `Bearer ${t.visionOne}`) return reply.code(401).send({ error: { code: "Unauthorized" } });
+    const q = qp(req);
+    const top = intParam(q.top, 50, 200) || 50;
+    const skip = q.skipToken ? Number(Buffer.from(q.skipToken, "base64url").toString()) : 0;
+    const total = 120;
+    const items = Array.from({ length: Math.max(0, Math.min(top, total - skip)) }, (_, i) => {
+      const n = skip + i;
+      return {
+        id: `WB-9002-2026${String(n).padStart(5, "0")}`,
+        model: ["Possible Credential Dumping", "Ransomware Behavior", "Suspicious PowerShell"][n % 3],
+        severity: ["low", "medium", "high", "critical"][n % 4],
+        createdDateTime: iso(n).replace(".000", ""),
+        description: `Mock workbench alert ${n}`,
+        investigationStatus: "New",
+        score: (n * 13) % 100,
+      };
+    });
+    const nextSkip = skip + items.length;
+    return { items, ...(nextSkip < total ? { nextLink: `${origin(req)}/v3.0/workbench/alerts?top=${top}&skipToken=${Buffer.from(String(nextSkip)).toString("base64url")}` } : {}) };
+  });
+
+  // ---- Netskope-like alerts: custom token header, offset/limit, no total ----
+  app.get("/api/v2/events/data/alert", async (req, reply) => {
+    if (req.headers["netskope-api-token"] !== t.netskope) return reply.code(403).send({ ok: 0, message: "Invalid token" });
+    const q = qp(req);
+    const limit = intParam(q.limit, 100, 100) || 100;
+    const offset = intParam(q.offset, 0, 1e6);
+    const total = 260;
+    const result = Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, i) => {
+      const n = offset + i;
+      return {
+        _id: `ns${String(n).padStart(7, "0")}`,
+        alert_name: ["DLP - PCI", "Malware Download", "Compromised Credential"][n % 3],
+        alert_type: ["DLP", "malware", "compromisedcredential"][n % 3],
+        severity: ["low", "medium", "high", "critical"][n % 4],
+        timestamp: Math.floor(Date.UTC(2026, 0, 1) / 1000) + n * 60,
+        user: `user${n % 40}@example.test`,
+        app: "Box",
+      };
+    });
+    return { ok: 1, result };
+  });
+
+  // ---- FortiGate-like device inventory: bearer, single page ----
+  app.get("/api/v2/monitor/user/device/query", async (req, reply) => {
+    if (req.headers.authorization !== `Bearer ${t.fortigate}`) return reply.code(401).send({ http_status: 401, status: "error" });
+    const results = Array.from({ length: 40 }, (_, n) => ({
+      mac: `00:09:0f:00:${(n >> 8).toString(16).padStart(2, "0")}:${(n & 255).toString(16).padStart(2, "0")}`,
+      ipv4_address: `192.168.1.${n + 10}`,
+      hostname: `branch-dev-${n}`,
+      os_name: ["Windows", "iOS", "Android", "Linux"][n % 4],
+      os_version: "",
+      last_seen: Math.floor(Date.UTC(2026, 0, 2) / 1000) + n * 30,
+      user: n % 5 === 0 ? `guest${n}` : undefined,
+      hardware_vendor: "Fortinet",
+    }));
+    return { http_method: "GET", results, vdom: "root", status: "success" };
+  });
+
+  // ---- Elastic Security-like alerts: ApiKey header, read-only POST _search, from/size in body ----
+  app.post("/.alerts-security.alerts-default/_search", async (req, reply) => {
+    if (req.headers.authorization !== `ApiKey ${t.elastic}`) return reply.code(401).send({ error: { type: "security_exception" }, status: 401 });
+    const b = (req.body ?? {}) as { from?: number; size?: number; query?: unknown };
+    const from = Math.max(0, Number(b.from ?? 0));
+    const size = Math.min(Math.max(1, Number(b.size ?? 10)), 1000);
+    const total = 130;
+    const hits = Array.from({ length: Math.max(0, Math.min(size, total - from)) }, (_, i) => {
+      const n = from + i;
+      return {
+        _index: ".internal.alerts-security.alerts-default-000001",
+        _id: `es${String(n).padStart(6, "0")}`,
+        _source: {
+          "@timestamp": iso(n),
+          "kibana.alert.rule.name": ["Unusual Login", "Malware Prevention Alert", "Privilege Escalation"][n % 3],
+          "kibana.alert.severity": ["low", "medium", "high", "critical"][n % 4],
+          "kibana.alert.reason": `process event on host-${n % 20} created alert`,
+          "kibana.alert.workflow_status": "open",
+          "host.name": `host-${n % 20}`,
+        },
+      };
+    });
+    return { took: 3, timed_out: false, hits: { total: { value: total, relation: "eq" }, hits } };
+  });
+
   app.get("/__health", async () => ({ ok: true }));
-  return { app, calls, options, setFault };
+  return { app, calls, options, setFault, oauth };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

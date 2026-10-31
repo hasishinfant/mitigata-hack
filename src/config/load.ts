@@ -21,7 +21,9 @@ export type ResolvedConnector = ConnectorConfig & {
     rateLimit: { requestsPerMinute: number; respectRetryAfter: boolean; maxWaitMs: number };
     breaker: { failuresToOpen: number; coolDownMs: number };
     schedule?: { everyMs: number; jitterMs: number };
-    allowedPaths: string[];
+    allowedPaths: string[]; // GET paths (plus the OAuth token path, POST only)
+    readOnlyPost: string[]; // declared read-only search endpoints
+    tokenPath?: string; // OAuth token endpoint path: the only other POST target
     methods: string[];
     maxRequestsPerRun: number;
     maxRecordsPerRun: number;
@@ -32,9 +34,10 @@ export type ResolvedConnector = ConnectorConfig & {
 export function resolveConnector(cfg: ConnectorConfig, configHash: string): ResolvedConnector {
   const r = cfg.reliability ?? {};
   const basePrefix = new URL(cfg.connection.base_url).pathname.replace(/\/$/, "");
-  const implicitPaths = cfg.streams.map((s) => basePrefix + s.request.path);
-  if (cfg.connection.auth.type === "oauth2_client_credentials")
-    implicitPaths.push(new URL(cfg.connection.auth.token_url, cfg.connection.base_url).pathname);
+  const implicitPaths = cfg.streams.filter((s) => s.request.method === "GET").map((s) => basePrefix + s.request.path);
+  const tokenPath =
+    cfg.connection.auth.type === "oauth2_client_credentials" ? new URL(cfg.connection.auth.token_url, cfg.connection.base_url).pathname : undefined;
+  if (tokenPath) implicitPaths.push(tokenPath);
   return {
     ...cfg,
     configHash,
@@ -54,6 +57,8 @@ export function resolveConnector(cfg: ConnectorConfig, configHash: string): Reso
         ? { schedule: { everyMs: durationMs(cfg.schedule.every), jitterMs: cfg.schedule.jitter ? durationMs(cfg.schedule.jitter) : 0 } }
         : {}),
       allowedPaths: cfg.policy.allowed_paths ?? implicitPaths,
+      readOnlyPost: cfg.policy.read_only_post ?? [],
+      ...(tokenPath ? { tokenPath } : {}),
       methods: cfg.policy.methods ?? ["GET"],
       maxRequestsPerRun: cfg.policy.max_requests_per_run ?? 1000,
       maxRecordsPerRun: cfg.policy.max_records_per_run ?? 50_000,

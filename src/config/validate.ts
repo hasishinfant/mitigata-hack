@@ -298,11 +298,23 @@ function semanticChecks(cfg: ConnectorConfig, add: Add): void {
     if (names.has(st.name)) add("error", [...sp, "name"], `duplicate stream name "${st.name}"`);
     names.add(st.name);
 
-    if (!methodAllowed(st.request.method, methods)) add("error", [...sp, "request", "method"], `method ${st.request.method} not in policy.methods`);
     const fullPath = basePrefix + st.request.path;
-    if (st.request.path.includes("?")) add("error", [...sp, "request", "path"], "put query parameters in request.params, not the path");
-    if (policy.allowed_paths && !pathAllowed(fullPath, policy.allowed_paths))
-      add("error", [...sp, "request", "path"], `path ${fullPath} is not in policy.allowed_paths`);
+    const rp: P = [...sp, "request"];
+    if (st.request.method === "POST") {
+      // Read-only POST: only for search endpoints the policy declares explicitly.
+      if (!policy.read_only_post || !pathAllowed(fullPath, policy.read_only_post))
+        add("error", [...rp, "method"], `POST to ${fullPath} needs the path in policy.read_only_post (read-only search endpoints only)`);
+      else
+        add("warning", [...rp, "method"], "read-only POST: the broker allows POST only to policy.read_only_post paths, but cannot verify the endpoint has no side effects");
+      if (!st.request.body) add("error", rp, "POST requests need a request.body (the search query)", "method");
+    } else {
+      if (!methodAllowed(st.request.method, methods)) add("error", [...rp, "method"], `method ${st.request.method} not in policy.methods`);
+      if (policy.allowed_paths && !pathAllowed(fullPath, policy.allowed_paths))
+        add("error", [...rp, "path"], `path ${fullPath} is not in policy.allowed_paths`);
+      if (st.request.body) add("error", [...rp, "body"], "request.body is only allowed with method POST");
+    }
+    if (st.request.paging_in === "body" && st.request.method !== "POST") add("error", [...rp, "paging_in"], "paging_in: body requires method POST");
+    if (st.request.path.includes("?")) add("error", [...rp, "path"], "put query parameters in request.params, not the path");
     for (const h of Object.keys(st.request.headers ?? {}))
       if (CREDENTIAL_HEADERS.includes(h.toLowerCase()))
         add("error", [...sp, "request", "headers"], `header ${h} carries credentials; configure it in connection.auth`, h);
@@ -315,6 +327,9 @@ function semanticChecks(cfg: ConnectorConfig, add: Add): void {
     const pg = st.pagination;
     const pp: P = [...sp, "pagination"];
     if (pg.type === "offset") checkPath(add, [...pp, "total_path"], pg.total_path);
+    if (pg.type === "body_link") checkPath(add, [...pp, "next_path"], pg.next_path);
+    if ((pg.type === "link_header" || pg.type === "body_link") && st.request.paging_in === "body")
+      add("error", [...rp, "paging_in"], `paging_in: body has no effect with ${pg.type} pagination`);
     if (pg.type === "cursor") {
       if (!!pg.token_path === !!pg.token_header) add("error", pp, "cursor pagination needs exactly one of token_path or token_header");
       checkPath(add, [...pp, "token_path"], pg.token_path);
@@ -393,7 +408,7 @@ function checkMapping(add: Add, sp: P, entity: keyof typeof ENTITY_FIELDS, mappi
 }
 
 function policyWarnings(cfg: ConnectorConfig, add: Add): void {
-  if (!cfg.policy.allowed_paths)
+  if (!cfg.policy.allowed_paths && cfg.streams.some((s) => s.request.method === "GET"))
     add("warning", ["policy"], "allowed_paths not set; the broker will allow only the declared stream paths");
   if (!cfg.policy.max_requests_per_run) add("warning", ["policy"], "max_requests_per_run not set; defaulting to 1000");
   if (!cfg.schedule) add("warning", [], "no schedule; this connector runs only on demand (ix run)");

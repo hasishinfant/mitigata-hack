@@ -10,11 +10,11 @@ import { log } from "../log.ts";
 import { mapRecord, type MappedRecord } from "../mapping/mapper.ts";
 import { resolvePath } from "../mapping/paths.ts";
 import { BrokerError, type Broker } from "../broker/types.ts";
-import { createPaginator } from "./paginate/index.ts";
+import { createPaginator, type PageRequest } from "./paginate/index.ts";
 
 export type RunStatus = "running" | "success" | "partial" | "failed" | "auth_failed" | "degraded" | "paused";
 export type FieldStats = { records: number; hits: Record<string, number> };
-export type Checkpoint = { nextUrl: string; configHash: string };
+export type Checkpoint = { nextUrl: string; nextBody?: Record<string, unknown>; configHash: string };
 
 export type QuarantineItem = { raw: unknown; errors: string[] };
 export type PageCommit = {
@@ -127,11 +127,13 @@ export async function runStream(opts: {
   const { connector: conn, stream, broker, store } = opts;
   const connectorId = conn.metadata.id;
   const runId = randomUUID();
-  const paginator = createPaginator(stream.pagination);
+  const paginator = createPaginator(stream.pagination, stream.request.paging_in ?? "query");
 
   const cp = await store.loadCheckpoint(connectorId, stream.name);
   const resumed = cp !== null && cp.configHash === conn.configHash;
-  let url: URL | null = resumed ? new URL(cp.nextUrl) : paginator.start(buildBaseUrl(conn, stream));
+  let req: PageRequest | null = resumed
+    ? { url: new URL(cp.nextUrl), ...(cp.nextBody ? { body: cp.nextBody } : {}) }
+    : paginator.start({ url: buildBaseUrl(conn, stream), ...(stream.request.body ? { body: structuredClone(stream.request.body) } : {}) });
 
   const summary: RunSummary = {
     runId, stream: stream.name, status: "running", requests: 0, recordsOk: 0, recordsQuarantined: 0, retries: 0, rateLimitedMs: 0, resumed,
@@ -139,11 +141,11 @@ export async function runStream(opts: {
   const stats: FieldStats = { records: 0, hits: {} };
   const ctx = { connector: connectorId, stream: stream.name, run: runId };
   await store.startRun({ runId, connectorId, stream: stream.name, configHash: conn.configHash, startedAt: new Date(), resumed });
-  if (resumed) log.info({ ...ctx, path: url?.pathname }, "resuming from checkpoint");
+  if (resumed) log.info({ ...ctx, path: req?.url.pathname }, "resuming from checkpoint");
 
   let stopReason: string | undefined;
   try {
-    while (url) {
+    while (req) {
       if (summary.requests >= conn.runtime.maxRequestsPerRun) {
         stopReason = `stopped at policy.max_requests_per_run (${conn.runtime.maxRequestsPerRun}); next run continues from checkpoint`;
         break;
@@ -151,7 +153,7 @@ export async function runStream(opts: {
       summary.requests++;
       let res;
       try {
-        res = await broker.request({ connectorId, method: "GET", url: url.href, headers: stream.request.headers });
+        res = await broker.request({ connectorId, method: stream.request.method, url: req.url.href, body: req.body, headers: stream.request.headers });
       } catch (e) {
         if (e instanceof BrokerError) {
           summary.retries += e.retries;
@@ -179,11 +181,11 @@ export async function runStream(opts: {
         if (r.ok) records.push(r.record);
         else quarantined.push({ raw, errors: r.errors });
       }
-      const next = paginator.next({ url, headers: res.headers, body, records: raws.length });
+      const next = paginator.next({ req, headers: res.headers, body, records: raws.length });
       await store.commitPage({
         runId, connectorId, stream: stream.name, tenant: conn.metadata.tenant, source: conn.metadata.source,
         entity: stream.entity, fetchedAt: new Date(), records, quarantined, requests: 1,
-        checkpoint: next ? { nextUrl: next.href, configHash: conn.configHash } : null,
+        checkpoint: next ? { nextUrl: next.url.href, ...(next.body ? { nextBody: next.body } : {}), configHash: conn.configHash } : null,
       });
       summary.recordsOk += records.length;
       summary.recordsQuarantined += quarantined.length;
@@ -193,7 +195,7 @@ export async function runStream(opts: {
         stopReason = `stopped at policy.max_records_per_run (${conn.runtime.maxRecordsPerRun}); next run continues from checkpoint`;
         break;
       }
-      url = next;
+      req = next;
     }
     summary.status = summary.recordsQuarantined > 0 || stopReason ? "partial" : "success";
     if (stopReason) summary.lastError = stopReason;
@@ -209,7 +211,7 @@ export async function runStream(opts: {
       summary.status = e.status;
       summary.lastError = e.message;
     } else if (e instanceof BrokerError) {
-      summary.status = e.kind === "secret_missing" ? "auth_failed" : "failed";
+      summary.status = e.kind === "secret_missing" || e.kind === "auth_failed" ? "auth_failed" : "failed";
       summary.lastError = `${e.kind}: ${e.message}`;
     } else {
       summary.status = "failed";

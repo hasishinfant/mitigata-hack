@@ -1,5 +1,6 @@
-// Auth strategies. Each mutates the outgoing headers/URL and returns the secret values it used
-// (so the broker can scrub them from responses and logs).
+// Static auth strategies (none, api_key, bearer, basic). Each mutates the outgoing headers/URL and
+// returns the secret values it used, so the broker can scrub them from responses and logs.
+// OAuth2 client credentials is stateful and lives in oauth2.ts.
 import type { ConnectorConfig } from "../../config/schema.ts";
 import { BrokerError, type SecretSource } from "../types.ts";
 
@@ -12,7 +13,7 @@ async function need(secrets: SecretSource, tenant: string, ref: string): Promise
   return v;
 }
 
-export async function applyAuth(auth: Auth, tenant: string, target: AuthTarget, secrets: SecretSource): Promise<string[]> {
+export async function applyStaticAuth(auth: Auth, tenant: string, target: AuthTarget, secrets: SecretSource): Promise<string[]> {
   switch (auth.type) {
     case "none":
       return [];
@@ -36,6 +37,6 @@ export async function applyAuth(auth: Auth, tenant: string, target: AuthTarget, 
       return [p, b64];
     }
     case "oauth2_client_credentials":
-      throw new BrokerError("secret_missing", "oauth2_client_credentials is not implemented yet (Phase 4)");
+      throw new Error("oauth2_client_credentials is handled by OAuthTokenManager");
   }
 }
