@@ -4,6 +4,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import pg from "pg";
+import { loadBrokerEnv } from "../envfiles.ts";
 import { startBoss } from "../scheduler/queue.ts";
 
 const MIGRATIONS_DIR = join(import.meta.dirname, "../../migrations");
@@ -69,9 +70,9 @@ export function passwordFromUrl(url: string | undefined): string | undefined {
 }
 
 async function main(): Promise<void> {
-  try { process.loadEnvFile(); } catch { /* no .env is fine */ }
+  loadBrokerEnv();
   const admin = process.env.DATABASE_URL_ADMIN;
-  if (!admin) throw new Error("DATABASE_URL_ADMIN is not set (see .env.example)");
+  if (!admin) throw new Error("DATABASE_URL_ADMIN is not set (see .env.broker.example)");
   await migrate(
     admin,
     { app: passwordFromUrl(process.env.DATABASE_URL_APP), broker: passwordFromUrl(process.env.DATABASE_URL_BROKER) },

@@ -392,15 +392,39 @@ export function buildMock(opts: MockOptions = {}): Mock {
     return { took: 3, timed_out: false, hits: { total: { value: total, relation: "eq" }, hits } };
   });
 
+  // ---- Public feed, no auth (CISA KEV-like single JSON document) ----
+  app.get("/public/kev.json", async () => ({
+    title: "Mock Known Exploited Vulnerabilities",
+    vulnerabilities: Array.from({ length: 25 }, (_, n) => ({
+      cveID: `CVE-2026-${String(50000 + n)}`,
+      vendorProject: ["Ivanti", "Cisco", "Microsoft"][n % 3],
+      product: ["Connect Secure", "ASA", "Exchange"][n % 3],
+      vulnerabilityName: `Mock exploited vulnerability ${n}`,
+      dateAdded: `2026-10-${String((n % 28) + 1).padStart(2, "0")}`,
+      dueDate: "2026-11-21",
+      knownRansomwareCampaignUse: n % 4 === 0 ? "Known" : "Unknown",
+      requiredAction: "Apply mitigations per vendor instructions.",
+    })),
+  }));
+
   app.get("/__health", async () => ({ ok: true }));
   return { app, calls, options, setFault, oauth };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
   const port = Number(process.env.MOCK_PORT ?? 4010);
-  const { app } = buildMock();
+  // Tokens can be overridden so a leak check can use values that appear nowhere in the repo.
+  const { app } = buildMock({
+    tokens: {
+      ...(process.env.MOCK_BEARER_TOKEN ? { bearer: process.env.MOCK_BEARER_TOKEN } : {}),
+      ...(process.env.MOCK_API_KEY ? { apiKey: process.env.MOCK_API_KEY } : {}),
+      ...(process.env.MOCK_SSWS_TOKEN ? { ssws: process.env.MOCK_SSWS_TOKEN } : {}),
+    },
+  });
   await app.listen({ host: "127.0.0.1", port });
   console.log(`mock providers on http://localhost:${port}`);
-  console.log("fake credentials for: ix secret / IX_SECRET_<REF> env (test values only)");
-  for (const [k, v] of Object.entries(MOCK_TOKENS)) console.log(`  ${k.padEnd(10)} ${v}`);
+  if (!process.env.MOCK_BEARER_TOKEN) {
+    console.log("fake credentials for: ix secret / IX_SECRET_<REF> env (test values only)");
+    for (const [k, v] of Object.entries(MOCK_TOKENS)) console.log(`  ${k.padEnd(10)} ${v}`);
+  } else console.log("using tokens from MOCK_* environment (not printed)");
 }

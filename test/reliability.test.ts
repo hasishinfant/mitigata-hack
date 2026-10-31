@@ -12,7 +12,7 @@ import { loadActiveConnector, registerConnector } from "../src/store/connectors.
 import { createPgRunStore } from "../src/store/runs.ts";
 import { buildMock, MOCK_TOKENS, type Mock } from "../mock/server.ts";
 import { fakeClock } from "./helpers/clock.ts";
-import { clearData, hasDb, testUrl } from "./helpers/db.ts";
+import { clearData, hasDb, regPool, testUrl } from "./helpers/db.ts";
 
 const DEFAULT_RELIABILITY = "reliability: { rate_limit: { requests_per_minute: 600 } }";
 const fixture = (name: string, reliability?: string) => {
@@ -52,7 +52,7 @@ describe.skipIf(!hasDb)("reliability", () => {
   });
 
   async function register(text: string) {
-    return (await registerConnector(pool, text, { env })).id;
+    return (await registerConnector(regPool(), text, { env })).id;
   }
   async function run(id: string, s: Record<string, string> = secrets) {
     const conn = await loadActiveConnector(pool, id, env);

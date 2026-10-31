@@ -19,7 +19,9 @@
     "api": "tsx src/api/index.ts",
     "scheduler": "tsx src/scheduler/index.ts",
     "worker": "tsx src/worker/index.ts",
-    "mock": "tsx mock/server.ts"
+    "mock": "tsx mock/server.ts",
+    "broker": "tsx src/broker/index.ts",
+    "leakcheck": "tsx src/security/leakcheck.ts"
   },
   "dependencies": {
     "commander": "^13.1.0",

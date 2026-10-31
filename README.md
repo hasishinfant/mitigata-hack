@@ -13,7 +13,9 @@ It is designed for the case where the hub itself is breached. A credential broke
 
 ```sh
 npx pnpm@10.28.0 install
-cp .env.example .env              # fill in DB URLs; IX_MASTER_KEY=$(openssl rand -base64 32)
+cp .env.example .env                      # app settings (no broker secrets)
+cp .env.broker.example .env.broker        # IX_MASTER_KEY=$(openssl rand -base64 32), broker + admin DB URLs
+chmod 600 .env .env.broker
 createdb integratex
 npx tsx src/store/migrate.ts      # tables, DB roles, append-only audit ledger
 npx pnpm@10.28.0 test             # uses a separate integratex_test database
@@ -45,11 +47,11 @@ npx tsx mock/server.ts                                           # mock provider
 ```
 The mock server also has `/__fault?mode=429|503|timeout|drop&count=N&retry_after=S&after=K` and `/__drift?rename_email=1`.
 
-## Running the platform (scheduler, worker, API, dashboard)
+## Running the platform (broker, scheduler, worker, API, dashboard)
 
 ```sh
-npx pnpm@10.28.0 dev          # api + scheduler + worker as separate processes
-npx pnpm@10.28.0 dev:mock     # same, plus the mock providers on :4010
+npx pnpm@10.28.0 dev          # broker + api + scheduler + worker as separate processes
+npx pnpm@10.28.0 dev:mock     # same, plus mock providers on :4010 (broker accepts their fake IX_SECRET_* env)
 open http://localhost:7070    # dashboard: health cards, run history, records, quarantine
 ```
 
@@ -67,6 +69,26 @@ open http://localhost:7070    # dashboard: health cards, run history, records, q
 | `POST /v1/connectors`, `PUT /v1/connectors/:id` | Register a connector or store a new version (admin) |
 | `POST /v1/connectors/:id/runs` | Run now (admin) |
 
+## Security model (what a breached hub gives up)
+
+- **Broker process.** It is the only process with the master key and the broker database role. It listens on a Unix socket (`/tmp/ix-broker.sock`, mode `0600`).
+  - Workers, the API and the CLI send "fetch this URL for connector X" and get back status, headers and body. They never see a credential.
+  - Worker, API and scheduler **refuse to start** if `IX_MASTER_KEY`, `DATABASE_URL_BROKER`, `DATABASE_URL_ADMIN` or `IX_SECRET_*` are in their environment.
+- **Signed configs.** Configs are registered through the broker, which signs each version (an HMAC keyed from the master key). At request time it only honours versions it signed, so a rogue config row can't point a stored secret at a new host.
+  - This holds even if someone writes that row straight into the database.
+  - The app database role can't write config versions at all.
+- **Write-only secrets.** `ix secret set` / `PUT /v1/secrets/:ref` send values into the broker. No route returns a value, and `ix secret list` shows only names, age and last use.
+- **Audit ledger.** Every outbound call, policy denial, token request, secret change and registration is appended to a hash-chained `audit_ledger`.
+  - Rows are append-only, enforced by grants and a trigger.
+  - `ix audit verify` recomputes the chain; `ix audit log --deny` shows refused calls.
+- **Leak check:**
+  ```sh
+  npx pnpm@10.28.0 leakcheck -- /path/to/logs/*.log
+  ```
+  It decrypts every stored secret in memory, then searches the repo, `.env`, the given logs, a full database dump and the environments of running app processes, in raw, base64 and URL-encoded form. It prints secret names only.
+
+Limit: none of this stops someone who already stole a provider token from replaying it from their own machine. It limits what a breach of IntegrateX itself can hand over.
+
 ## Where things are
 
 | Path | What |
@@ -74,7 +96,8 @@ open http://localhost:7070    # dashboard: health cards, run history, records, q
 | `connectors/` | Real sources: GitHub, NVD, Okta |
 | `connectors/coverage/` | Vendor coverage configs: CrowdStrike, Trend Vision One, Netskope, FortiGate, Elastic. See `docs/coverage.md`. |
 | `src/config` | Zod schema, validator, `${env.X}` interpolation |
-| `src/broker` | Policy, auth, OAuth2, retries, rate limits, encrypted secrets. **No provider-specific code.** |
+| `src/broker` | Broker process (socket server and client), policy, auth, OAuth2, retries, rate limits, encrypted secrets, signed configs, audit ledger. **No provider-specific code.** |
+| `src/security` | Leak check |
 | `src/engine` | Runner, paging, checkpoints, drift, breaker. **No provider-specific code.** |
 | `src/mapping` | Path resolver, transforms, mapper, secret scanner |
 | `src/store` | Postgres: upserts, runs, quarantine, connector versions, health |

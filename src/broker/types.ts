@@ -40,7 +40,7 @@ export class BrokerError extends Error {
 export interface Broker {
   request(req: BrokerRequest): Promise<BrokerResponse>;
   /** What the broker learned about the credential (never the credential itself). */
-  credentialInfo(connectorId: string): CredentialInfo;
+  credentialInfo(connectorId: string): Promise<CredentialInfo>;
 }
 
 /** Where the broker gets secret values. */

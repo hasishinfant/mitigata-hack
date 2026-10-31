@@ -7,9 +7,12 @@ import { join } from "node:path";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import type { PgBoss } from "pg-boss";
 import type pg from "pg";
+import type { BrokerAdmin } from "../broker/remote.ts";
+import type { Broker } from "../broker/types.ts";
 import { validateConfigText } from "../config/validate.ts";
+import { testConnection } from "../engine/testConnection.ts";
 import { enqueueRun } from "../scheduler/queue.ts";
-import { ConnectorConfigError, registerConnector } from "../store/connectors.ts";
+import { ConnectorConfigError, loadActiveConnector } from "../store/connectors.ts";
 import { getHealth } from "../store/health.ts";
 import { listQuarantine } from "../store/quarantine.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
@@ -23,7 +26,14 @@ const STATIC: Record<string, { file: string; type: string }> = {
 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
-export type ApiOptions = { pool: pg.Pool; boss?: PgBoss; adminToken?: string; env?: Record<string, string | undefined> };
+export type ApiOptions = {
+  pool: pg.Pool; // ix_app role: cannot read credentials or write config versions
+  boss?: PgBoss;
+  broker?: Broker; // socket client: provider calls for "test connection"
+  admin?: BrokerAdmin; // socket client: registration and write-only secrets
+  adminToken?: string;
+  env?: Record<string, string | undefined>;
+};
 
 export function buildApi(opts: ApiOptions) {
   const app = Fastify({ logger: false, bodyLimit: 1024 * 1024 });
@@ -50,8 +60,14 @@ export function buildApi(opts: ApiOptions) {
     throw Object.assign(new Error("send the config as text/yaml, or JSON { \"yaml\": \"...\" }"), { statusCode: 400 });
   };
 
-  app.setErrorHandler((err: Error & { statusCode?: number }, _req, reply) => {
+  const needAdmin = (): BrokerAdmin => {
+    if (!opts.admin) throw Object.assign(new Error("broker not available"), { statusCode: 503 });
+    return opts.admin;
+  };
+
+  app.setErrorHandler((err: Error & { statusCode?: number; issues?: unknown }, _req, reply) => {
     if (err instanceof ConnectorConfigError) return reply.code(422).send({ error: err.message, errors: err.issues });
+    if (err.statusCode === 422 && err.issues) return reply.code(422).send({ error: err.message, errors: err.issues });
     const code = err.statusCode && err.statusCode < 500 ? err.statusCode : 500;
     return reply.code(code).send({ error: code === 500 ? "internal error" : err.message });
   });
@@ -91,8 +107,9 @@ export function buildApi(opts: ApiOptions) {
   });
 
   // ---- writes (admin token) ----
+  // Registration goes through the broker, which validates and signs the version it will honour.
   app.post("/v1/connectors", { preHandler: requireAdmin }, async (req, reply) => {
-    const r = await registerConnector(opts.pool, yamlBody(req), { env, mustNotExist: true, createdBy: "api" });
+    const r = await needAdmin().register(yamlBody(req), "add", "api");
     return reply.code(201).send(r);
   });
 
@@ -101,7 +118,23 @@ export function buildApi(opts: ApiOptions) {
     const text = yamlBody(req);
     const v = validateConfigText(text, { env });
     if (v.config && v.config.metadata.id !== id) return reply.code(400).send({ error: `metadata.id is ${v.config.metadata.id}, URL says ${id}` });
-    return registerConnector(opts.pool, text, { env, mustExist: true, createdBy: "api" });
+    return needAdmin().register(text, "update", "api");
+  });
+
+  // Write-only: the value goes to the broker; nothing ever returns it.
+  app.put("/v1/secrets/:ref", { preHandler: requireAdmin }, async (req) => {
+    const { ref } = req.params as { ref: string };
+    const tenant = (req.query as { tenant?: string }).tenant ?? "demo";
+    const value = (req.body as { value?: unknown } | undefined)?.value;
+    if (typeof value !== "string") throw Object.assign(new Error('send JSON { "value": "..." }'), { statusCode: 400 });
+    const r = await needAdmin().putSecret(tenant, ref, value);
+    return { stored: true, tenant, ref, chars: r.chars };
+  });
+
+  app.post("/v1/connectors/:id/test", { preHandler: requireAdmin }, async (req, reply) => {
+    if (!opts.broker) return reply.code(503).send({ error: "broker not available" });
+    const conn = await loadActiveConnector(opts.pool, (req.params as { id: string }).id, env);
+    return testConnection(conn, opts.broker);
   });
 
   app.post("/v1/connectors/:id/runs", { preHandler: requireAdmin }, async (req, reply) => {

@@ -12,7 +12,7 @@ import { loadActiveConnector, registerConnector } from "../src/store/connectors.
 import { queryRecords } from "../src/store/query.ts";
 import { createPgRunStore } from "../src/store/runs.ts";
 import { buildMock, MOCK_TOKENS, type Mock } from "../mock/server.ts";
-import { clearData, hasDb, testUrl } from "./helpers/db.ts";
+import { clearData, hasDb, regPool, testUrl } from "./helpers/db.ts";
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, "fixtures/configs", name), "utf8");
 const goodSecrets = {
@@ -44,7 +44,7 @@ describe.skipIf(!hasDb)("engine on mocks", () => {
   });
 
   async function sync(file: string, secrets: Record<string, string> = goodSecrets) {
-    const r = await registerConnector(pool, fixture(file), { env });
+    const r = await registerConnector(regPool(), fixture(file), { env });
     const conn = await loadActiveConnector(pool, r.id, env);
     const broker = createLocalBroker({ getConnector: (id) => (id === conn.metadata.id ? conn : undefined), secrets: envSecretSource(secrets) });
     const [summary] = await runConnector({ connector: conn, broker, store: createPgRunStore(pool) });

@@ -1,10 +1,12 @@
 // Scheduler process: ticks every IX_SCHEDULER_TICK_S seconds (default 15).
+import { assertNoBrokerSecrets, loadAppEnv } from "../envfiles.ts";
 import { log } from "../log.ts";
 import { createPool } from "../store/db.ts";
 import { startBoss } from "./queue.ts";
 import { createScheduler } from "./scheduler.ts";
 
-try { process.loadEnvFile(); } catch { /* no .env is fine */ }
+loadAppEnv();
+assertNoBrokerSecrets("scheduler");
 
 const pool = createPool(process.env.DATABASE_URL_APP);
 const boss = await startBoss(process.env.DATABASE_URL_APP!);

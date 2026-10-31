@@ -17,7 +17,7 @@ import { loadActiveConnector, registerConnector } from "../src/store/connectors.
 import { createPgRunStore } from "../src/store/runs.ts";
 import { buildMock, MOCK_TOKENS, type Mock } from "../mock/server.ts";
 import { fakeClock } from "./helpers/clock.ts";
-import { clearData, hasDb, testUrl } from "./helpers/db.ts";
+import { clearData, hasDb, regPool, testUrl } from "./helpers/db.ts";
 
 const root = join(import.meta.dirname, "..");
 const read = (rel: string) => readFileSync(join(root, rel), "utf8");
@@ -113,7 +113,7 @@ describe.skipIf(!hasDb)("Phase 4 on mocks", () => {
   });
 
   async function setup(text: string, opts: { secrets?: Record<string, string>; clock?: ReturnType<typeof fakeClock>["clock"] } = {}) {
-    const { id } = await registerConnector(pool, text, { env });
+    const { id } = await registerConnector(regPool(), text, { env });
     const conn = await loadActiveConnector(pool, id, env);
     const broker = createLocalBroker({
       getConnector: (cid) => (cid === conn.metadata.id ? conn : undefined),
@@ -140,7 +140,7 @@ describe.skipIf(!hasDb)("Phase 4 on mocks", () => {
     expect(a.payload.aud).toBe(`http://localhost:${env.MOCK_PORT}/oauth2/v1/token`);
     expect(Number(a.payload.exp) - Number(a.payload.iat)).toBe(300);
     expect(a.payload.jti).toMatch(/^[0-9a-f-]{36}$/);
-    expect(broker.credentialInfo(conn.metadata.id)).toMatchObject({ grantedScopes: ["okta.users.read"], scopeSource: "token_response" });
+    expect(await broker.credentialInfo(conn.metadata.id)).toMatchObject({ grantedScopes: ["okta.users.read"], scopeSource: "token_response" });
   });
 
   it("client_secret_basic and client_secret_post both work", async () => {
@@ -212,7 +212,7 @@ describe.skipIf(!hasDb)("Phase 4 on mocks", () => {
     const raw = (await brokerPool.query("select ciphertext, wrapped_dek from credentials")).rows[0];
     expect(Buffer.concat([raw.ciphertext, raw.wrapped_dek]).toString("latin1")).not.toContain(MOCK_TOKENS.visionOne);
 
-    const { id } = await registerConnector(pool, read("connectors/coverage/trendmicro-visionone-alerts.yaml"), { env });
+    const { id } = await registerConnector(regPool(), read("connectors/coverage/trendmicro-visionone-alerts.yaml"), { env });
     const conn = await loadActiveConnector(pool, id, env);
     const broker = createLocalBroker({ getConnector: () => conn, secrets: dbSecretSource(brokerPool, mk) });
     expect((await runWith(conn, broker)).status).toBe("success");

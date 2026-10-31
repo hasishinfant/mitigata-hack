@@ -7,6 +7,7 @@ import { log, registerSecretForScrub } from "../log.ts";
 import { applyStaticAuth } from "./auth/index.ts";
 import { OAuthTokenManager } from "./auth/oauth2.ts";
 import { httpCall, type HttpResult } from "./http.ts";
+import type { AuditEntry } from "./ledger.ts";
 import { hostAllowed, methodAllowed, pathAllowed } from "./policy.ts";
 import { backoffMs, classifyResponse, providerWaitMs, realClock, TokenBucket, type Clock } from "./retry.ts";
 import {
@@ -18,10 +19,13 @@ const MAX_RATE_LIMIT_WAITS = 5;
 const FORBIDDEN_HEADERS = new Set(["authorization", "proxy-authorization", "cookie", "host", "x-api-key", "content-length"]);
 
 export type LocalBrokerOptions = {
-  getConnector: (id: string) => ResolvedConnector | undefined;
+  /** In the broker process this loads the broker-signed config from the database. */
+  getConnector: (id: string) => ResolvedConnector | undefined | Promise<ResolvedConnector | undefined>;
   secrets: SecretSource;
   clock?: Clock;
   random?: () => number;
+  /** Called for every outbound call and every denial. If it throws, the request fails (fail closed). */
+  audit?: (e: AuditEntry) => Promise<void>;
 };
 
 export type LocalBroker = Broker & {
@@ -44,6 +48,20 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
     if (!b || b.rpm !== rpm) buckets.set(conn.metadata.id, (b = new TokenBucket(rpm, clock.now())));
     return b;
   };
+
+  async function auditDeny(conn: ResolvedConnector, method: string, rawUrl: string, e: unknown): Promise<void> {
+    if (!opts.audit || !(e instanceof BrokerError)) return;
+    let host: string | null = null;
+    let path: string | null = null;
+    try {
+      const u = new URL(rawUrl);
+      host = u.host;
+      path = u.pathname;
+    } catch {
+      /* unparseable URL: log without host/path */
+    }
+    await opts.audit({ connectorId: conn.metadata.id, action: "request", method, host, path, decision: `deny: ${e.message.replace(/^policy denied: /, "")}` });
+  }
 
   /** One logical call with throttle, retries and rate-limit waits. Returns the final response. */
   async function send(conn: ResolvedConnector, method: string, url: URL, headers: Record<string, string>, body?: string): Promise<Sent> {
@@ -109,14 +127,24 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
 
   return {
     async request(req: BrokerRequest): Promise<BrokerResponse> {
-      const conn = opts.getConnector(req.connectorId);
+      const conn = await opts.getConnector(req.connectorId);
       if (!conn) throw new BrokerError("unknown_connector", `connector ${req.connectorId} is not registered with the broker`);
-      const url = checkPolicy(conn, req.method, req.url, "api");
+      let url: URL;
+      try {
+        url = checkPolicy(conn, req.method, req.url, "api");
+      } catch (e) {
+        await auditDeny(conn, req.method, req.url, e);
+        throw e;
+      }
 
       const headers: Record<string, string> = { "user-agent": "IntegrateX/0.1", accept: "application/json" };
       for (const [k, v] of Object.entries(req.headers ?? {})) {
         const name = k.toLowerCase();
-        if (FORBIDDEN_HEADERS.has(name)) throw deny(conn, req.method, url, `header ${name} may not be set by workers`);
+        if (FORBIDDEN_HEADERS.has(name)) {
+          const err = deny(conn, req.method, url, `header ${name} may not be set by workers`);
+          await auditDeny(conn, req.method, url.href, err);
+          throw err;
+        }
         headers[name] = v;
       }
       let body: string | undefined;
@@ -135,8 +163,15 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
         let used: string[];
         if (auth.type === "oauth2_client_credentials") {
           const t = await tokens.get(conn, opts.secrets, async (tokenUrl, h, b) => {
-            checkPolicy(conn, "POST", tokenUrl.href, "token");
-            return (await send(conn, "POST", tokenUrl, h, b)).res;
+            try {
+              checkPolicy(conn, "POST", tokenUrl.href, "token");
+            } catch (e) {
+              await auditDeny(conn, "POST", tokenUrl.href, e);
+              throw e;
+            }
+            const r = (await send(conn, "POST", tokenUrl, h, b)).res;
+            await opts.audit?.({ connectorId: conn.metadata.id, action: "token", method: "POST", host: tokenUrl.host, path: tokenUrl.pathname, status: r.status, decision: "allow" });
+            return r;
           }, clock.now());
           target.headers.authorization = `Bearer ${t.token}`;
           used = t.used;
@@ -152,9 +187,11 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
           if (e instanceof BrokerError) {
             e.retries += retries;
             e.rateLimitedMs += rateLimitedMs;
+            await opts.audit?.({ connectorId: conn.metadata.id, action: "request", method: req.method, host: url.host, path: url.pathname, decision: `error: ${e.kind}` });
           }
           throw e;
         }
+        await opts.audit?.({ connectorId: conn.metadata.id, action: "request", method: req.method, host: url.host, path: url.pathname, status: sent.res.status, decision: "allow" });
         retries += sent.retries;
         rateLimitedMs += sent.rateLimitedMs;
 
@@ -182,7 +219,7 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
       }
     },
 
-    credentialInfo(connectorId: string): CredentialInfo {
+    async credentialInfo(connectorId: string): Promise<CredentialInfo> {
       const t = tokens.peek(connectorId);
       if (t?.scopes) return { grantedScopes: t.scopes, scopeSource: "token_response", tokenExpiresAt: new Date(t.expiresAt).toISOString() };
       const hs = headerScopes.get(connectorId);
@@ -199,6 +236,7 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
 }
 
 function checkPolicy(conn: ResolvedConnector, method: string, rawUrl: string, target: Target): URL {
+  if ((conn as { status?: string }).status === "disabled") throw new BrokerError("policy_denied", "policy denied: connector is disabled");
   let url: URL;
   try {
     url = new URL(rawUrl);

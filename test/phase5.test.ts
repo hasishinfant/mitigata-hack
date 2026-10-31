@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { PgBoss } from "pg-boss";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApi } from "../src/api/server.ts";
+import type { BrokerAdmin } from "../src/broker/remote.ts";
 import { envSecretSource } from "../src/broker/secrets.ts";
 import { enqueueRun, RUN_QUEUE, startBoss, type RunJob } from "../src/scheduler/queue.ts";
 import { createScheduler, nextRunAt } from "../src/scheduler/scheduler.ts";
@@ -14,7 +15,7 @@ import { registerConnector } from "../src/store/connectors.ts";
 import { deriveHealth } from "../src/store/health.ts";
 import { createWorker } from "../src/worker/worker.ts";
 import { buildMock, MOCK_TOKENS, type Mock } from "../mock/server.ts";
-import { clearData, hasDb, testUrl } from "./helpers/db.ts";
+import { clearData, hasDb, regPool, testUrl } from "./helpers/db.ts";
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, "fixtures/configs", name), "utf8");
 const ADMIN = "test-admin-token-abcdef";
@@ -69,7 +70,7 @@ describe.skipIf(!hasDb)("scheduler, worker, API", () => {
   });
 
   const scheduler = () => createScheduler({ pool, boss, now: () => t, random: () => 0, env });
-  const register = (name: string) => registerConnector(pool, fixture(name), { env });
+  const register = (name: string) => registerConnector(regPool(), fixture(name), { env });
   const queued = async () => (await pool.query("select data->>'connectorId' as id, data->>'trigger' as trigger, state from pgboss.job where name = $1 order by 1", [RUN_QUEUE])).rows;
 
   it("enqueues due connectors once, then waits for the interval", async () => {
@@ -104,7 +105,7 @@ describe.skipIf(!hasDb)("scheduler, worker, API", () => {
     expect(r.skipped).toEqual([{ id: "mock-github-members", reason: "circuit open" }]);
     expect((await pool.query("select next_run_at from connectors")).rows[0].next_run_at).toBe(until.toISOString());
 
-    await registerConnector(pool, fixture("mock-okta-users.yaml").replace("schedule: { every: 15m }\n", ""), { env });
+    await registerConnector(regPool(), fixture("mock-okta-users.yaml").replace("schedule: { every: 15m }\n", ""), { env });
     expect((await scheduler().tick()).skipped).toContainEqual({ id: "mock-okta-users", reason: "no schedule" });
   });
 
@@ -174,7 +175,11 @@ describe.skipIf(!hasDb)("scheduler, worker, API", () => {
     const yaml = fixture("mock-github-members.yaml");
     const headers = { "content-type": "text/yaml" };
     expect((await buildApi({ pool, env }).inject({ method: "POST", url: "/v1/connectors", headers, payload: yaml })).statusCode).toBe(503);
-    const app = buildApi({ pool, env, adminToken: ADMIN, boss });
+    // Stand-in for the broker's registration endpoint (the real one is covered in phase6.test.ts).
+    const admin = {
+      register: (y: string, mode: "add" | "update") => registerConnector(regPool(), y, { env, mustNotExist: mode === "add", mustExist: mode === "update" }),
+    } as unknown as BrokerAdmin;
+    const app = buildApi({ pool, env, adminToken: ADMIN, boss, admin });
     expect((await app.inject({ method: "POST", url: "/v1/connectors", headers, payload: yaml })).statusCode).toBe(401);
     expect((await app.inject({ method: "POST", url: "/v1/connectors", headers: { ...headers, authorization: "Bearer nope" }, payload: yaml })).statusCode).toBe(401);
     const auth = { ...headers, authorization: `Bearer ${ADMIN}` };

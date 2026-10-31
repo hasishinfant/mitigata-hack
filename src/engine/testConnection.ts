@@ -48,5 +48,5 @@ export async function testConnection(conn: ResolvedConnector, broker: Broker, op
     }
     streams.push(t);
   }
-  return { connectorId: conn.metadata.id, ok: streams.every((s) => s.ok), streams, credential: broker.credentialInfo(conn.metadata.id) };
+  return { connectorId: conn.metadata.id, ok: streams.every((s) => s.ok), streams, credential: await broker.credentialInfo(conn.metadata.id) };
 }
