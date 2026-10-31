@@ -8,7 +8,7 @@ metadata:
 
 connection:
   base_url: https://api.github.com
-  auth: { type: bearer, secret_ref: github_pat }
+  auth: { type: bearer, secret_ref: github_org_pat }   # fine-grained token owned by the org: Members read
 
 streams:
   - name: members

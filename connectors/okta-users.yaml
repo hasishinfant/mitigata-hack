@@ -34,7 +34,7 @@ streams:
       id:          { path: id, required: true }
       name:        { concat: [profile.firstName, { lit: " " }, profile.lastName] }
       email:       { path: profile.email, transform: lowercase, required: true }
-      status:      { path: status, map_enum: { ACTIVE: active, SUSPENDED: suspended, DEPROVISIONED: disabled }, default: unknown }
+      status:      { path: status, map_enum: { ACTIVE: active, PROVISIONED: pending, STAGED: staged, RECOVERY: active, PASSWORD_EXPIRED: active, LOCKED_OUT: locked, SUSPENDED: suspended, DEPROVISIONED: disabled }, default: unknown }
       last_login:  { path: lastLogin, transform: to_iso8601 }
       attributes:  { pick: [profile.login, created, lastUpdated] }
 
