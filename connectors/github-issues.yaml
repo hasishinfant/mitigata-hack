@@ -53,6 +53,7 @@ credential:
   max_age_days: 90
   idle_disable_days: 14
   provider_ip_restriction: unknown
+  scopes_header: X-OAuth-Scopes          # classic PATs report their scopes here; fine-grained PATs do not
 
 data: { store_raw: false, redact_secrets: true, retention_days: 30 }
 alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }
