@@ -352,11 +352,12 @@ program
 
 program
   .command("rm")
-  .description("remove a connector and every record it stored (secrets are kept: ix secret rm)")
+  .description("remove a connector, every record it stored, and its secrets (unless another connector uses them)")
   .argument("<id>")
   .option("--yes", "do not ask for confirmation")
+  .option("--keep-secrets", "keep the connector's secrets in the broker")
   .action(
-    action(async (id: string, opts: { yes?: boolean }) => {
+    action(async (id: string, opts: { yes?: boolean; keepSecrets?: boolean }) => {
       if (!opts.yes) {
         if (!process.stdin.isTTY) throw new Error("refusing to remove without --yes in a non-interactive shell");
         process.stderr.write(yellow(`remove ${id} and all its records? type the id to confirm: `));
@@ -364,9 +365,11 @@ program
         process.stdin.pause();
         if (answer !== id) throw new Error("cancelled");
       }
-      const r = await broker().removeConnector(id);
+      const r = await broker().removeConnector(id, { purgeSecrets: !opts.keepSecrets });
       await db().query("delete from pgboss.job where data->>'connectorId' = $1 and state in ('created', 'retry')", [id]).catch(() => {});
       console.log(`${green("✔")} ${id} removed (${r.records} records deleted)`);
+      if (r.secrets?.deleted.length) console.log(`  secrets deleted: ${r.secrets.deleted.join(", ")}`);
+      if (r.secrets?.kept_shared.length) console.log(dim(`  secrets kept (still used by another connector): ${r.secrets.kept_shared.join(", ")}`));
     }),
   );
 

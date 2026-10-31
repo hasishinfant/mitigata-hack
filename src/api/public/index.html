@@ -170,9 +170,8 @@
 
   <dialog id="remove">
     <div class="dialog-head"><strong>Remove a connector</strong><button id="remove-close">Close</button></div>
-    <p class="muted">Deletes the connector, its config versions, runs and every record it stored. Secrets are kept (remove them with <code>ix secret rm</code>).</p>
+    <p class="muted">Deletes the connector, its config versions, runs, every record it stored, and its secrets. A secret another connector still uses is kept.</p>
     <label>Connector <select id="remove-select"></select></label>
-    <label>Type the connector id to confirm <input id="remove-confirm" autocomplete="off"></label>
     <div class="b-actions"><button id="remove-go" class="danger" disabled>Remove</button></div>
     <pre id="remove-log"></pre>
   </dialog>

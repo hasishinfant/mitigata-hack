@@ -147,7 +147,8 @@ export function buildApi(opts: ApiOptions) {
   // Remove a connector and its records (through the broker; the app role cannot delete connectors).
   app.delete("/v1/connectors/:id", { preHandler: requireAdmin }, async (req) => {
     const { id } = req.params as { id: string };
-    const r = await needAdmin().removeConnector(id);
+    const keep = (req.query as { keep_secrets?: string }).keep_secrets === "1";
+    const r = await needAdmin().removeConnector(id, { purgeSecrets: !keep });
     await opts.pool.query("delete from pgboss.job where data->>'connectorId' = $1 and state in ('created', 'retry')", [id]).catch(() => {});
     return { id, ...r };
   });

@@ -341,10 +341,8 @@ $("b-run").addEventListener("click", async () => {
 
 // ---------- remove connector ----------
 const removeSelect = $("remove-select");
-const removeConfirm = $("remove-confirm");
-const syncRemove = () => { $("remove-go").disabled = !removeSelect.value || removeConfirm.value !== removeSelect.value; };
+const syncRemove = () => { $("remove-go").disabled = !removeSelect.value; };
 async function loadRemoveList() {
-  removeConfirm.value = "";
   try {
     const h = await api("/v1/health");
     removeSelect.replaceChildren(el("option", { value: "" }, "choose…"), ...h.connectors.map((c) => el("option", { value: c.id }, `${c.id} (${c.source}, ${c.records_in_store} records)`)));
@@ -359,13 +357,17 @@ $("open-remove").addEventListener("click", async () => {
   if (!$("remove").open) $("remove").showModal();
 });
 removeSelect.addEventListener("change", syncRemove);
-removeConfirm.addEventListener("input", syncRemove);
 $("remove-close").addEventListener("click", () => $("remove").close());
 $("remove-go").addEventListener("click", async () => {
   const id = removeSelect.value;
+  if (!id || !confirm(`Remove ${id}, all its records and its secrets?`)) return;
   try {
     const r = await api(`/v1/connectors/${encodeURIComponent(id)}`, { method: "DELETE", headers: adminHeaders() });
-    $("remove-log").textContent = `✔ ${r.id} removed (${r.records} records deleted). The removal is recorded in the audit ledger.`;
+    const lines = [`✔ ${r.id} removed (${r.records} records deleted)`];
+    if (r.secrets?.deleted.length) lines.push(`  secrets deleted: ${r.secrets.deleted.join(", ")}`);
+    if (r.secrets?.kept_shared.length) lines.push(`  secrets kept (still used by another connector): ${r.secrets.kept_shared.join(", ")}`);
+    lines.push("  recorded in the audit ledger");
+    $("remove-log").textContent = lines.join("\n");
     refresh();
     await loadRemoveList();
   } catch (e) {

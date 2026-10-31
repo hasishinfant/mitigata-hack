@@ -13,6 +13,7 @@ import { resolveConnector } from "../config/load.ts";
 import { validateConfigText } from "../config/validate.ts";
 import { testConnection } from "../engine/testConnection.ts";
 import { log } from "../log.ts";
+import { credentialRefs } from "../security/posture.ts";
 import { ConnectorConfigError, loadSignedConnector, registerConnector } from "../store/connectors.ts";
 import { createLocalBroker, type LocalBroker } from "./client.ts";
 import { httpCall } from "./http.ts";
@@ -131,18 +132,42 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     return r;
   });
 
+  // Secret refs a stored config uses (auth credentials and the alert webhook).
+  const refsOf = (yaml: string): string[] => {
+    const res = validateConfigText(yaml, { env });
+    if (!res.config) return [];
+    const c = resolveConnector(res.config, res.configHash);
+    return [...credentialRefs(c), ...(c.alerts?.slack_webhook_ref ? [c.alerts.slack_webhook_ref] : [])];
+  };
+
   // Remove a connector: its config versions, runs, checkpoints, quarantine, alerts and every record it
-  // stored. Secrets are kept (other connectors may share a ref); remove them with ix secret rm.
+  // stored. With purge_secrets, also delete its secrets, except refs another connector still uses.
   app.delete("/v1/connectors/:id", async (req) => {
     const { id } = req.params as { id: string };
+    const purge = (req.query as { purge_secrets?: string }).purge_secrets === "1";
     const client = await opts.pool.connect();
     let records = 0;
+    const secrets = { deleted: [] as string[], kept_shared: [] as string[] };
     try {
       await client.query("begin");
       const found = await client.query("select 1 from connectors where id = $1 for update", [id]);
       if (!found.rowCount) {
         await client.query("rollback");
         throw Object.assign(new Error(`connector ${id} not found`), { statusCode: 404 });
+      }
+      if (purge) {
+        const all = (
+          await client.query(
+            `select k.id, k.tenant_id, v.config_yaml from connectors k
+             join connector_versions v on v.connector_id = k.id and v.version = k.active_version`,
+          )
+        ).rows as { id: string; tenant_id: string; config_yaml: string }[];
+        const mine = all.find((r) => r.id === id);
+        const usedElsewhere = new Set(all.filter((r) => r.id !== id && r.tenant_id === mine?.tenant_id).flatMap((r) => refsOf(r.config_yaml)));
+        for (const ref of new Set(mine ? refsOf(mine.config_yaml) : [])) {
+          if (usedElsewhere.has(ref)) secrets.kept_shared.push(ref);
+          else if ((await client.query("delete from credentials where tenant_id = $1 and ref = $2", [mine!.tenant_id, ref])).rowCount) secrets.deleted.push(ref);
+        }
       }
       for (const t of ["users", "devices", "events"]) records += (await client.query(`delete from ${t} where connector_id = $1`, [id])).rowCount ?? 0;
       await client.query("delete from quarantine where connector_id = $1", [id]);
@@ -156,8 +181,9 @@ export function createBrokerServer(opts: BrokerServerOptions) {
       client.release();
     }
     forget(id);
-    await audit({ connectorId: id, action: "remove", decision: `allow: ${records} records deleted` });
-    return { removed: true, records };
+    if (purge) forget(); // drop cached secret values too
+    await audit({ connectorId: id, action: "remove", decision: `allow: ${records} records deleted${purge ? `, ${secrets.deleted.length} secrets deleted` : ""}` });
+    return { removed: true, records, ...(purge ? { secrets } : {}) };
   });
 
   app.put("/v1/secrets/:tenant/:ref", async (req) => {

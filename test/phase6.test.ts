@@ -231,9 +231,24 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     expect(await remote.removeConnector("mock-github-members")).toEqual({ removed: true, records: 250 });
     for (const t of ["connectors", "connector_versions", "runs", "users"])
       expect(Number((await appPool.query(`select count(*) from ${t}`)).rows[0].count)).toBe(0);
-    expect((await remote.listSecrets()).map((x) => x.ref)).toEqual(["mock_bearer"]);
+    expect((await remote.listSecrets()).map((x) => x.ref)).toEqual(["mock_bearer"]); // kept without purge
     expect((await ledger()).at(-1)).toMatchObject({ action: "remove", decision: "allow: 250 records deleted" });
     await expect(remote.removeConnector("mock-github-members")).rejects.toThrow(/not found/);
+  });
+
+  it("remove with purge: deletes the connector's own secrets but keeps one another connector still uses", async () => {
+    // Two connectors share mock_bearer; okta has its own mock_ssws.
+    const second = fixture("mock-github-members.yaml").replace("id: mock-github-members", "id: mock-github-copy");
+    await remote.register(fixture("mock-github-members.yaml"), "add");
+    await remote.register(second, "add");
+    await remote.register(fixture("mock-okta-users.yaml"), "add");
+    await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer);
+    await remote.putSecret("demo", "mock_ssws", MOCK_TOKENS.ssws);
+    expect(await remote.removeConnector("mock-okta-users", { purgeSecrets: true })).toMatchObject({ secrets: { deleted: ["mock_ssws"], kept_shared: [] } });
+    expect(await remote.removeConnector("mock-github-members", { purgeSecrets: true })).toMatchObject({ secrets: { deleted: [], kept_shared: ["mock_bearer"] } });
+    expect((await remote.listSecrets()).map((x) => x.ref)).toEqual(["mock_bearer"]);
+    expect(await remote.removeConnector("mock-github-copy", { purgeSecrets: true })).toMatchObject({ secrets: { deleted: ["mock_bearer"], kept_shared: [] } });
+    expect(await remote.listSecrets()).toEqual([]);
   });
 
   it("dashboard builder routes: inline test (no-auth only) and remove; page has the new buttons", async () => {
@@ -251,12 +266,13 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
 
     await remote.register(fixture("mock-github-members.yaml"), "add");
     const del = await app.inject({ method: "DELETE", url: "/v1/connectors/mock-github-members", headers: { authorization: `Bearer ${admin}` } });
-    expect(del.json()).toEqual({ id: "mock-github-members", removed: true, records: 0 });
+    expect(del.json()).toEqual({ id: "mock-github-members", removed: true, records: 0, secrets: { deleted: [], kept_shared: [] } });
     expect((await app.inject({ method: "DELETE", url: "/v1/connectors/mock-github-members", headers: { authorization: `Bearer ${admin}` } })).statusCode).toBe(404);
 
     const page = (await app.inject({ url: "/" })).body;
     expect(page).toContain("＋ Add connector");
     expect(page).toContain('id="open-remove"');
+    expect(page).not.toContain("remove-confirm");
     const js = await app.inject({ url: "/builder.js" });
     expect(js.statusCode).toBe(200);
     expect(js.body).not.toContain("innerHTML");
