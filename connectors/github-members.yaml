@@ -1,0 +1,53 @@
+apiVersion: ix/v1
+kind: Connector
+metadata:
+  id: github-members
+  source: github
+  tenant: demo
+  owner: secops@example.com
+
+connection:
+  base_url: https://api.github.com
+  auth: { type: bearer, secret_ref: github_pat }
+
+streams:
+  - name: members
+    entity: user
+    request:
+      method: GET
+      path: /orgs/${env.GITHUB_ORG}/members
+      headers: { Accept: application/vnd.github+json, X-GitHub-Api-Version: "2022-11-28" }
+      params: { per_page: 100 }
+    records_path: $
+    pagination: { type: link_header, rel: next }
+    mapping:
+      id:         { path: id, required: true }
+      name:       { path: login, required: true }
+      status:     { const: active }
+      attributes: { pick: [login, type, site_admin, html_url] }
+
+schedule: { every: 1h, jitter: 60s }
+
+reliability:
+  timeout: 20s
+  retries: { max: 3, backoff: exponential, base: 1s, jitter: true }
+  rate_limit: { requests_per_minute: 60, respect_retry_after: true, max_wait: 120s }
+  circuit_breaker: { failures_to_open: 5, cool_down: 10m }
+
+policy:
+  allowed_hosts: [api.github.com]
+  allowed_paths: [/orgs/*/members]
+  methods: [GET]
+  max_requests_per_run: 100
+  max_records_per_run: 10000
+  anomaly_multiplier: 5
+
+credential:
+  expected_scopes: ["members:read"]
+  forbid_scopes: ["*:write", "admin:*", "repo", "delete_repo"]
+  max_age_days: 90
+  idle_disable_days: 14
+  provider_ip_restriction: unknown
+
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }
+alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }

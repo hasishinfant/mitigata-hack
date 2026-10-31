@@ -1,0 +1,58 @@
+apiVersion: ix/v1
+kind: Connector
+metadata:
+  id: github-issues
+  source: github
+  tenant: demo
+  owner: secops@example.com
+
+connection:
+  base_url: https://api.github.com
+  auth: { type: bearer, secret_ref: github_pat }
+
+streams:
+  - name: issues
+    entity: event
+    request:
+      method: GET
+      path: /repos/${env.GITHUB_ORG}/${env.GITHUB_REPO}/issues
+      headers: { Accept: application/vnd.github+json, X-GitHub-Api-Version: "2022-11-28" }
+      params: { state: all, sort: updated, direction: asc, per_page: 100 }
+    records_path: $
+    pagination: { type: link_header, rel: next }
+    incremental:
+      cursor_field: updated_at
+      param: since
+      template: "{{cursor}}"
+      initial: -30d
+    mapping:
+      id:          { path: id, required: true }
+      type:        { const: github_issue }
+      severity:    { path: "labels[*].name", transform: first, map_enum: { critical: critical, security: high, bug: medium }, default: info }
+      timestamp:   { path: updated_at, transform: to_iso8601, required: true }
+      description: { path: title }
+      attributes:  { pick: [number, state, html_url, user.login, created_at, closed_at] }
+
+schedule: { every: 15m, jitter: 60s }
+
+reliability:
+  timeout: 20s
+  retries: { max: 3, backoff: exponential, base: 1s, jitter: true }
+  rate_limit: { requests_per_minute: 60, respect_retry_after: true, max_wait: 120s }
+
+policy:
+  allowed_hosts: [api.github.com]
+  allowed_paths: [/repos/*/*/issues]
+  methods: [GET]
+  max_requests_per_run: 200
+  max_records_per_run: 20000
+
+credential:
+  expected_scopes: ["issues:read"]
+  forbid_scopes: ["*:write", "admin:*", "repo", "delete_repo"]
+  max_age_days: 90
+  idle_disable_days: 14
+  provider_ip_restriction: unknown
+
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }
+alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }

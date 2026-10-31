@@ -1,0 +1,21 @@
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: cisa-kev, source: cisa_kev, tenant: demo }
+connection:
+  base_url: https://www.cisa.gov
+  auth: { type: nonee }
+streams:
+  - name: kev
+    entity: event
+    request: { method: GET, path: /sites/default/files/feeds/known_exploited_vulnerabilities.json }
+    records_path: vulnerabilities[*]
+    pagination: { type: nonee }
+    mapping:
+      id:          { path: cveID, required: true }
+      type:        { const: known_exploited_vulnerability }
+      severity:    { const: critical }
+      timestamp:   { path: dateAdded, transform: to_iso8601 }
+      description: { concat: [vendorProject, { lit: " " }, product, { lit: ": " }, vulnerabilityName] }
+      attributes:  { pick: [dueDate, knownRansomwareCampaignUse, requiredAction] }
+schedule: { every: 24h }
+policy: { allowed_hosts: [www.cisa.gov], methods: [GET], max_records_per_run: 5000 }

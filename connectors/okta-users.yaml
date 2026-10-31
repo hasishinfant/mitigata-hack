@@ -1,0 +1,64 @@
+apiVersion: ix/v1
+kind: Connector
+metadata:
+  id: okta-users
+  source: okta
+  tenant: demo
+  owner: secops@example.com
+
+connection:
+  base_url: https://${env.OKTA_ORG}.okta.com
+  auth:
+    type: oauth2_client_credentials
+    token_url: /oauth2/v1/token
+    client_id_ref: okta_client_id
+    client_auth: private_key_jwt
+    private_key_ref: okta_private_key
+    scopes: [okta.users.read]
+
+streams:
+  - name: users
+    entity: user
+    request:
+      method: GET
+      path: /api/v1/users
+      params: { limit: 200 }
+    records_path: $
+    pagination: { type: link_header, rel: next, stop_when: no_next }
+    incremental:
+      cursor_field: lastUpdated
+      param: search
+      template: 'lastUpdated gt "{{cursor}}"'
+    mapping:
+      id:          { path: id, required: true }
+      name:        { concat: [profile.firstName, { lit: " " }, profile.lastName] }
+      email:       { path: profile.email, transform: lowercase, required: true }
+      status:      { path: status, map_enum: { ACTIVE: active, SUSPENDED: suspended, DEPROVISIONED: disabled }, default: unknown }
+      last_login:  { path: lastLogin, transform: to_iso8601 }
+      attributes:  { pick: [profile.login, created, lastUpdated] }
+
+schedule: { every: 15m, jitter: 60s }
+
+reliability:
+  timeout: 20s
+  retries: { max: 3, backoff: exponential, base: 1s, jitter: true }
+  rate_limit: { requests_per_minute: 300, respect_retry_after: true, max_wait: 120s }
+  circuit_breaker: { failures_to_open: 5, cool_down: 10m }
+
+policy:
+  allowed_hosts: ["${env.OKTA_ORG}.okta.com"]
+  allowed_paths: [/api/v1/users, /oauth2/v1/token]
+  methods: [GET]
+  max_requests_per_run: 500
+  max_records_per_run: 20000
+  anomaly_multiplier: 5
+
+credential:
+  expected_scopes: [okta.users.read]
+  forbid_scopes: ["okta.*.manage"]
+  max_age_days: 90
+  idle_disable_days: 14
+  provider_ip_restriction: unknown
+
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }
+alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }

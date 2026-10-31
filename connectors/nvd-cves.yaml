@@ -1,0 +1,67 @@
+apiVersion: ix/v1
+kind: Connector
+metadata:
+  id: nvd-cves
+  source: nvd
+  tenant: demo
+  owner: secops@example.com
+
+connection:
+  base_url: https://services.nvd.nist.gov
+  auth: { type: api_key, in: header, name: apiKey, secret_ref: nvd_key }
+
+streams:
+  - name: cves
+    entity: event
+    request:
+      method: GET
+      path: /rest/json/cves/2.0
+    records_path: "vulnerabilities[*]"
+    pagination:
+      type: offset
+      offset_param: startIndex
+      limit_param: resultsPerPage
+      limit: 2000
+      total_path: totalResults
+    incremental:
+      cursor_field: cve.lastModified
+      param: lastModStartDate
+      template: "{{cursor}}"
+      initial: -7d
+      extra_params: { lastModEndDate: "{{now}}" }
+    mapping:
+      id:          { path: cve.id, required: true }
+      type:        { const: vulnerability }
+      severity:
+        path:
+          - "cve.metrics.cvssMetricV40[0].cvssData.baseScore"
+          - "cve.metrics.cvssMetricV31[0].cvssData.baseScore"
+          - "cve.metrics.cvssMetricV30[0].cvssData.baseScore"
+          - "cve.metrics.cvssMetricV2[0].cvssData.baseScore"
+        transform: cvss_to_severity
+        default: info
+      timestamp:   { path: cve.lastModified, transform: to_iso8601, required: true }
+      description: { path: "cve.descriptions[0].value" }
+      attributes:  { pick: [cve.published, cve.vulnStatus, cve.sourceIdentifier] }
+
+schedule: { every: 6h, jitter: 5m }
+
+reliability:
+  timeout: 30s
+  retries: { max: 3, backoff: exponential, base: 1s, jitter: true }
+  rate_limit: { requests_per_minute: 50, respect_retry_after: true, max_wait: 120s }   # NVD: 50 req / 30 s with key; stay well under
+
+policy:
+  allowed_hosts: [services.nvd.nist.gov]
+  allowed_paths: [/rest/json/cves/2.0]
+  methods: [GET]
+  max_requests_per_run: 50
+  max_records_per_run: 20000
+
+credential:
+  max_age_days: 365
+  idle_disable_days: 30
+  provider_ip_restriction: no
+
+data: { store_raw: false, redact_secrets: true, retention_days: 90 }
+alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }

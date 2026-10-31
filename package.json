@@ -1,0 +1,29 @@
+{
+  "name": "integratex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20.12" },
+  "packageManager": "pnpm@10.28.0",
+  "scripts": {
+    "ix": "tsx src/cli/ix.ts",
+    "migrate": "tsx src/store/migrate.ts",
+    "db:up": "docker compose up -d postgres",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "check:no-provider-code": "! grep -riE 'github|okta|nvd|cisa' src/engine src/broker"
+  },
+  "dependencies": {
+    "commander": "^13.1.0",
+    "pg": "^8.13.1",
+    "yaml": "^2.7.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.8.0",
+    "vitest": "^3.0.0"
+  }
+}

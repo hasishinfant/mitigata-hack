@@ -1,0 +1,63 @@
+apiVersion: ix/v1
+kind: Connector
+metadata:
+  id: okta-logs
+  source: okta
+  tenant: demo
+  owner: secops@example.com
+
+connection:
+  base_url: https://${env.OKTA_ORG}.okta.com
+  auth:
+    type: oauth2_client_credentials
+    token_url: /oauth2/v1/token
+    client_id_ref: okta_client_id
+    client_auth: private_key_jwt
+    private_key_ref: okta_private_key
+    scopes: [okta.logs.read]
+
+streams:
+  - name: logs
+    entity: event
+    request:
+      method: GET
+      path: /api/v1/logs
+      params: { limit: 1000, sortOrder: ASCENDING }
+    records_path: $
+    pagination: { type: link_header, rel: next, stop_when: no_next }
+    incremental:
+      cursor_field: published
+      param: since
+      template: "{{cursor}}"
+      initial: -1d
+    mapping:
+      id:          { path: uuid, required: true }
+      type:        { path: eventType, required: true }
+      severity:    { path: severity, map_enum: { DEBUG: info, INFO: info, WARN: medium, ERROR: high }, default: info }
+      timestamp:   { path: published, transform: to_iso8601, required: true }
+      description: { path: displayMessage }
+      attributes:  { pick: [actor.alternateId, outcome.result, outcome.reason, client.ipAddress, "target[*].alternateId"] }
+
+schedule: { every: 15m, jitter: 60s }
+
+reliability:
+  timeout: 20s
+  retries: { max: 3, backoff: exponential, base: 1s, jitter: true }
+  rate_limit: { requests_per_minute: 60, respect_retry_after: true, max_wait: 120s }
+
+policy:
+  allowed_hosts: ["${env.OKTA_ORG}.okta.com"]
+  allowed_paths: [/api/v1/logs, /oauth2/v1/token]
+  methods: [GET]
+  max_requests_per_run: 500
+  max_records_per_run: 50000
+
+credential:
+  expected_scopes: [okta.logs.read]
+  forbid_scopes: ["okta.*.manage"]
+  max_age_days: 90
+  idle_disable_days: 14
+  provider_ip_restriction: unknown
+
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }
+alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }

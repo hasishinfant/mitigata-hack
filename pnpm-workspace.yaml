@@ -1,0 +1,3 @@
+# Single package for now; kept so mock/ or cli/ can be split into packages later.
+packages:
+  - "."
