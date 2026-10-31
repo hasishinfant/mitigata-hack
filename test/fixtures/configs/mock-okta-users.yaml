@@ -1,0 +1,23 @@
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: mock-okta-users, source: okta, tenant: demo }
+connection:
+  base_url: http://localhost:${env.MOCK_PORT}
+  auth: { type: api_key, in: header, name: Authorization, prefix: "SSWS ", secret_ref: mock_ssws }
+streams:
+  - name: users
+    entity: user
+    request: { method: GET, path: /api/v1/users, params: { limit: 200 } }
+    records_path: $
+    pagination: { type: link_header, rel: next }
+    mapping:
+      id:         { path: id, required: true }
+      name:       { concat: [profile.firstName, { lit: " " }, profile.lastName] }
+      email:      { path: profile.email, transform: lowercase, required: true }
+      status:     { path: status, map_enum: { ACTIVE: active, SUSPENDED: suspended, DEPROVISIONED: disabled }, default: unknown }
+      last_login: { path: lastLogin, transform: to_iso8601 }
+      attributes: { pick: [profile.login, created] }
+schedule: { every: 15m }
+reliability: { rate_limit: { requests_per_minute: 600 } }
+policy: { allowed_hosts: [localhost], allowed_paths: [/api/v1/users], methods: [GET], max_requests_per_run: 20 }
+credential: { max_age_days: 90, idle_disable_days: 14 }

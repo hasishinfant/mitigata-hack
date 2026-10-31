@@ -1,0 +1,23 @@
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: mock-jira-issues, source: jira, tenant: demo }
+connection:
+  base_url: http://localhost:${env.MOCK_PORT}
+  auth: { type: basic, username_ref: mock_basic_user, password_ref: mock_basic_pass }
+streams:
+  - name: issues
+    entity: event
+    request: { method: GET, path: /rest/api/3/search/jql, params: { jql: "project = SEC", maxResults: 50 } }
+    records_path: "issues[*]"
+    pagination: { type: cursor, token_path: nextPageToken, token_param: nextPageToken, stop_when: is_last_path, is_last_path: isLast }
+    mapping:
+      id:          { path: id, required: true }
+      type:        { const: ticket }
+      severity:    { path: fields.priority.name, map_enum: { Lowest: info, Low: low, Medium: medium, High: high, Highest: critical }, default: info }
+      timestamp:   { path: fields.updated, transform: to_iso8601 }
+      description: { concat: [key, { lit: ": " }, fields.summary] }
+      attributes:  { pick: [key, fields.status.name] }
+schedule: { every: 15m }
+reliability: { rate_limit: { requests_per_minute: 600 } }
+policy: { allowed_hosts: [localhost], allowed_paths: [/rest/api/3/search/jql], methods: [GET], max_requests_per_run: 20 }
+credential: { max_age_days: 90, idle_disable_days: 14 }

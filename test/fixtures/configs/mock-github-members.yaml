@@ -1,0 +1,21 @@
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: mock-github-members, source: github, tenant: demo }
+connection:
+  base_url: http://localhost:${env.MOCK_PORT}
+  auth: { type: bearer, secret_ref: mock_bearer }
+streams:
+  - name: members
+    entity: user
+    request: { method: GET, path: /orgs/acme/members, params: { per_page: 100 } }
+    records_path: $
+    pagination: { type: link_header, rel: next }
+    mapping:
+      id:         { path: id, required: true }
+      name:       { path: login, required: true }
+      status:     { const: active }
+      attributes: { pick: [login, type, site_admin] }
+schedule: { every: 1h }
+reliability: { rate_limit: { requests_per_minute: 600 } }
+policy: { allowed_hosts: [localhost], allowed_paths: [/orgs/*/members], methods: [GET], max_requests_per_run: 50 }
+credential: { max_age_days: 90, idle_disable_days: 14 }

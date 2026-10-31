@@ -1,0 +1,26 @@
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: mock-nvd-cves, source: nvd, tenant: demo }
+connection:
+  base_url: http://localhost:${env.MOCK_PORT}
+  auth: { type: api_key, in: header, name: apiKey, secret_ref: mock_api_key }
+streams:
+  - name: cves
+    entity: event
+    request: { method: GET, path: /rest/json/cves/2.0 }
+    records_path: "vulnerabilities[*]"
+    pagination: { type: offset, offset_param: startIndex, limit_param: resultsPerPage, limit: 2000, total_path: totalResults }
+    mapping:
+      id:          { path: cve.id, required: true }
+      type:        { const: vulnerability }
+      severity:
+        path: ["cve.metrics.cvssMetricV31[0].cvssData.baseScore", "cve.metrics.cvssMetricV2[0].cvssData.baseScore"]
+        transform: cvss_to_severity
+        default: info
+      timestamp:   { path: cve.lastModified, transform: to_iso8601, required: true }
+      description: { path: "cve.descriptions[0].value" }
+      attributes:  { pick: [cve.published, cve.vulnStatus] }
+schedule: { every: 6h }
+reliability: { rate_limit: { requests_per_minute: 600 } }
+policy: { allowed_hosts: [localhost], allowed_paths: [/rest/json/cves/2.0], methods: [GET], max_requests_per_run: 20 }
+credential: { max_age_days: 365, idle_disable_days: 30 }
