@@ -4,6 +4,7 @@ import type { Checkpoint, FieldStats, PageCommit, RunStatus, RunStore } from "..
 import { withTx } from "./db.ts";
 import { insertQuarantine } from "./quarantine.ts";
 import { upsertRecords } from "./upsert.ts";
+import { raiseAlertOnce } from "../security/alerts.ts";
 
 export function createPgRunStore(pool: pg.Pool): RunStore {
   return {
@@ -32,7 +33,8 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
              on conflict (connector_id, stream) do update set page_state = excluded.page_state, updated_at = now()`,
             [p.connectorId, p.stream, JSON.stringify({ next_url: p.checkpoint.nextUrl, next_body: p.checkpoint.nextBody, config_hash: p.checkpoint.configHash })],
           );
-        else await c.query("delete from checkpoints where connector_id = $1 and stream = $2", [p.connectorId, p.stream]);
+        // Stream complete: clear the page position but keep the row (it holds the incremental watermark).
+        else await c.query("update checkpoints set page_state = null, updated_at = now() where connector_id = $1 and stream = $2", [p.connectorId, p.stream]);
       });
     },
 
@@ -50,10 +52,17 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
     },
 
     async loadCheckpoint(connectorId, stream): Promise<Checkpoint | null> {
-      const r = await pool.query("select page_state from checkpoints where connector_id = $1 and stream = $2", [connectorId, stream]);
-      const ps = r.rows[0]?.page_state as { next_url?: string; next_body?: Record<string, unknown>; config_hash?: string } | undefined;
-      if (!ps?.next_url) return null;
-      return { nextUrl: ps.next_url, ...(ps.next_body ? { nextBody: ps.next_body } : {}), configHash: ps.config_hash ?? "" };
+      const r = await pool.query("select page_state, cursor_value from checkpoints where connector_id = $1 and stream = $2", [connectorId, stream]);
+      if (!r.rowCount) return null;
+      const ps = r.rows[0].page_state as { next_url?: string; next_body?: Record<string, unknown>; config_hash?: string } | null;
+      const cursorValue = (r.rows[0].cursor_value as string | null) ?? undefined;
+      if (!ps?.next_url && !cursorValue) return null;
+      return {
+        ...(ps?.next_url ? { nextUrl: ps.next_url } : {}),
+        ...(ps?.next_body ? { nextBody: ps.next_body } : {}),
+        configHash: ps?.config_hash ?? "",
+        ...(cursorValue ? { cursorValue } : {}),
+      };
     },
 
     async previousFieldStats(connectorId, stream, excludeRunId): Promise<FieldStats | null> {
@@ -91,8 +100,17 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
       );
     },
 
+    async saveWatermark(connectorId, stream, value) {
+      await pool.query(
+        `insert into checkpoints (connector_id, stream, cursor_value, updated_at) values ($1, $2, $3, now())
+         on conflict (connector_id, stream) do update set cursor_value = excluded.cursor_value, updated_at = now()`,
+        [connectorId, stream, value],
+      );
+    },
+
+    // De-duplicated per connector and kind for an hour, so a bad key on a 15-minute schedule doesn't spam.
     async raiseAlert(connectorId, kind, message) {
-      await pool.query("insert into alerts (connector_id, kind, message) values ($1, $2, $3)", [connectorId, kind, message]);
+      await raiseAlertOnce(pool, connectorId, kind, message, 1);
     },
   };
 }

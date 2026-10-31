@@ -103,3 +103,15 @@ export async function loadSignedConnector(
   if (res.config.metadata.id !== id) throw new Error(`connector ${id}: stored config claims id ${res.config.metadata.id}`);
   return { ...resolveConnector(res.config, res.configHash), status: row.status as string, version: row.active_version as number };
 }
+
+export async function setConnectorEnabled(pool: pg.Pool, id: string, enabled: boolean, reason?: string): Promise<boolean> {
+  const r = enabled
+    ? await pool.query(
+        "update connectors set status = 'enabled', disabled_reason = null, disabled_at = null, paused_until = null, enabled_at = now() where id = $1",
+        [id],
+      )
+    : await pool.query("update connectors set status = 'disabled', disabled_reason = $2, disabled_at = now(), next_run_at = null where id = $1", [
+        id, reason ?? "disabled by operator",
+      ]);
+  return (r.rowCount ?? 0) > 0;
+}

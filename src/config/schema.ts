@@ -41,6 +41,7 @@ const AuthOAuth2 = z.strictObject({
   key_id: z.string().optional(),
   scopes: z.array(z.string().min(1)).optional(),
   audience: z.string().optional(),
+  revocation_url: z.string().optional(), // RFC 7009 endpoint: panic revokes cached tokens here
 });
 export const AuthSchema = z.discriminatedUnion("type", [AuthNone, AuthApiKey, AuthBasic, AuthBearer, AuthOAuth2]);
 
@@ -173,6 +174,8 @@ export const ConnectorSchema = z.strictObject({
       idle_disable_days: posInt.optional(),
       provider_ip_restriction: z.enum(["yes", "no", "unknown"]).optional(),
       scopes_header: z.string().optional(), // response header listing the token's granted scopes, if the provider sends one
+      revocable_by_api: z.boolean().optional(), // can the hub revoke this credential itself (OAuth revocation)?
+      revoke_hint: z.string().max(300).optional(), // where a human revokes it, printed by `ix panic`
     })
     .optional(),
   data: z

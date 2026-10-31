@@ -53,15 +53,17 @@ function card(c) {
   return el("article", { class: `card h-${c.health}` },
     el("h3", {}, el("span", {}, c.id), el("span", { class: `pill h-${c.health}` }, c.health.replace("_", " "))),
     el("div", { class: "badges" },
+      c.posture && el("span", { class: `risk risk-${c.posture.risk}`, title: c.posture.flags.map((f) => `${f.level}: ${f.message}`).join("\n") || "no flags" }, `${c.posture.risk} risk`),
       el("span", { class: "badge" }, c.source),
       c.auth_type && el("span", { class: "badge" }, c.auth_type),
       c.entities.map((e) => el("span", { class: "badge" }, e)),
       c.config_version && el("span", { class: "badge" }, `v${c.config_version}`)),
     meta,
     strip,
+    c.posture && c.posture.risk === "high" ? el("div", { class: "flag flag-high" }, `⚠ ${c.posture.flags[0].message}`) : null,
     c.reason ? el("div", { class: "error", title: c.reason }, c.reason) : null,
     c.last_error && c.last_error !== c.reason ? el("div", { class: "error", title: c.last_error }, c.last_error) : null,
-    el("div", { class: "actions" }, runBtn, el("button", { onclick: () => showHistory(c.id) }, "History")),
+    el("div", { class: "actions" }, runBtn, el("button", { onclick: () => showHistory(c.id) }, "History"), el("button", { onclick: () => showPosture(c.id) }, "Posture")),
   );
 }
 
@@ -117,6 +119,61 @@ async function showHistory(id) {
   $("history").showModal();
 }
 $("history-close").addEventListener("click", () => $("history").close());
+
+// ---------- posture ----------
+async function showPosture(id) {
+  const p = await api(`/v1/connectors/${encodeURIComponent(id)}/posture`);
+  $("posture-title").textContent = `Blast radius: ${p.connector_id} (${p.risk} risk)`;
+  const s = p.scopes;
+  const scopeEls = s.granted
+    ? s.granted.map((g) => el("span", { class: s.forbidden.includes(g) || s.writeLike.includes(g) ? "scope-bad" : s.extra.includes(g) ? "scope-extra" : "" }, `${g} `))
+    : [el("span", { class: "muted" }, "not reported by provider")];
+  $("posture-body").replaceChildren(
+    el("div", { class: "kv" },
+      el("div", {}, "Source / auth"), el("div", {}, `${p.source} · ${p.auth_type} · ${p.status}`),
+      el("div", {}, "Streams"), el("div", {}, p.streams.map((x) => `${x.method} ${x.path} → ${x.entity}`).join("  |  ")),
+      el("div", {}, "Allowed hosts"), el("div", {}, p.reach.allowed_hosts.join(", ")),
+      el("div", {}, "Allowed paths"), el("div", {}, [...p.reach.allowed_paths, ...p.reach.read_only_post.map((x) => `POST ${x}`)].join(", ")),
+      el("div", {}, "Per-run caps"), el("div", {}, `${p.reach.max_requests_per_run} requests, ${p.reach.max_records_per_run} records`),
+      el("div", {}, "Credentials"), el("div", {}, p.credentials.map((c) => (c.stored ? `${c.ref}: ${c.age_days}d old, idle ${c.idle_days}d` : `${c.ref}: not stored`)).join("  |  ") || "none"),
+      el("div", {}, "Expected scopes"), el("div", {}, s.expected.join(" ") || "—"),
+      el("div", {}, "Granted scopes"), el("div", {}, ...scopeEls),
+      el("div", {}, "Revocable by API"), el("div", {}, String(p.revocable_by_api)),
+      el("div", {}, "Provider IP restriction"), el("div", {}, p.provider_ip_restriction),
+      el("div", {}, "Policy violations (7d)"), el("div", {}, String(p.violations_7d)),
+    ),
+    ...p.flags.map((f) => el("div", { class: `flag flag-${f.level}` }, `${f.level.toUpperCase()}  ${f.message}`)),
+  );
+  $("posture").showModal();
+}
+$("posture-close").addEventListener("click", () => $("posture").close());
+
+// ---------- panic ----------
+$("panic").addEventListener("click", async () => {
+  if (!tokenInput.value) {
+    tokenInput.focus();
+    alert("Enter the admin token (IX_ADMIN_TOKEN) first.");
+    return;
+  }
+  if (prompt("PANIC disables EVERY connector and wipes all tokens. Type 'panic' to confirm.") !== "panic") return;
+  try {
+    const r = await api("/v1/panic", { method: "POST", headers: { authorization: `Bearer ${tokenInput.value}`, "content-type": "application/json" }, body: "{}" });
+    $("panic-body").replaceChildren(
+      el("p", {}, `${r.disabled.length} connectors disabled · ${r.queued_runs_cancelled} queued runs cancelled · ${r.broker.tokens_revoked} tokens revoked at the provider`),
+      r.broker.error ? el("div", { class: "error" }, r.broker.error) : el("p", { class: "muted" }, "All in-memory tokens in the broker were wiped."),
+      el("div", { class: "table-wrap" }, el("table", {},
+        el("thead", {}, el("tr", {}, ["", "connector", "auth", "what to do"].map((h) => el("th", {}, h)))),
+        el("tbody", {}, r.checklist.map((c) => el("tr", {},
+          el("td", {}, c.action === "revoked_by_api" ? "✔" : c.action === "nothing_to_revoke" ? "–" : "☐"),
+          el("td", {}, c.connector_id), el("td", {}, c.auth_type), el("td", { title: c.detail }, c.detail)))))),
+    );
+    $("panic-result").showModal();
+    refresh();
+  } catch (e) {
+    alert(`Panic failed: ${e.message}`);
+  }
+});
+$("panic-close").addEventListener("click", () => $("panic-result").close());
 
 // ---------- records ----------
 async function loadRecords() {

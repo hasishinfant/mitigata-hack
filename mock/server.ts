@@ -21,6 +21,10 @@ export type MockOptions = {
   /** Scope string returned by the token endpoint (default: the scope that was requested). */
   grantedScope?: string;
   tokenTtlS?: number;
+  /** X-OAuth-Scopes returned by the GitHub-like endpoint (classic PAT behaviour). */
+  githubScopes?: string;
+  /** Directory users (by index) whose lastUpdated is bumped to a later date (incremental sync tests). */
+  touchedUsers?: number[];
 };
 
 export type FaultMode = "429" | "500" | "503" | "timeout" | "drop" | "ratelimit403";
@@ -39,7 +43,8 @@ export type Mock = {
   calls: MockCall[];
   options: Required<Omit<MockOptions, "tokens">> & { tokens: Required<NonNullable<MockOptions["tokens"]>> };
   setFault(spec: FaultSpec | null): void;
-  oauth: { tokenCalls: number; lastAssertion?: { header: Record<string, unknown>; payload: Record<string, unknown> }; revokeAll(): void };
+  oauth: { tokenCalls: number; revoked: number; lastAssertion?: { header: Record<string, unknown>; payload: Record<string, unknown> }; revokeAll(): void };
+  slack: { path: string; text: string }[];
 };
 
 export const MOCK_TOKENS = {
@@ -76,6 +81,8 @@ export function buildMock(opts: MockOptions = {}): Mock {
     jwtPublicKey: opts.jwtPublicKey ?? "",
     grantedScope: opts.grantedScope ?? "",
     tokenTtlS: opts.tokenTtlS ?? 1799,
+    githubScopes: opts.githubScopes ?? "read:org",
+    touchedUsers: opts.touchedUsers ?? [],
     tokens: { ...MOCK_TOKENS, ...opts.tokens },
   };
   const t = options.tokens;
@@ -156,6 +163,7 @@ export function buildMock(opts: MockOptions = {}): Mock {
     if (page > 1) links.push(`${link(1)}; rel="first"`, `${link(page - 1)}; rel="prev"`);
     if (links.length) reply.header("link", links.join(", "));
     reply.header("x-ratelimit-remaining", "4999");
+    if (options.githubScopes) reply.header("x-oauth-scopes", options.githubScopes);
     return items;
   });
 
@@ -191,7 +199,7 @@ export function buildMock(opts: MockOptions = {}): Mock {
       id: `00u${String(i).padStart(6, "0")}`,
       status: ["ACTIVE", "ACTIVE", "SUSPENDED", "DEPROVISIONED", "PROVISIONED"][i % 5],
       lastLogin: i % 7 === 0 ? null : iso(i),
-      lastUpdated: iso(i + 2),
+      lastUpdated: options.touchedUsers.includes(i) ? "2026-06-01T00:00:00.000Z" : iso(i + 2),
       created: iso(-i),
       profile: {
         firstName: `First${i}`,
@@ -204,7 +212,10 @@ export function buildMock(opts: MockOptions = {}): Mock {
     if (req.headers.authorization !== `SSWS ${t.ssws}` && !hasToken(req)) return unauthorized(reply, "Invalid token provided");
     const q = qp(req);
     const limit = intParam(q.limit, 200, 200) || 200;
-    const all = dirUsers();
+    let all = dirUsers();
+    // Okta-style filter used by incremental sync: search=lastUpdated gt "<iso>"
+    const since = /lastUpdated gt "([^"]+)"/.exec(q.search ?? "")?.[1];
+    if (since) all = all.filter((u) => Date.parse(u.lastUpdated) > Date.parse(since));
     const startIdx = q.after ? all.findIndex((u) => u.id === Buffer.from(q.after!, "base64url").toString()) + 1 : 0;
     const page = all.slice(startIdx, startIdx + limit);
     const self = `<${origin(req)}/api/v1/users?limit=${limit}${q.after ? `&after=${q.after}` : ""}>; rel="self"`;
@@ -241,7 +252,8 @@ export function buildMock(opts: MockOptions = {}): Mock {
 
 
   // ---- OAuth2 client credentials token endpoint (CrowdStrike-like path and Okta-like path) ----
-  const oauth: Mock["oauth"] = { tokenCalls: 0, revokeAll: () => validTokens.clear() };
+  const oauth: Mock["oauth"] = { tokenCalls: 0, revoked: 0, revokeAll: () => validTokens.clear() };
+  const slack: Mock["slack"] = [];
   const validTokens = new Set<string>();
   const hasToken = (req: FastifyRequest) => {
     const h = req.headers.authorization ?? "";
@@ -281,6 +293,20 @@ export function buildMock(opts: MockOptions = {}): Mock {
   };
   app.post("/oauth2/token", tokenHandler);
   app.post("/oauth2/v1/token", tokenHandler);
+  // RFC 7009 revocation (client must authenticate; unknown tokens still return 200, per the RFC).
+  app.post("/oauth2/v1/revoke", async (req, reply) => {
+    const f = (req.body ?? {}) as Record<string, string>;
+    const basic = req.headers.authorization?.startsWith("Basic ") ? Buffer.from(req.headers.authorization.slice(6), "base64").toString() : "";
+    const ok = basic ? basic === `${encodeURIComponent(t.clientId)}:${encodeURIComponent(t.clientSecret)}` : (f.client_id === t.clientId && f.client_secret === t.clientSecret) || Boolean(f.client_assertion);
+    if (!ok) return reply.code(401).send({ error: "invalid_client" });
+    if (f.token && validTokens.delete(f.token)) oauth.revoked++;
+    return reply.code(200).send();
+  });
+  // Slack-like incoming webhook
+  app.post("/services/:a/:b/:c", async (req) => {
+    slack.push({ path: new URL(req.url, "http://x").pathname, text: String((req.body as { text?: unknown })?.text ?? "") });
+    return "ok";
+  });
 
   // ---- CrowdStrike-like hosts: OAuth2 bearer, offset + meta.pagination.total ----
   app.get("/devices/combined/devices/v1", async (req, reply) => {
@@ -408,7 +434,7 @@ export function buildMock(opts: MockOptions = {}): Mock {
   }));
 
   app.get("/__health", async () => ({ ok: true }));
-  return { app, calls, options, setFault, oauth };
+  return { app, calls, options, setFault, oauth, slack };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
@@ -420,6 +446,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
       ...(process.env.MOCK_API_KEY ? { apiKey: process.env.MOCK_API_KEY } : {}),
       ...(process.env.MOCK_SSWS_TOKEN ? { ssws: process.env.MOCK_SSWS_TOKEN } : {}),
     },
+    ...(process.env.MOCK_GITHUB_SCOPES ? { githubScopes: process.env.MOCK_GITHUB_SCOPES } : {}),
   });
   await app.listen({ host: "127.0.0.1", port });
   console.log(`mock providers on http://localhost:${port}`);

@@ -26,21 +26,35 @@ export type LocalBrokerOptions = {
   random?: () => number;
   /** Called for every outbound call and every denial. If it throws, the request fails (fail closed). */
   audit?: (e: AuditEntry) => Promise<void>;
+  /** Called when the broker learns (or re-learns different) granted scopes for a connector's credential. */
+  onScopes?: (conn: ResolvedConnector, scopes: string[], source: "token_response" | "response_header") => Promise<void>;
 };
+
+export type RevokeResult = { connectorId: string; revoked: boolean; detail: string };
 
 export type LocalBroker = Broker & {
   /** Drop cached tokens and learned credential info (disable / panic). */
   forget(connectorId?: string): void;
+  /** Panic: revoke every cached OAuth token where a revocation endpoint is configured, then drop them all. */
+  revokeAll(): Promise<RevokeResult[]>;
 };
 
 type Sent = { res: HttpResult; retries: number; rateLimitedMs: number };
-type Target = "api" | "token";
+type Target = "api" | "token" | "revoke";
 
 export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
   const clock = opts.clock ?? realClock;
   const buckets = new Map<string, TokenBucket>();
   const tokens = new OAuthTokenManager();
   const headerScopes = new Map<string, string[]>();
+  const reportedScopes = new Map<string, string>(); // connector -> last scopes reported via onScopes
+
+  async function reportScopes(conn: ResolvedConnector, scopes: string[], source: "token_response" | "response_header"): Promise<void> {
+    const key = [...scopes].sort().join(" ");
+    if (!opts.onScopes || reportedScopes.get(conn.metadata.id) === key) return;
+    reportedScopes.set(conn.metadata.id, key);
+    await opts.onScopes(conn, scopes, source);
+  }
 
   const bucketFor = (conn: ResolvedConnector): TokenBucket => {
     const rpm = conn.runtime.rateLimit.requestsPerMinute;
@@ -205,7 +219,13 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
 
         const scopesHeader = conn.credential?.scopes_header?.toLowerCase();
         const hs = scopesHeader ? sent.res.headers[scopesHeader] : undefined;
-        if (hs !== undefined) headerScopes.set(conn.metadata.id, hs.split(/[\s,]+/).filter(Boolean));
+        if (hs !== undefined) {
+          const list = hs.split(/[\s,]+/).filter(Boolean);
+          headerScopes.set(conn.metadata.id, list);
+          await reportScopes(conn, list, "response_header");
+        }
+        const tok = tokens.peek(conn.metadata.id);
+        if (tok?.scopes) await reportScopes(conn, tok.scopes, "token_response");
 
         // A provider may echo a credential back (e.g. a query-string key inside a Link header). Strip it.
         return {
@@ -229,14 +249,52 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
 
     forget(connectorId?: string) {
       tokens.invalidate(connectorId);
-      if (connectorId) headerScopes.delete(connectorId);
-      else headerScopes.clear();
+      if (connectorId) {
+        headerScopes.delete(connectorId);
+        reportedScopes.delete(connectorId);
+      } else {
+        headerScopes.clear();
+        reportedScopes.clear();
+      }
+    },
+
+    async revokeAll(): Promise<RevokeResult[]> {
+      const out: RevokeResult[] = [];
+      for (const id of tokens.cachedIds()) {
+        let conn: ResolvedConnector | undefined;
+        try {
+          conn = await opts.getConnector(id);
+        } catch {
+          conn = undefined;
+        }
+        if (!conn) {
+          tokens.invalidate(id);
+          out.push({ connectorId: id, revoked: false, detail: "config unavailable; token dropped from memory" });
+          continue;
+        }
+        const c = conn;
+        try {
+          const r = await tokens.revoke(c, opts.secrets, async (url, h, b) => {
+            checkPolicy(c, "POST", url.href, "revoke");
+            const res = (await send(c, "POST", url, h, b)).res;
+            await opts.audit?.({ connectorId: c.metadata.id, action: "revoke", method: "POST", host: url.host, path: url.pathname, status: res.status, decision: res.status < 300 ? "allow" : `error: HTTP ${res.status}` });
+            return res;
+          }, clock.now());
+          out.push({ connectorId: id, ...r });
+        } catch (e) {
+          out.push({ connectorId: id, revoked: false, detail: `revocation failed: ${(e as Error).message}` });
+        }
+      }
+      tokens.invalidate();
+      return out;
     },
   };
 }
 
 function checkPolicy(conn: ResolvedConnector, method: string, rawUrl: string, target: Target): URL {
-  if ((conn as { status?: string }).status === "disabled") throw new BrokerError("policy_denied", "policy denied: connector is disabled");
+  // Disabled connectors make no calls, except revoking their own token during panic.
+  if (target !== "revoke" && (conn as { status?: string }).status === "disabled")
+    throw new BrokerError("policy_denied", "policy denied: connector is disabled");
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -250,6 +308,8 @@ function checkPolicy(conn: ResolvedConnector, method: string, rawUrl: string, ta
   const rt = conn.runtime;
   if (target === "token") {
     if (method !== "POST" || url.pathname !== rt.tokenPath) throw deny(conn, method, url, "not the configured token endpoint");
+  } else if (target === "revoke") {
+    if (method !== "POST" || url.href !== rt.revocationUrl) throw deny(conn, method, url, "not the configured revocation endpoint");
   } else if (method === "POST") {
     if (!pathAllowed(url.pathname, rt.readOnlyPost)) throw deny(conn, method, url, `POST to ${url.pathname} not in read_only_post`);
   } else {

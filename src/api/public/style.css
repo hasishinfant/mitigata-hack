@@ -47,3 +47,13 @@ th { position: sticky; top: 0; background: var(--panel); color: var(--muted); fo
 dialog { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 10px; width: min(1100px, 95vw); padding: 16px; }
 dialog::backdrop { background: rgba(0, 0, 0, .6); }
 .dialog-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+
+.danger { border-color: var(--red); color: #fecaca; }
+.danger:hover { background: #2a1517; }
+.risk { font-size: 11px; padding: 1px 6px; border-radius: 4px; font-weight: 700; border: 1px solid currentColor; }
+.risk-high { color: var(--red); } .risk-medium { color: var(--amber); } .risk-low { color: var(--muted); }
+.flag { font-size: 12px; margin: 2px 0; }
+.flag-high { color: #fca5a5; } .flag-medium { color: #fcd34d; } .flag-low { color: var(--muted); }
+.kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 12px; font-size: 13px; margin-bottom: 12px; }
+.kv div:nth-child(odd) { color: var(--muted); }
+.scope-bad { color: var(--red); font-weight: 600; } .scope-extra { color: var(--amber); }

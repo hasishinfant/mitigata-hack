@@ -12,7 +12,9 @@ import type { Broker } from "../broker/types.ts";
 import { validateConfigText } from "../config/validate.ts";
 import { testConnection } from "../engine/testConnection.ts";
 import { enqueueRun } from "../scheduler/queue.ts";
-import { ConnectorConfigError, loadActiveConnector } from "../store/connectors.ts";
+import { panic } from "../security/panic.ts";
+import { getPosture } from "../security/posture.ts";
+import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "../store/connectors.ts";
 import { getHealth } from "../store/health.ts";
 import { listQuarantine } from "../store/quarantine.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
@@ -101,6 +103,13 @@ export function buildApi(opts: ApiOptions) {
     return { items: await listQuarantine(opts.pool, { connectorId: q.connector, limit: Math.min(Number(q.limit) || 50, 500) }) };
   });
 
+  app.get("/v1/connectors/:id/posture", async (req) => getPosture(opts.pool, (req.params as { id: string }).id, env));
+
+  app.get("/v1/alerts", async (req) => {
+    const limit = Math.min(Number((req.query as { limit?: string }).limit) || 50, 500);
+    return { alerts: (await opts.pool.query("select id, connector_id, kind, message, created_at, delivered, channel from alerts order by id desc limit $1", [limit])).rows };
+  });
+
   app.post("/v1/configs/validate", async (req) => {
     const res = validateConfigText(yamlBody(req), { env });
     return { ok: res.ok, errors: res.errors, warnings: res.warnings, config_hash: res.configHash };
@@ -135,6 +144,24 @@ export function buildApi(opts: ApiOptions) {
     if (!opts.broker) return reply.code(503).send({ error: "broker not available" });
     const conn = await loadActiveConnector(opts.pool, (req.params as { id: string }).id, env);
     return testConnection(conn, opts.broker);
+  });
+
+  app.post("/v1/connectors/:id/disable", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!(await setConnectorEnabled(opts.pool, id, false, "disabled via API"))) return reply.code(404).send({ error: `connector ${id} not found` });
+    await opts.admin?.forget(id).catch(() => {}); // drop its cached token now
+    return { id, status: "disabled" };
+  });
+
+  app.post("/v1/connectors/:id/enable", { preHandler: requireAdmin }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!(await setConnectorEnabled(opts.pool, id, true))) return reply.code(404).send({ error: `connector ${id} not found` });
+    return { id, status: "enabled" };
+  });
+
+  app.post("/v1/panic", { preHandler: requireAdmin }, async (req) => {
+    const body = (req.body ?? {}) as { purge_secrets?: boolean };
+    return panic(opts.pool, { admin: opts.admin, boss: opts.boss, purgeSecrets: body.purge_secrets === true, actor: "api", env });
   });
 
   app.post("/v1/connectors/:id/runs", { preHandler: requireAdmin }, async (req, reply) => {

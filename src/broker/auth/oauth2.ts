@@ -65,23 +65,17 @@ export class OAuthTokenManager {
     else this.cache.clear();
   }
 
-  /** Returns a valid access token plus the secret values involved (for scrubbing). */
-  async get(conn: ResolvedConnector, secrets: SecretSource, send: TokenSender, now: number): Promise<{ token: string; used: string[] }> {
-    const hit = this.cache.get(conn.metadata.id);
-    if (hit && hit.expiresAt - REFRESH_EARLY_MS > now) return { token: hit.token, used: [hit.token] };
-
+  /** Client authentication for the token or revocation endpoint (RFC 6749 §2.3 / RFC 7523). */
+  private async clientAuth(conn: ResolvedConnector, secrets: SecretSource, audience: string, now: number) {
     const auth = conn.connection.auth as OAuthCfg;
     const tenant = conn.metadata.tenant;
-    const tokenUrl = new URL(auth.token_url, conn.connection.base_url);
     const clientId = await need(secrets, tenant, auth.client_id_ref, "client_id");
-    const form = new URLSearchParams({ grant_type: "client_credentials" });
-    if (auth.scopes?.length) form.set("scope", auth.scopes.join(" "));
+    const form = new URLSearchParams();
     const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded", accept: "application/json" };
     const used: string[] = [];
-
     if (auth.client_auth === "private_key_jwt") {
       const pem = await need(secrets, tenant, auth.private_key_ref, "private_key");
-      const assertion = await clientAssertion(clientId, auth.audience ?? tokenUrl.href, pem, auth.key_id, now);
+      const assertion = await clientAssertion(clientId, audience, pem, auth.key_id, now);
       form.set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer");
       form.set("client_assertion", assertion);
       used.push(pem, assertion);
@@ -97,6 +91,19 @@ export class OAuthTokenManager {
         form.set("client_secret", secret);
       }
     }
+    return { headers, form, used };
+  }
+
+  /** Returns a valid access token plus the secret values involved (for scrubbing). */
+  async get(conn: ResolvedConnector, secrets: SecretSource, send: TokenSender, now: number): Promise<{ token: string; used: string[] }> {
+    const hit = this.cache.get(conn.metadata.id);
+    if (hit && hit.expiresAt - REFRESH_EARLY_MS > now) return { token: hit.token, used: [hit.token] };
+
+    const auth = conn.connection.auth as OAuthCfg;
+    const tokenUrl = new URL(auth.token_url, conn.connection.base_url);
+    const { headers, form, used } = await this.clientAuth(conn, secrets, auth.audience ?? tokenUrl.href, now);
+    form.set("grant_type", "client_credentials");
+    if (auth.scopes?.length) form.set("scope", auth.scopes.join(" "));
     if (auth.audience && auth.client_auth !== "private_key_jwt") form.set("audience", auth.audience);
 
     const res = await send(tokenUrl, headers, form.toString());
@@ -117,5 +124,29 @@ export class OAuthTokenManager {
     const cached: CachedToken = { token: json.access_token, expiresAt: now + ttl, ...(scopes ? { scopes } : {}) };
     this.cache.set(conn.metadata.id, cached);
     return { token: cached.token, used: [...used, cached.token] };
+  }
+
+  /** Connector ids that currently hold a cached token. */
+  cachedIds(): string[] {
+    return [...this.cache.keys()];
+  }
+
+  /**
+   * Revoke the cached access token at the connector's revocation endpoint (RFC 7009), then drop it.
+   * Returns false when there's nothing to revoke or no endpoint is configured.
+   */
+  async revoke(conn: ResolvedConnector, secrets: SecretSource, send: TokenSender, now: number): Promise<{ revoked: boolean; detail: string }> {
+    const t = this.cache.get(conn.metadata.id);
+    this.cache.delete(conn.metadata.id);
+    if (!t) return { revoked: false, detail: "no cached token" };
+    const url = conn.runtime.revocationUrl;
+    if (!url) return { revoked: false, detail: "no revocation_url configured; token dropped from memory only" };
+    const { headers, form } = await this.clientAuth(conn, secrets, url, now);
+    form.set("token", t.token);
+    form.set("token_type_hint", "access_token");
+    const res = await send(new URL(url), headers, form.toString());
+    return res.status >= 200 && res.status < 300
+      ? { revoked: true, detail: `revoked at ${new URL(url).host}` }
+      : { revoked: false, detail: `revocation endpoint answered HTTP ${res.status}` };
   }
 }

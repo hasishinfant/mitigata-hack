@@ -97,7 +97,7 @@ describe.skipIf(!hasDb)("reliability", () => {
     expect(s2).toMatchObject({ status: "success", resumed: true, requests: 2, recordsOk: 2500 });
     expect(startIndexes()).toEqual(["2000", "4000"]);
     expect(await count("select count(*) from events")).toBe(4500);
-    expect(await count("select count(*) from checkpoints")).toBe(0);
+    expect(await count("select count(*) from checkpoints where page_state is not null")).toBe(0);
   });
 
   // ---------- PRD failure test 3: calling faster than the limit (429) ----------

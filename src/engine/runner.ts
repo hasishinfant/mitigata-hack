@@ -9,13 +9,15 @@ import type { Entity, StreamConfig } from "../config/schema.ts";
 import { log } from "../log.ts";
 import { mapRecord, type MappedRecord } from "../mapping/mapper.ts";
 import { resolvePath } from "../mapping/paths.ts";
+import { redactValue } from "../mapping/scanner.ts";
+import { toIso } from "../mapping/transforms.ts";
 import { BrokerError, type Broker } from "../broker/types.ts";
 import { createPaginator, type PageRequest } from "./paginate/index.ts";
 
 export type RunTrigger = "manual" | "schedule" | "api";
 export type RunStatus = "running" | "success" | "partial" | "failed" | "auth_failed" | "degraded" | "paused";
 export type FieldStats = { records: number; hits: Record<string, number> };
-export type Checkpoint = { nextUrl: string; nextBody?: Record<string, unknown>; configHash: string };
+export type Checkpoint = { nextUrl?: string; nextBody?: Record<string, unknown>; configHash: string; cursorValue?: string };
 
 export type QuarantineItem = { raw: unknown; errors: string[] };
 export type PageCommit = {
@@ -47,6 +49,8 @@ export interface RunStore {
   commitPage(p: PageCommit): Promise<void>;
   finishRun(r: FinishRun): Promise<void>;
   loadCheckpoint(connectorId: string, stream: string): Promise<Checkpoint | null>;
+  /** Incremental sync: highest cursor_field value seen in a fully completed run. */
+  saveWatermark(connectorId: string, stream: string, value: string): Promise<void>;
   previousFieldStats(connectorId: string, stream: string, excludeRunId: string): Promise<FieldStats | null>;
   connectorState(connectorId: string): Promise<{ status: string; pausedUntil: Date | null; reason: string | null }>;
   recentStatuses(connectorId: string, n: number): Promise<RunStatus[]>;
@@ -65,6 +69,8 @@ export type RunSummary = {
   retries: number;
   rateLimitedMs: number;
   resumed: boolean;
+  incrementalFrom?: string; // watermark injected for this run
+  watermark?: string; // new watermark saved after this run
   lastError?: string;
 };
 
@@ -79,6 +85,25 @@ export class RunFailure extends Error {
 const FAILURE: RunStatus[] = ["failed", "auth_failed"];
 const DRIFT_MIN_RECORDS = 5;
 const DRIFT_JUMP = 0.5;
+const RAW_LIMIT = 16 * 1024;
+
+/** "-7d" / "-12h" / "-30m" relative to now, or an absolute date, as ISO 8601 UTC. */
+export function initialCursor(initial: string | undefined, nowMs: number): string | undefined {
+  if (!initial) return undefined;
+  const m = /^-(\d+)([mhd])$/.exec(initial);
+  if (m) return new Date(nowMs - Number(m[1]) * { m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as "m" | "h" | "d"]).toISOString();
+  return toIso(initial);
+}
+
+function cursorOf(raw: unknown, field: string): string | undefined {
+  const v = resolvePath(raw, field);
+  if (v === undefined || v === null || v === "") return undefined;
+  try {
+    return toIso(v);
+  } catch {
+    return undefined;
+  }
+}
 
 export function buildBaseUrl(conn: ResolvedConnector, stream: StreamConfig): URL {
   const url = new URL(conn.connection.base_url.replace(/\/$/, "") + stream.request.path);
@@ -132,13 +157,32 @@ export async function runStream(opts: {
   const paginator = createPaginator(stream.pagination, stream.request.paging_in ?? "query");
 
   const cp = await store.loadCheckpoint(connectorId, stream.name);
-  const resumed = cp !== null && cp.configHash === conn.configHash;
-  let req: PageRequest | null = resumed
-    ? { url: new URL(cp.nextUrl), ...(cp.nextBody ? { body: cp.nextBody } : {}) }
-    : paginator.start({ url: buildBaseUrl(conn, stream), ...(stream.request.body ? { body: structuredClone(stream.request.body) } : {}) });
+  const resumed = Boolean(cp?.nextUrl) && cp!.configHash === conn.configHash;
+  const inc = stream.incremental;
+  const runStart = new Date();
+  let incrementalFrom: string | undefined;
+  let req: PageRequest | null;
+  if (resumed) {
+    req = { url: new URL(cp!.nextUrl!), ...(cp!.nextBody ? { body: cp!.nextBody } : {}) };
+  } else {
+    const base = buildBaseUrl(conn, stream);
+    // Incremental: only fetch what changed since the last fully completed run (or since `initial`).
+    if (inc) {
+      incrementalFrom = cp?.cursorValue ?? initialCursor(inc.initial, runStart.getTime());
+      if (incrementalFrom) {
+        const fill = (t: string) => t.replaceAll("{{cursor}}", incrementalFrom!).replaceAll("{{now}}", runStart.toISOString());
+        base.searchParams.set(inc.param, fill(inc.template));
+        for (const [k, v] of Object.entries(inc.extra_params ?? {})) base.searchParams.set(k, fill(v));
+      }
+    }
+    req = paginator.start({ url: base, ...(stream.request.body ? { body: structuredClone(stream.request.body) } : {}) });
+  }
+  let maxCursor: string | undefined;
+  let completed = false;
 
   const summary: RunSummary = {
     runId, stream: stream.name, status: "running", requests: 0, recordsOk: 0, recordsQuarantined: 0, retries: 0, rateLimitedMs: 0, resumed,
+    ...(incrementalFrom ? { incrementalFrom } : {}),
   };
   const stats: FieldStats = { records: 0, hits: {} };
   const ctx = { connector: connectorId, stream: stream.name, run: runId };
@@ -180,8 +224,19 @@ export async function runStream(opts: {
         const r = mapRecord(raw, stream.entity, stream.mapping);
         stats.records++;
         for (const f of r.present) stats.hits[f] = (stats.hits[f] ?? 0) + 1;
-        if (r.ok) records.push(r.record);
-        else quarantined.push({ raw, errors: r.errors });
+        if (inc) {
+          const c = cursorOf(raw, inc.cursor_field);
+          if (c && (!maxCursor || Date.parse(c) > Date.parse(maxCursor))) maxCursor = c;
+        }
+        if (r.ok) {
+          // Data minimisation: raw payloads are kept only if the config opts in, and always secret-redacted.
+          if (conn.data?.store_raw) {
+            const red = redactValue(raw);
+            const text = JSON.stringify(red) ?? "";
+            r.record.attributes._raw = text.length > RAW_LIMIT ? { truncated: true, preview: text.slice(0, RAW_LIMIT) } : red;
+          }
+          records.push(r.record);
+        } else quarantined.push({ raw, errors: r.errors });
       }
       const next = paginator.next({ req, headers: res.headers, body, records: raws.length });
       await store.commitPage({
@@ -199,6 +254,7 @@ export async function runStream(opts: {
       }
       req = next;
     }
+    completed = req === null && !stopReason;
     summary.status = summary.recordsQuarantined > 0 || stopReason ? "partial" : "success";
     if (stopReason) summary.lastError = stopReason;
     else if (summary.recordsQuarantined > 0) summary.lastError = `${summary.recordsQuarantined} record(s) quarantined`;
@@ -222,13 +278,27 @@ export async function runStream(opts: {
     }
   }
 
+  // Advance the watermark only after a run that saw every page: a partial run may have skipped newer records.
+  if (inc && completed && maxCursor && !FAILURE.includes(summary.status) && (!cp?.cursorValue || Date.parse(maxCursor) > Date.parse(cp.cursorValue))) {
+    await store.saveWatermark(connectorId, stream.name, maxCursor);
+    summary.watermark = maxCursor;
+  }
+
   await store.finishRun({
     runId, connectorId, status: summary.status, requests: summary.requests, retries: summary.retries,
     rateLimitedMs: summary.rateLimitedMs, fieldStats: stats, lastError: summary.lastError,
   });
   if (summary.status === "degraded" || summary.status === "auth_failed")
     await store.raiseAlert(connectorId, summary.status, `${stream.name}: ${summary.lastError}`);
-  if (FAILURE.includes(summary.status)) await maybeOpenBreaker(conn, store, summary);
+  if (FAILURE.includes(summary.status)) {
+    await maybeOpenBreaker(conn, store, summary);
+    // Fire once per failure streak, when it reaches alerts.on_consecutive_failures.
+    const n = conn.alerts?.on_consecutive_failures ?? 3;
+    const recent = await store.recentStatuses(connectorId, n + 1);
+    const streak = recent.findIndex((s) => !FAILURE.includes(s));
+    if ((streak === -1 ? recent.length : streak) === n)
+      await store.raiseAlert(connectorId, "consecutive_failures", `${n} consecutive failed runs; last: ${summary.lastError ?? summary.status}`);
+  }
 
   log.info(
     { ...ctx, status: summary.status, requests: summary.requests, ok: summary.recordsOk, quarantined: summary.recordsQuarantined, retries: summary.retries },

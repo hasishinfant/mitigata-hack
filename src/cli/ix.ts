@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ix CLI. Phase 6: validate, schema, add, update, run, runs, query, quarantine.
+// ix CLI. Phase 7: validate, schema, add, update, run, runs, query, quarantine.
 // `run` uses the in-process broker for now; Phase 5/6 route it through the API and broker process.
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
@@ -11,7 +11,10 @@ import { loadAppEnv } from "../envfiles.ts";
 import { runConnector } from "../engine/runner.ts";
 import { testConnection, type ConnectionTest } from "../engine/testConnection.ts";
 import { createPool, type Pool } from "../store/db.ts";
-import { ConnectorConfigError, loadActiveConnector } from "../store/connectors.ts";
+import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "../store/connectors.ts";
+import { panic } from "../security/panic.ts";
+import { getPosture, type Level } from "../security/posture.ts";
+import { startBoss } from "../scheduler/queue.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
 import { listQuarantine } from "../store/quarantine.ts";
 import { createPgRunStore, listRuns } from "../store/runs.ts";
@@ -304,6 +307,108 @@ audit
         const tag = d.startsWith("deny") ? red(d) : d.startsWith("error") ? yellow(d) : dim(d);
         console.log(`#${String(r.seq).padEnd(5)} ${String(r.ts).slice(0, 19)}  ${(r.connector_id ?? "-").padEnd(20)} ${r.action.padEnd(13)} ${(r.method ?? "").padEnd(5)} ${(r.host ?? "")}${r.path ?? ""} ${r.status ?? ""}  ${tag}`);
       }
+    }),
+  );
+
+
+const LEVEL_PAINT: Record<Level, (s: string) => string> = { high: red, medium: yellow, low: dim };
+
+program
+  .command("posture")
+  .description("blast-radius card: what this connector can reach and what its credential could do if stolen")
+  .argument("<id>")
+  .option("--json")
+  .action(
+    action(async (id: string, opts: { json?: boolean }) => {
+      const p = await getPosture(db(), id);
+      if (opts.json) return console.log(JSON.stringify(p, null, 2));
+      const badge = LEVEL_PAINT[p.risk](`${p.risk.toUpperCase()} RISK`);
+      console.log(`${p.connector_id}  (${p.source}, ${p.auth_type}, ${p.status})  ${badge}`);
+      console.log(dim("  reach"));
+      for (const st of p.streams) console.log(`    ${st.method} ${st.path}  -> ${st.entity}`);
+      console.log(`    hosts: ${p.reach.allowed_hosts.join(", ")}`);
+      console.log(`    paths: ${p.reach.allowed_paths.join(", ")}${p.reach.read_only_post.length ? `  read-only POST: ${p.reach.read_only_post.join(", ")}` : ""}`);
+      console.log(`    caps:  ${p.reach.max_requests_per_run} requests, ${p.reach.max_records_per_run} records per run`);
+      console.log(dim("  credential"));
+      for (const c of p.credentials)
+        console.log(`    ${c.ref}: ${c.stored ? `age ${c.age_days}d, idle ${c.idle_days}d` : red("not stored")}${p.limits.max_age_days ? dim(`  (max age ${p.limits.max_age_days}d, idle limit ${p.limits.idle_disable_days ?? "-"}d)`) : ""}`);
+      const sc = p.scopes;
+      console.log(`    expected scopes: ${sc.expected.join(" ") || "-"}`);
+      console.log(`    granted scopes:  ${sc.granted ? sc.granted.map((g) => (sc.forbidden.includes(g) || sc.writeLike.includes(g) ? red(g) : sc.extra.includes(g) ? yellow(g) : g)).join(" ") : dim("not reported by provider")}${sc.granted ? dim(` (${sc.source})`) : ""}`);
+      console.log(`    revocable by API: ${p.revocable_by_api}   provider IP restriction: ${p.provider_ip_restriction}`);
+      if (p.revoke_hint) console.log(`    revoke at: ${p.revoke_hint}`);
+      console.log(`  policy violations (7d): ${p.violations_7d}${p.last_violation ? dim(`  last: ${String(p.last_violation.ts).slice(0, 19)} ${p.last_violation.decision}`) : ""}`);
+      if (p.flags.length) {
+        console.log(dim("  flags"));
+        for (const f of p.flags) console.log(`    ${LEVEL_PAINT[f.level](f.level.padEnd(6))} ${f.message}`);
+      }
+    }),
+  );
+
+program
+  .command("disable")
+  .description("disable a connector and drop its cached token in the broker")
+  .argument("<id>")
+  .action(
+    action(async (id: string) => {
+      if (!(await setConnectorEnabled(db(), id, false, `disabled by ${process.env.USER ?? "operator"}`))) throw new Error(`connector ${id} not found`);
+      await broker().forget(id).catch(() => console.log(yellow("  broker not reachable: its cached token expires on its own or on broker restart")));
+      console.log(`${green("✔")} ${id} disabled`);
+    }),
+  );
+
+program
+  .command("enable")
+  .description("re-enable a connector (restarts its idle clock)")
+  .argument("<id>")
+  .action(
+    action(async (id: string) => {
+      if (!(await setConnectorEnabled(db(), id, true))) throw new Error(`connector ${id} not found`);
+      console.log(`${green("✔")} ${id} enabled`);
+    }),
+  );
+
+program
+  .command("panic")
+  .description("kill switch: disable every connector, cancel queued runs, revoke/wipe tokens, print a revocation checklist")
+  .option("--yes", "do not ask for confirmation")
+  .option("--purge-secrets", "also delete every stored secret from the broker")
+  .action(
+    action(async (opts: { yes?: boolean; purgeSecrets?: boolean }) => {
+      if (!opts.yes) {
+        if (!process.stdin.isTTY) throw new Error("refusing to panic without --yes in a non-interactive shell");
+        process.stderr.write(red("PANIC: disable ALL connectors and wipe tokens? type 'panic' to confirm: "));
+        const answer = await new Promise<string>((resolve) => process.stdin.once("data", (d) => resolve(String(d).trim())));
+        process.stdin.pause();
+        if (answer !== "panic") throw new Error("cancelled");
+      }
+      const boss = await startBoss(process.env.DATABASE_URL_APP!).catch(() => undefined);
+      const r = await panic(db(), { admin: broker(), boss, purgeSecrets: opts.purgeSecrets, actor: process.env.USER ?? "operator" });
+      await boss?.stop({ graceful: false });
+      console.log(red(`■ PANIC at ${r.at}`));
+      console.log(`  connectors disabled: ${r.disabled.length}${r.disabled.length ? dim(` (${r.disabled.join(", ")})`) : ""}`);
+      console.log(`  queued runs cancelled: ${r.queued_runs_cancelled}`);
+      if (r.broker.error) console.log(red(`  ${r.broker.error}`));
+      else console.log(`  broker: in-memory tokens wiped, ${r.broker.tokens_revoked} revoked at the provider, ${r.broker.secrets_purged} stored secrets purged`);
+      console.log(dim("\n  revocation checklist"));
+      for (const c of r.checklist) {
+        const mark = c.action === "revoked_by_api" ? green("✔ revoked ") : c.action === "nothing_to_revoke" ? dim("- none    ") : red("☐ TODO    ");
+        console.log(`  ${mark} ${c.connector_id.padEnd(22)} ${c.detail}`);
+      }
+      console.log(dim("\n  Re-enable one at a time after rotating its credential: ix secret set <ref> && ix enable <id>"));
+    }),
+  );
+
+program
+  .command("alerts")
+  .description("recent alerts and their delivery status")
+  .option("-n, --limit <n>", "rows", "20")
+  .action(
+    action(async (opts: { limit: string }) => {
+      const rows = (await db().query("select id, connector_id, kind, message, created_at, delivered, channel from alerts order by id desc limit $1", [Number(opts.limit)])).rows;
+      if (!rows.length) return console.log(dim("no alerts"));
+      for (const a of rows.reverse())
+        console.log(`#${String(a.id).padEnd(4)} ${String(a.created_at).slice(0, 19)}  ${(a.connector_id ?? "-").padEnd(20)} ${yellow(a.kind.padEnd(20))} ${a.message}${dim(`  [${a.delivered ? `sent:${a.channel}` : a.channel ?? "pending"}]`)}`);
     }),
   );
 

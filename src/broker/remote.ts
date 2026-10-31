@@ -18,6 +18,8 @@ export interface BrokerAdmin {
   verifyLedger(): Promise<LedgerCheck>;
   forget(connectorId?: string): Promise<void>;
   ping(): Promise<boolean>;
+  panic(opts: { purgeSecrets?: boolean; actor?: string }): Promise<{ revocations: { connectorId: string; revoked: boolean; detail: string }[]; purged: number }>;
+  notify(connectorId: string, text: string): Promise<{ delivered: boolean; channel: string; detail: string }>;
 }
 export type RemoteBroker = Broker & BrokerAdmin;
 
@@ -83,6 +85,8 @@ export function createRemoteBroker(socketPath = defaultSocketPath()): RemoteBrok
     deleteSecret: async (tenant, ref) => (await call<{ deleted: boolean }>("DELETE", `/v1/secrets/${encodeURIComponent(tenant)}/${encodeURIComponent(ref)}`)).deleted,
     testInline: (yaml) => call<ConnectionTest>("POST", "/v1/test-inline", { yaml }),
     verifyLedger: () => call<LedgerCheck>("GET", "/v1/ledger/verify"),
+    panic: (o) => call("POST", "/v1/panic", o),
+    notify: (connectorId, text) => call("POST", "/v1/notify", { connectorId, text }),
     forget: async (connectorId) => {
       await call("POST", "/v1/forget", { connectorId });
     },

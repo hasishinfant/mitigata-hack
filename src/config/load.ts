@@ -24,6 +24,7 @@ export type ResolvedConnector = ConnectorConfig & {
     allowedPaths: string[]; // GET paths (plus the OAuth token path, POST only)
     readOnlyPost: string[]; // declared read-only search endpoints
     tokenPath?: string; // OAuth token endpoint path: the only other POST target
+    revocationUrl?: string; // OAuth revocation endpoint (absolute), used only by panic
     methods: string[];
     maxRequestsPerRun: number;
     maxRecordsPerRun: number;
@@ -59,6 +60,9 @@ export function resolveConnector(cfg: ConnectorConfig, configHash: string): Reso
       allowedPaths: cfg.policy.allowed_paths ?? implicitPaths,
       readOnlyPost: cfg.policy.read_only_post ?? [],
       ...(tokenPath ? { tokenPath } : {}),
+      ...(cfg.connection.auth.type === "oauth2_client_credentials" && cfg.connection.auth.revocation_url
+        ? { revocationUrl: new URL(cfg.connection.auth.revocation_url, cfg.connection.base_url).href }
+        : {}),
       methods: cfg.policy.methods ?? ["GET"],
       maxRequestsPerRun: cfg.policy.max_requests_per_run ?? 1000,
       maxRecordsPerRun: cfg.policy.max_records_per_run ?? 50_000,

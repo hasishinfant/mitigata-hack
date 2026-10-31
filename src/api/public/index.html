@@ -17,7 +17,8 @@
     </nav>
     <div class="right">
       <span id="updated" class="muted"></span>
-      <input id="token" type="password" placeholder="admin token (for Run now)" autocomplete="off">
+      <input id="token" type="password" placeholder="admin token (Run now / Panic)" autocomplete="off">
+      <button id="panic" class="danger" title="Disable every connector, wipe tokens, show the revocation checklist">Panic</button>
     </div>
   </header>
 
@@ -43,6 +44,16 @@
       <div id="quarantine"></div>
     </section>
   </main>
+
+  <dialog id="panic-result">
+    <div class="dialog-head"><strong>Panic: revocation checklist</strong><button id="panic-close">Close</button></div>
+    <div id="panic-body"></div>
+  </dialog>
+
+  <dialog id="posture">
+    <div class="dialog-head"><strong id="posture-title"></strong><button id="posture-close">Close</button></div>
+    <div id="posture-body"></div>
+  </dialog>
 
   <dialog id="history">
     <div class="dialog-head"><strong id="history-title"></strong><button id="history-close">Close</button></div>

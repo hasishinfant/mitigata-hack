@@ -283,6 +283,16 @@ function semanticChecks(cfg: ConnectorConfig, add: Add): void {
       if (policy.allowed_paths && !pathAllowed(tokenUrl.pathname, policy.allowed_paths))
         add("error", [...ap, "token_url"], `token path ${tokenUrl.pathname} is not in policy.allowed_paths`);
     }
+    if (auth.revocation_url) {
+      let rev: URL | undefined;
+      try {
+        rev = new URL(auth.revocation_url, cfg.connection.base_url);
+      } catch {
+        add("error", [...ap, "revocation_url"], `not a valid URL: ${auth.revocation_url}`);
+      }
+      if (rev && !hostAllowed(rev.hostname, policy.allowed_hosts))
+        add("error", [...ap, "revocation_url"], `revocation host ${rev.hostname} is outside policy.allowed_hosts`);
+    }
     const forbid = cfg.credential?.forbid_scopes ?? [];
     (auth.scopes ?? []).forEach((s, i) => {
       const hit = forbid.find((f) => globToRe(f).test(s));

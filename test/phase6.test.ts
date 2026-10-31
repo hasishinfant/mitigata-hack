@@ -76,6 +76,7 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
   let env: Record<string, string | undefined>;
   const socketPath = join(tmpdir(), `ixb-${process.pid}.sock`);
   const masterKey = randomBytes(32);
+  let ledgerStart = 0; // the ledger is append-only and shared by all test files: only look at this test's rows
 
   beforeAll(async () => {
     mock = buildMock();
@@ -97,9 +98,11 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     await clearData(appPool);
     await remote.forget();
     mock.calls.length = 0;
+    ledgerStart = Number((await appPool.query("select coalesce(max(seq), 0) as s from audit_ledger")).rows[0].s);
   });
 
-  const ledger = async () => (await appPool.query("select action, connector_id, method, host, path, status, decision from audit_ledger order by seq")).rows;
+  const ledger = async () =>
+    (await appPool.query("select action, connector_id, method, host, path, status, decision from audit_ledger where seq > $1 order by seq", [ledgerStart])).rows;
   const port = () => env.MOCK_PORT;
 
   it("socket is private to this OS user (0600)", () => {

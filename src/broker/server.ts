@@ -15,6 +15,8 @@ import { testConnection } from "../engine/testConnection.ts";
 import { log } from "../log.ts";
 import { ConnectorConfigError, loadSignedConnector, registerConnector } from "../store/connectors.ts";
 import { createLocalBroker, type LocalBroker } from "./client.ts";
+import { httpCall } from "./http.ts";
+import { hostAllowed } from "./policy.ts";
 import { configSigKey, signConfig, verifyConfigSig } from "./configSig.ts";
 import { appendLedger, verifyLedger } from "./ledger.ts";
 import type { Clock } from "./retry.ts";
@@ -33,7 +35,25 @@ export type BrokerServerOptions = {
   envSecrets?: boolean;
   clock?: Clock;
   random?: () => number;
+  /** Hosts alert webhooks may point at (IX_ALERT_WEBHOOK_HOSTS, default hooks.slack.com). */
+  alertHosts?: string[];
 };
+
+/** The credential ref that identifies a connector's credential (where learned scopes are recorded). */
+export function primaryRef(conn: ResolvedConnector): string | undefined {
+  const a = conn.connection.auth;
+  switch (a.type) {
+    case "api_key":
+    case "bearer":
+      return a.secret_ref;
+    case "basic":
+      return a.password_ref;
+    case "oauth2_client_credentials":
+      return a.client_id_ref;
+    default:
+      return undefined;
+  }
+}
 
 export function createBrokerServer(opts: BrokerServerOptions) {
   const env = opts.env ?? process.env;
@@ -57,7 +77,20 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     }
   }
 
-  const broker: LocalBroker = createLocalBroker({ getConnector, secrets, audit, clock: opts.clock, random: opts.random });
+  // Record what the provider says the credential can do, so posture cards can flag over-privileged tokens.
+  const onScopes = async (conn: ResolvedConnector, scopes: string[]) => {
+    const ref = primaryRef(conn);
+    if (!ref) return;
+    const a = conn.connection.auth;
+    const revocable = conn.credential?.revocable_by_api ?? (a.type === "oauth2_client_credentials" && Boolean(a.revocation_url));
+    await opts.pool.query(
+      "update credentials set granted_scopes = $3, scopes_seen_at = now(), revocable_by_api = $4 where tenant_id = $1 and ref = $2",
+      [conn.metadata.tenant, ref, scopes, revocable],
+    );
+  };
+  const alertHosts = opts.alertHosts ?? (env.IX_ALERT_WEBHOOK_HOSTS ?? "hooks.slack.com").split(",").map((h) => h.trim()).filter(Boolean);
+
+  const broker: LocalBroker = createLocalBroker({ getConnector, secrets, audit, onScopes, clock: opts.clock, random: opts.random });
   const forget = (id?: string) => {
     broker.forget(id);
     store.forget();
@@ -134,6 +167,50 @@ export function createBrokerServer(opts: BrokerServerOptions) {
   });
 
   app.get("/v1/ledger/verify", async () => verifyLedger(opts.pool));
+
+  // Panic: revoke every cached OAuth token that has a revocation endpoint, wipe all in-memory tokens and
+  // config caches, and optionally delete every stored secret. Connectors are disabled by the caller (app DB);
+  // the broker then refuses their calls on the next request.
+  app.post("/v1/panic", async (req) => {
+    const { purgeSecrets, actor } = (req.body ?? {}) as { purgeSecrets?: boolean; actor?: string };
+    const revocations = await broker.revokeAll();
+    forget();
+    let purged = 0;
+    if (purgeSecrets) purged = (await opts.pool.query("delete from credentials")).rowCount ?? 0;
+    await audit({ actor: actor ?? "panic", action: "panic", decision: `allow: ${revocations.filter((r) => r.revoked).length} revoked, ${purged} secrets purged` });
+    return { revocations, purged };
+  });
+
+  // Alert delivery. The webhook URL is a secret (it embeds a token), so only the broker sends it, only to an
+  // allowed host, and the ledger records the host but never the path.
+  app.post("/v1/notify", async (req) => {
+    const { connectorId, text } = req.body as { connectorId: string; text: string };
+    if (typeof text !== "string" || !text) throw Object.assign(new Error("text is required"), { statusCode: 400 });
+    let conn: ResolvedConnector | undefined;
+    try {
+      conn = await loadSignedConnector(opts.pool, connectorId, (cid, v, h, sig) => verifyConfigSig(sigKey, cid, v, h, sig), env);
+    } catch (e) {
+      throw new BrokerError("policy_denied", (e as Error).message);
+    }
+    const ref = conn.alerts?.slack_webhook_ref;
+    if (!ref) return { delivered: false, channel: "none", detail: "connector has no alerts.slack_webhook_ref" };
+    const hook = await secrets.get(conn.metadata.tenant, ref);
+    if (!hook) throw new BrokerError("secret_missing", `secret "${ref}" is not set (ix secret set ${ref})`);
+    let url: URL;
+    try {
+      url = new URL(hook);
+    } catch {
+      throw new BrokerError("policy_denied", `secret "${ref}" is not a URL`);
+    }
+    const local = ["localhost", "127.0.0.1"].includes(url.hostname);
+    if ((url.protocol !== "https:" && !(url.protocol === "http:" && local)) || !hostAllowed(url.hostname, alertHosts)) {
+      await audit({ connectorId, action: "alert", method: "POST", host: url.host, path: "[webhook]", decision: `deny: webhook host ${url.hostname} not in IX_ALERT_WEBHOOK_HOSTS` });
+      throw new BrokerError("policy_denied", `webhook host ${url.hostname} is not an allowed alert host`);
+    }
+    const res = await httpCall("POST", url, { "content-type": "application/json", "user-agent": "IntegrateX/0.1" }, { timeoutMs: 10_000, maxBytes: 64 * 1024, body: JSON.stringify({ text: text.slice(0, 3000) }) });
+    await audit({ connectorId, action: "alert", method: "POST", host: url.host, path: "[webhook]", status: res.status, decision: res.status < 300 ? "allow" : `error: HTTP ${res.status}` });
+    return { delivered: res.status >= 200 && res.status < 300, channel: "slack", detail: `HTTP ${res.status}` };
+  });
 
   return { app, broker, forget };
 }

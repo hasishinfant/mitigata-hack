@@ -1,6 +1,7 @@
 // Health per connection (FR-10): status, last run, records pulled, last error, plus schedule,
 // quarantine, credential age and a recent-runs strip for the dashboard.
 import type pg from "pg";
+import { getPosture } from "../security/posture.ts";
 import { loadActiveConnector } from "./connectors.ts";
 
 export type Health = "healthy" | "warning" | "degraded" | "failing" | "stale" | "running" | "paused" | "disabled" | "never_run" | "config_error";
@@ -79,6 +80,15 @@ export async function getHealth(pool: pg.Pool, env: Record<string, string | unde
       await pool.query("select status, started_at from runs where connector_id = $1 order by started_at desc limit 12", [c.id])
     ).rows.map((r) => r.status as string);
     const last = latest.slice().sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at))[0];
+    let posture: { risk: string; flags: { level: string; message: string }[] } | null = null;
+    if (cfg) {
+      try {
+        const p = await getPosture(pool, c.id, env);
+        posture = { risk: p.risk, flags: p.flags.slice(0, 5) };
+      } catch {
+        posture = null;
+      }
+    }
     const health = deriveHealth({
       status: c.status, configOk: !configError, latest, lastSuccessAt: c.last_success_at, everyMs: cfg?.runtime.schedule?.everyMs, now,
     });
@@ -108,6 +118,7 @@ export async function getHealth(pool: pg.Pool, env: Record<string, string | unde
       quarantine_total: quarantine.get(c.id) ?? 0,
       recent_runs: recent,
       config_version: c.active_version,
+      posture,
     });
   }
   const summary: Record<string, number> = { total: items.length };
