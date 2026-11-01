@@ -100,6 +100,7 @@ export function createRemoteBroker(
 
   return {
     request: (r: BrokerRequest) => call<BrokerResponse>("POST", "/v1/request", r),
+    anchorReceipt: (id: number) => call<{ seq: number }>("POST", `/v1/receipts/${id}/anchor`, {}),
     credentialInfo: (id) => call<CredentialInfo>("GET", `/v1/credential-info/${encodeURIComponent(id)}`),
     register: (yaml, mode, createdBy, o) => admin<RegisterResult>("POST", "/v1/connectors", { yaml, mode, createdBy, confirmHosts: o?.confirmHosts === true }),
     putSecret: (tenant, ref, value) => admin("PUT", `/v1/secrets/${encodeURIComponent(tenant)}/${encodeURIComponent(ref)}`, { value }),

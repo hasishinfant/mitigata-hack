@@ -89,7 +89,9 @@ describe.skipIf(!hasDb)("reliability", () => {
     expect(s1).toMatchObject({ requests: 2, recordsOk: 2000, retries: 3 });
     const cp = (await pool.query("select page_state from checkpoints")).rows[0].page_state;
     expect(new URL(cp.next_url).searchParams.get("startIndex")).toBe("2000");
-    expect(await count("select count(*) from events")).toBe(2000);
+    // Staged, not published: a failed sync exposes no partial data.
+    expect(await count("select count(*) from events")).toBe(0);
+    expect(await count("select count(*) from stage_records")).toBe(2000);
 
     mock.setFault(null);
     mock.calls.length = 0;
@@ -98,6 +100,11 @@ describe.skipIf(!hasDb)("reliability", () => {
     expect(startIndexes()).toEqual(["2000", "4000"]);
     expect(await count("select count(*) from events")).toBe(4500);
     expect(await count("select count(*) from checkpoints where page_state is not null")).toBe(0);
+    expect(await count("select count(*) from stage_records")).toBe(0); // promoted, staging cleared
+    // Two receipts for one sync: incomplete (first run), then verified and published (the resumed run).
+    const receipts = (await pool.query("select sync_id, decision, published from sync_receipts order by id")).rows;
+    expect(receipts.map((r) => [r.decision, r.published])).toEqual([["incomplete", false], ["verified", true]]);
+    expect(receipts[0].sync_id).toBe(receipts[1].sync_id);
   });
 
   // ---------- 200 OK with the wrong shape (maintenance page) ----------

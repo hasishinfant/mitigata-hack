@@ -41,6 +41,8 @@ export interface Broker {
   request(req: BrokerRequest): Promise<BrokerResponse>;
   /** What the broker learned about the credential (never the credential itself). */
   credentialInfo(connectorId: string): Promise<CredentialInfo>;
+  /** Anchor a stored Sync Integrity Receipt's digest in the audit ledger (broker process only). */
+  anchorReceipt?(receiptId: number): Promise<{ seq: number }>;
 }
 
 /** Where the broker gets secret values. */

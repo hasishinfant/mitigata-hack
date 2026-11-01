@@ -91,13 +91,17 @@ describe.skipIf(!hasDb)("run finalisation and lock loss", () => {
 
     expect(await one("select status from runs where connector_id = $1", [ID])).toEqual({ status: "running" }); // not success
     expect((await one("select cursor_value from checkpoints where connector_id = $1", [ID]))?.cursor_value ?? null).toBeNull(); // not advanced
-    expect(Number((await one("select count(*) from events where connector_id = $1", [ID])).count)).toBe(2); // pages committed before
+    // The page was staged before; nothing was published because the sync's final transaction never committed.
+    expect(Number((await one("select count(*) from events where connector_id = $1", [ID])).count)).toBe(0);
+    expect(Number((await one("select count(*) from stage_records r join stage_syncs s using (sync_id) where s.connector_id = $1", [ID])).count)).toBe(2);
 
     // The next run asks for the same window again and then advances, in one transaction with its success.
     const [r] = await runConnector({ connector: conn, broker: p.b, store: createPgRunStore(poolA) });
     expect(p.calls.map((u) => u.searchParams.get("since"))).toEqual(["2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z"]);
     expect(r).toMatchObject({ status: "success", watermark: "2026-02-03T00:00:00.000Z" });
     expect((await one("select cursor_value from checkpoints where connector_id = $1", [ID])).cursor_value).toBe("2026-02-03T00:00:00.000Z");
+    expect(Number((await one("select count(*) from events where connector_id = $1", [ID])).count)).toBe(2); // published now
+    expect(Number((await one("select count(*) from stage_syncs where connector_id = $1", [ID])).count)).toBe(0); // stale staging gone
   });
 
   it("lock lost mid-run: the original run commits nothing more and saves no watermark; the new holder runs normally", async () => {

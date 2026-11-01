@@ -19,6 +19,7 @@ import { startBoss } from "../scheduler/queue.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
 import { listQuarantine } from "../store/quarantine.ts";
 import { createPgRunStore, listRuns } from "../store/runs.ts";
+import { listHeld, listReceipts, resolveHeldSync, verifyReceipt } from "../store/staging.ts";
 
 // The CLI holds no provider secrets: it loads .env plus the broker admin token (.env.admin)
 // and talks to the broker process over its sockets.
@@ -32,6 +33,9 @@ const green = (s: string) => c(32, s);
 const dim = (s: string) => c(2, s);
 const STATUS_COLOR: Record<string, (s: string) => string> = { success: green, partial: yellow, degraded: yellow, running: dim };
 const paint = (status: string) => (STATUS_COLOR[status] ?? red)(status);
+const DECISION_COLOR: Record<string, (s: string) => string> = {
+  verified: green, verified_empty: green, approved: green, held: yellow, incomplete: dim, rejected: red, discarded: dim,
+};
 
 function printIssue(i: Issue, lines: string[]): void {
   const tag = i.severity === "error" ? red("error  ") : yellow("warning");
@@ -180,10 +184,91 @@ program
             (r.resumed ? yellow(" (resumed from checkpoint)") : "") +
             (r.lastError ? dim(`  ${r.lastError}`) : ""),
         );
+        if (r.decision)
+          console.log(
+            `${"".padEnd(13)}${DECISION_COLOR[r.decision]?.(r.decision) ?? r.decision}` +
+              (r.published !== undefined ? ` · published ${r.published}` : "") +
+              (r.receiptId ? dim(` · receipt #${r.receiptId} sha256:${r.receiptDigest?.slice(0, 12)}…`) : "") +
+              (r.decision === "held" ? yellow(`  → review: ix held · ix approve ${r.syncId} · ix discard ${r.syncId}`) : ""),
+          );
       }
       if (results.some((r) => !["success", "partial", "paused"].includes(r.status))) process.exitCode = 1;
     }),
   );
+
+program
+  .command("receipts")
+  .description("Sync Integrity Receipts for a connector: decision, what was published, digest and ledger anchor")
+  .argument("<id>")
+  .option("-n, --limit <n>", "rows", "20")
+  .action(
+    action(async (id: string, opts: { limit: string }) => {
+      const rows = await listReceipts(db(), id, Number(opts.limit));
+      if (!rows.length) return console.log(dim("no receipts yet"));
+      for (const r of rows.reverse()) {
+        const c = r.sync_counts ?? {};
+        console.log(
+          `#${String(r.id).padEnd(5)} ${String(r.created_at).slice(0, 19)}  ${String(r.stream).padEnd(10)} ${(DECISION_COLOR[r.decision] ?? ((x: string) => x))(String(r.decision).padEnd(14))}` +
+            ` published=${r.records_published ?? 0}` + (c.seen !== undefined ? ` seen=${c.seen} quarantined=${c.quarantined}` : "") +
+            dim(`  sha256:${String(r.digest).slice(0, 12)}… ${r.anchored_seq ? `anchored #${r.anchored_seq}` : "NOT anchored"}`),
+        );
+      }
+    }),
+  );
+
+program
+  .command("receipt")
+  .description("show one receipt and verify it: digest recomputed from the body, and compared with its ledger anchor")
+  .argument("<receiptId>")
+  .option("--json", "print the full receipt body")
+  .action(
+    action(async (rid: string, opts: { json?: boolean }) => {
+      const id = Number(rid);
+      const r = (await db().query("select * from sync_receipts where id = $1", [id])).rows[0];
+      if (!r) throw new Error(`receipt ${rid} not found`);
+      const v = (await verifyReceipt(db(), id))!;
+      if (opts.json) return console.log(JSON.stringify(r.body, null, 2));
+      const b = r.body;
+      console.log(`receipt #${r.id}  ${r.connector_id}/${r.stream}  ${(DECISION_COLOR[r.decision] ?? ((x: string) => x))(r.decision)}  published=${r.published}`);
+      console.log(dim(`  sync ${r.sync_id}  run ${r.run_id ?? "-"}  config v${b.connector?.config_version ?? "?"} ${String(b.connector?.config_hash ?? "").slice(0, 12)}…`));
+      if (b.counts?.sync) console.log(`  sync totals: ${b.counts.sync.pages} pages, ${b.counts.sync.seen} seen, ${b.counts.sync.accepted} accepted, ${b.counts.sync.quarantined} quarantined`);
+      if (b.pagination) console.log(`  pagination: ${b.pagination.termination}`);
+      if (b.schema) console.log(`  schema: ${String(b.schema.fingerprint).slice(0, 12)}… (${b.schema.paths} paths)${b.schema.breaking?.length ? yellow(`  breaking: ${b.schema.breaking.join("; ")}`) : ""}`);
+      if (b.freshness?.newest_record_at) console.log(`  newest record: ${b.freshness.newest_record_at}`);
+      for (const x of b.reasons ?? []) console.log(`  reason: ${x}`);
+      for (const x of b.inferences ?? []) console.log(dim(`  inferred: ${x}`));
+      console.log(
+        `  verify: digest ${v.digestMatches ? green("matches body") : red("DOES NOT match body")}` +
+          `, ledger anchor ${v.anchored ? (v.anchorMatches ? green(`matches (ledger #${r.anchored_seq})`) : red("DOES NOT match")) : yellow("missing")}`,
+      );
+      console.log(dim(`  not claimed: ${(b.not_claimed ?? []).join("; ")}`));
+      if (!v.digestMatches || (v.anchored && !v.anchorMatches)) process.exitCode = 1;
+    }),
+  );
+
+program
+  .command("held")
+  .description("syncs held for review (schema change, too much quarantine, too few records): nothing was published")
+  .action(
+    action(async () => {
+      const rows = await listHeld(db());
+      if (!rows.length) return console.log(dim("nothing held"));
+      for (const r of rows) console.log(`${r.sync_id}  ${r.connector_id}/${r.stream}  ${r.records} records staged  ${String(r.created_at).slice(0, 19)}\n  ${yellow(r.held_reason ?? "")}`);
+    }),
+  );
+
+for (const [name, action_] of [["approve", "publish a held sync's staged records"], ["discard", "drop a held sync's staged records"]] as const)
+  program
+    .command(name)
+    .description(`${action_} (leaves its own receipt, anchored in the ledger)`)
+    .argument("<syncId>")
+    .action(
+      action(async (syncId: string) => {
+        const r = await resolveHeldSync(db(), syncId, name, process.env.USER ?? "cli");
+        const anchored = await broker().anchorReceipt!(r.receiptId).then(() => true, () => false);
+        console.log(`${green("✔")} ${name === "approve" ? `published ${r.records}` : `discarded ${r.records}`} records of ${r.connectorId}; receipt #${r.receiptId}${anchored ? "" : yellow(" (not anchored: broker unreachable)")}`);
+      }),
+    );
 
 program
   .command("runs")

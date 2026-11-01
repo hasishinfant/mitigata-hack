@@ -58,6 +58,10 @@ curl "localhost:4010/__fault?mode=clear"; ix run mock-nvd-cves
 curl "localhost:4010/__fault?mode=envelope&count=1&after=1"; ix run mock-nvd-cves
 #   -> 200 OK but the wrong shape: failed, "records_path vulnerabilities[*] not found", never "0 records, success"
 ix quarantine                        # bad records with reasons; run was "partial", not crashed
+ix receipts mock-nvd-cves            # one receipt per run: incomplete (interrupted) -> verified (published once complete)
+ix receipt <id>                      # facts vs inferences, schema fingerprint, digest + ledger anchor verified
+curl "localhost:4010/__drift?rename_email=1"; ix run mock-okta-users   # schema change -> HELD, nothing published
+ix held; ix approve <sync-id>        # a human publishes it (or ix discard); the approval gets its own receipt
 ```
 Bad key: `ix secret set github_org_pat` (type junk) → `ix run github-members` → `auth_failed`, one attempt, alert raised. Then store the real token again.
 

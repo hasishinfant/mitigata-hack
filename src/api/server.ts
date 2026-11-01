@@ -19,6 +19,7 @@ import { getHealth } from "../store/health.ts";
 import { listQuarantine } from "../store/quarantine.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
 import { listRuns } from "../store/runs.ts";
+import { listHeld, listReceipts, resolveHeldSync, SyncNotHeld, verifyReceipt } from "../store/staging.ts";
 
 const PUBLIC = join(import.meta.dirname, "public");
 const STATIC: Record<string, { file: string; type: string }> = {
@@ -112,6 +113,20 @@ export function buildApi(opts: ApiOptions) {
     return { alerts: (await opts.pool.query("select id, connector_id, kind, message, created_at, delivered, channel from alerts order by id desc limit $1", [limit])).rows };
   });
 
+  // ---- integrity receipts and held syncs (T7/T8) ----
+  app.get("/v1/connectors/:id/receipts", async (req) => {
+    const limit = Math.min(Number((req.query as { limit?: string }).limit) || 20, 200);
+    return { receipts: await listReceipts(opts.pool, (req.params as { id: string }).id, limit) };
+  });
+  app.get("/v1/receipts/:id", async (req, reply) => {
+    const id = Number((req.params as { id: string }).id);
+    if (!Number.isSafeInteger(id)) return reply.code(400).send({ error: "bad receipt id" });
+    const r = (await opts.pool.query("select * from sync_receipts where id = $1", [id])).rows[0];
+    if (!r) return reply.code(404).send({ error: `receipt ${id} not found` });
+    return { receipt: r, verification: await verifyReceipt(opts.pool, id) };
+  });
+  app.get("/v1/held", async (req) => ({ held: await listHeld(opts.pool, (req.query as { connector?: string }).connector) }));
+
   app.post("/v1/configs/validate", async (req) => {
     const res = validateConfigText(yamlBody(req), { env });
     return { ok: res.ok, errors: res.errors, warnings: res.warnings, config_hash: res.configHash };
@@ -172,6 +187,21 @@ export function buildApi(opts: ApiOptions) {
     const { id } = req.params as { id: string };
     return needAdmin().enableConnector(id); // broker-only: the app role cannot re-enable
   });
+
+  // Operator decision on a held sync: publish its staged records, or discard them. Leaves its own receipt.
+  for (const action of ["approve", "discard"] as const)
+    app.post(`/v1/syncs/:syncId/${action}`, { preHandler: requireAdmin }, async (req, reply) => {
+      const { syncId } = req.params as { syncId: string };
+      if (!/^[0-9a-f-]{36}$/.test(syncId)) return reply.code(400).send({ error: "bad sync id" });
+      try {
+        const r = await resolveHeldSync(opts.pool, syncId, action, "api");
+        await opts.broker?.anchorReceipt?.(r.receiptId).catch(() => {});
+        return { sync_id: syncId, action, ...r };
+      } catch (e) {
+        if (e instanceof SyncNotHeld) return reply.code(404).send({ error: e.message });
+        return reply.code(409).send({ error: (e as Error).message });
+      }
+    });
 
   app.post("/v1/panic", { preHandler: requireAdmin }, async (req) => {
     const body = (req.body ?? {}) as { purge_secrets?: boolean };

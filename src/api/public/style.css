@@ -56,6 +56,10 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 .flag-high { color: #fca5a5; } .flag-medium { color: #fcd34d; } .flag-low { color: var(--muted); }
 .kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 12px; font-size: 13px; margin-bottom: 12px; }
 .kv div:nth-child(odd) { color: var(--muted); }
+.d-verified, .d-verified_empty, .d-approved { color: var(--green); } .d-held { color: var(--amber); font-weight: 600; }
+.d-incomplete, .d-discarded { color: var(--muted); } .d-rejected { color: var(--red); }
+.badge[class*="d-"] { border-color: currentColor; }
+.held-box { border: 1px solid var(--amber); border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; font-size: 13px; }
 .scope-bad { color: var(--red); font-weight: 600; } .scope-extra { color: var(--amber); }
 
 .sep { display: inline-block; width: 0; height: 26px; border-left: 2px solid var(--muted); margin: 0 12px; align-self: center; font-size: 0; user-select: none; }

@@ -4,7 +4,7 @@ import type pgTypes from "pg";
 import { LOCK_LOST, RunFailure, type Checkpoint, type FieldStats, type FinishedRun, type PageCommit, type RunStatus, type RunStore } from "../engine/runner.ts";
 import { withTx } from "./db.ts";
 import { insertQuarantine } from "./quarantine.ts";
-import { upsertRecords } from "./upsert.ts";
+import { baselineSchema, discardSync, holdSync, insertReceipt, promoteSync, stagePage } from "./staging.ts";
 import { raiseAlertOnce } from "../security/alerts.ts";
 import { acquireRunLock, LockLost, type RunLock } from "./runLock.ts";
 
@@ -42,9 +42,8 @@ export function createPgRunStore(pool: pg.Pool, opts: PgRunStoreOptions = {}): R
 
     async commitPage(p: PageCommit) {
       await write(p.connectorId, async (c) => {
-        await upsertRecords(c, p.entity, p.records, {
-          tenant: p.tenant, source: p.source, connectorId: p.connectorId, runId: p.runId, fetchedAt: p.fetchedAt,
-        });
+        // Staged, not published: nothing reaches users / devices / events until the sync is verified (finishRun).
+        await stagePage(c, { syncId: p.syncId, freshSync: p.freshSync, connectorId: p.connectorId, stream: p.stream, entity: p.entity, runId: p.runId, fetchedAt: p.fetchedAt, records: p.records });
         await insertQuarantine(c, p.runId, p.connectorId, p.quarantined);
         await c.query(
           `update runs set requests = requests + $2, records_ok = records_ok + $3, records_quarantined = records_quarantined + $4
@@ -56,7 +55,10 @@ export function createPgRunStore(pool: pg.Pool, opts: PgRunStoreOptions = {}): R
           await c.query(
             `insert into checkpoints (connector_id, stream, page_state, updated_at) values ($1, $2, $3, now())
              on conflict (connector_id, stream) do update set page_state = excluded.page_state, updated_at = now()`,
-            [p.connectorId, p.stream, JSON.stringify({ next_url: p.checkpoint.nextUrl, next_body: p.checkpoint.nextBody, config_hash: p.checkpoint.configHash })],
+            [p.connectorId, p.stream, JSON.stringify({
+              next_url: p.checkpoint.nextUrl, next_body: p.checkpoint.nextBody, config_hash: p.checkpoint.configHash,
+              sync_id: p.checkpoint.syncId, sync_totals: p.checkpoint.syncTotals,
+            })],
           );
         // Stream complete: clear the page position but keep the row (it holds the incremental watermark).
         else await c.query("update checkpoints set page_state = null, updated_at = now() where connector_id = $1 and stream = $2", [p.connectorId, p.stream]);
@@ -64,12 +66,28 @@ export function createPgRunStore(pool: pg.Pool, opts: PgRunStoreOptions = {}): R
       });
     },
 
-    // Status and watermark in one transaction, on the lock session. If it fails (or the lock session dies before
-    // COMMIT), neither is saved. If the lock was lost, only the run's own history row is marked failed, through the
-    // data pool: no records, checkpoints, watermark or connector state, so it cannot interfere with a replacement run.
+    // Status, watermark, publication of the staged sync and its receipt: one transaction, on the lock session.
+    // If it fails (or the lock session dies before COMMIT), none of it is saved. If the lock was lost, only the run's
+    // own history row (and an "incomplete" receipt) is written, through the data pool: no records, staging,
+    // checkpoints, watermark or connector state, so it cannot interfere with a replacement run.
     async finishRun(r): Promise<FinishedRun> {
       try {
         return await write(r.connectorId, async (c) => {
+          let published: number | undefined;
+          let receipt: { id: number; digest: string } | undefined;
+          const pub = r.publication;
+          if (pub) {
+            if (pub.publish) published = await promoteSync(c, pub.syncId);
+            else if (pub.discard) await discardSync(c, pub.syncId);
+            else if (pub.hold) {
+              await holdSync(c, pub.syncId, pub.reasons.join("; "));
+              await c.query("update checkpoints set page_state = null, updated_at = now() where connector_id = $1 and stream = $2", [r.connectorId, r.stream]);
+            }
+            receipt = await insertReceipt(c, {
+              syncId: pub.syncId, runId: r.runId, connectorId: r.connectorId, stream: r.stream, kind: "run", decision: pub.decision,
+              published: pub.publish, body: { ...pub.receipt, records_published: published ?? 0 },
+            });
+          }
           if (r.watermark)
             // Only cursor_value: the page position (page_state) is left as the last page commit wrote it.
             await c.query(
@@ -86,7 +104,10 @@ export function createPgRunStore(pool: pg.Pool, opts: PgRunStoreOptions = {}): R
           if (["success", "partial", "degraded"].includes(r.status))
             await c.query("update connectors set last_success_at = now() where id = $1", [r.connectorId]);
           await opts.beforeCommit?.("finish", r.connectorId);
-          return { status: r.status, ...(r.lastError !== undefined ? { lastError: r.lastError } : {}), watermarkSaved: Boolean(r.watermark) };
+          return {
+            status: r.status, ...(r.lastError !== undefined ? { lastError: r.lastError } : {}), watermarkSaved: Boolean(r.watermark),
+            ...(published !== undefined ? { published } : {}), ...(receipt ? { receiptId: receipt.id, digest: receipt.digest } : {}),
+          };
         });
       } catch (e) {
         if (!(e instanceof RunFailure && e.message === LOST)) throw e;
@@ -94,23 +115,47 @@ export function createPgRunStore(pool: pg.Pool, opts: PgRunStoreOptions = {}): R
         await pool.query("update runs set status = 'failed', finished_at = now(), last_error = $2, requests = $3, retries = $4, rate_limited_ms = $5 where id = $1", [
           r.runId, lastError, r.requests, r.retries, r.rateLimitedMs,
         ]);
-        return { status: "failed", lastError, watermarkSaved: false };
+        // Evidence of what happened: an "incomplete" receipt for this run (insert-only; touches nothing else).
+        let receipt: { id: number; digest: string } | undefined;
+        if (r.publication) {
+          const c = await pool.connect();
+          try {
+            receipt = await insertReceipt(c, {
+              syncId: r.publication.syncId, runId: r.runId, connectorId: r.connectorId, stream: r.stream, kind: "run", decision: "incomplete", published: false,
+              body: { ...r.publication.receipt, decision: "incomplete", reasons: [lastError], records_published: 0 },
+            });
+          } finally {
+            c.release();
+          }
+        }
+        return { status: "failed", lastError, watermarkSaved: false, ...(receipt ? { receiptId: receipt.id, digest: receipt.digest } : {}) };
       }
     },
 
+    // A position is only resumable while its staged sync still exists: resuming without the earlier pages would
+    // publish an incomplete sync. Otherwise (or for pre-staging checkpoints) the run starts the stream over.
     async loadCheckpoint(connectorId, stream): Promise<Checkpoint | null> {
-      const r = await pool.query("select page_state, cursor_value from checkpoints where connector_id = $1 and stream = $2", [connectorId, stream]);
+      const r = await pool.query(
+        `select c.page_state, c.cursor_value, s.sync_id is not null as staged from checkpoints c
+         left join stage_syncs s on s.sync_id::text = c.page_state->>'sync_id' and s.state = 'open'
+         where c.connector_id = $1 and c.stream = $2`,
+        [connectorId, stream],
+      );
       if (!r.rowCount) return null;
-      const ps = r.rows[0].page_state as { next_url?: string; next_body?: Record<string, unknown>; config_hash?: string } | null;
+      type PageState = { next_url?: string; next_body?: Record<string, unknown>; config_hash?: string; sync_id?: string; sync_totals?: Checkpoint["syncTotals"] };
+      const ps = r.rows[0].page_state as PageState | null;
+      const resumable = Boolean(ps?.next_url && ps.sync_id && r.rows[0].staged);
       const cursorValue = (r.rows[0].cursor_value as string | null) ?? undefined;
-      if (!ps?.next_url && !cursorValue) return null;
+      if (!resumable && !cursorValue) return null;
       return {
-        ...(ps?.next_url ? { nextUrl: ps.next_url } : {}),
-        ...(ps?.next_body ? { nextBody: ps.next_body } : {}),
+        ...(resumable ? { nextUrl: ps!.next_url!, syncId: ps!.sync_id!, ...(ps!.sync_totals ? { syncTotals: ps!.sync_totals } : {}) } : {}),
+        ...(resumable && ps?.next_body ? { nextBody: ps.next_body } : {}),
         configHash: ps?.config_hash ?? "",
         ...(cursorValue ? { cursorValue } : {}),
       };
     },
+
+    baselineSchema: (connectorId, stream) => baselineSchema(pool, connectorId, stream),
 
     async previousFieldStats(connectorId, stream, excludeRunId): Promise<FieldStats | null> {
       const r = await pool.query(

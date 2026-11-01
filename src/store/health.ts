@@ -3,6 +3,7 @@
 import type pg from "pg";
 import { getPosture } from "../security/posture.ts";
 import { loadActiveConnector } from "./connectors.ts";
+import { integritySummary } from "./staging.ts";
 
 export type Health = "healthy" | "warning" | "degraded" | "failing" | "stale" | "running" | "paused" | "disabled" | "never_run" | "config_error";
 
@@ -59,6 +60,7 @@ export async function getHealth(pool: pg.Pool, env: Record<string, string | unde
     (await pool.query("select connector_id, count(*)::int as n from quarantine group by 1")).rows.map((r) => [r.connector_id, r.n]),
   );
 
+  const integrity = await integritySummary(pool);
   const items = [];
   for (const c of connectors) {
     let cfg: Awaited<ReturnType<typeof loadActiveConnector>> | undefined;
@@ -119,6 +121,8 @@ export async function getHealth(pool: pg.Pool, env: Record<string, string | unde
       recent_runs: recent,
       config_version: c.active_version,
       posture,
+      // Latest Sync Integrity Receipt decision per stream, and syncs held for review (T7/T8).
+      integrity: integrity.get(c.id) ?? { streams: [], held: 0 },
     });
   }
   const summary: Record<string, number> = { total: items.length };

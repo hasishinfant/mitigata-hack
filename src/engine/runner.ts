@@ -13,15 +13,34 @@ import { redactValue } from "../mapping/scanner.ts";
 import { toIso } from "../mapping/transforms.ts";
 import { BrokerError, type Broker } from "../broker/types.ts";
 import { createPaginator, type PageRequest } from "./paginate/index.ts";
+import { diffSchema, ShapeCollector, type SchemaEvidence, type Shape } from "./fingerprint.ts";
+import { DEFAULT_MAX_QUARANTINE_RATIO, evaluateIntegrity, type Decision } from "./integrity.ts";
+import { NOT_CLAIMED } from "./receipt.ts";
 
 export type RunTrigger = "manual" | "schedule" | "api";
 export type RunStatus = "running" | "success" | "partial" | "failed" | "auth_failed" | "degraded" | "paused";
 export type FieldStats = { records: number; hits: Record<string, number> };
-export type Checkpoint = { nextUrl?: string; nextBody?: Record<string, unknown>; configHash: string; cursorValue?: string };
+/** Running totals of one sync (it may span several resumed runs). */
+export type SyncTotals = { pages: number; seen: number; accepted: number; quarantined: number };
+export type Checkpoint = {
+  nextUrl?: string;
+  nextBody?: Record<string, unknown>;
+  configHash: string;
+  cursorValue?: string;
+  /** The staged sync this position belongs to; resumed runs keep adding to it. */
+  syncId?: string;
+  syncTotals?: SyncTotals;
+};
+export type PageEvidence = { n: number; request_sha256: string; status: number; body_sha256: string; records: number; quarantined: number; end?: string };
+/** Publication decision for a sync, applied by finishRun in the run's final transaction. */
+export type Publication = { syncId: string; decision: Decision; publish: boolean; discard: boolean; hold: boolean; reasons: string[]; receipt: Record<string, unknown> };
 
 export type QuarantineItem = { raw: unknown; errors: string[] };
 export type PageCommit = {
   runId: string;
+  syncId: string;
+  /** First commit of a new sync: older unpublished, non-held staging for this stream is discarded. */
+  freshSync: boolean;
   connectorId: string;
   stream: string;
   tenant: string;
@@ -45,9 +64,11 @@ export type FinishRun = {
   lastError?: string;
   /** Incremental watermark to save, atomically with the run's final status (only for a successful run). */
   watermark?: string;
+  /** Promote / keep / hold / discard the staged sync, and write its receipt, in the same transaction. */
+  publication?: Publication;
 };
 /** What finishRun actually committed: it may refuse the watermark (e.g. run lock lost) and fail the run instead. */
-export type FinishedRun = { status: RunStatus; lastError?: string; watermarkSaved: boolean };
+export type FinishedRun = { status: RunStatus; lastError?: string; watermarkSaved: boolean; receiptId?: number; digest?: string; published?: number };
 /** Held for a whole run. check() throws if the lock was lost (the run must stop before committing anything else). */
 export type RunLockHandle = { release(): Promise<void>; check(): Promise<void> };
 
@@ -61,6 +82,8 @@ export interface RunStore {
    */
   finishRun(r: FinishRun): Promise<FinishedRun>;
   loadCheckpoint(connectorId: string, stream: string): Promise<Checkpoint | null>;
+  /** Raw-record schema of the last published sync of this stream (the fingerprint baseline), if any. */
+  baselineSchema?(connectorId: string, stream: string): Promise<Shape | null>;
   previousFieldStats(connectorId: string, stream: string, excludeRunId: string): Promise<FieldStats | null>;
   connectorState(connectorId: string): Promise<{ status: string; pausedUntil: Date | null; reason: string | null }>;
   /** Latest finished run statuses, newest first, excluding lock-loss failures (see LOCK_LOST). */
@@ -97,6 +120,12 @@ export type RunSummary = {
   incrementalFrom?: string; // watermark injected for this run
   watermark?: string; // new watermark saved after this run
   watermarkHeld?: string; // why the watermark did not advance (fully or partly)
+  syncId?: string;
+  decision?: Decision; // integrity decision for the sync (T8)
+  decisionReasons?: string[];
+  published?: number; // records promoted to the common tables by this run
+  receiptId?: number;
+  receiptDigest?: string;
   lastError?: string;
 };
 
@@ -214,6 +243,15 @@ export async function runStream(opts: {
 
   const cp = await store.loadCheckpoint(connectorId, stream.name);
   const resumed = Boolean(cp?.nextUrl) && cp!.configHash === conn.configHash;
+  // Staged sync: a resumed run continues the sync its checkpoint belongs to; anything else starts a new one.
+  const continuing = resumed && Boolean(cp?.syncId);
+  const syncId = continuing ? cp!.syncId! : randomUUID();
+  const totals: SyncTotals = continuing && cp?.syncTotals ? { ...cp.syncTotals } : { pages: 0, seen: 0, accepted: 0, quarantined: 0 };
+  let freshSync = !continuing;
+  let positionKept = continuing; // does a resumable checkpoint for this sync exist right now?
+  const pages: PageEvidence[] = [];
+  const shapes = new ShapeCollector();
+  let newest: string | undefined; // newest timestamp among accepted records (freshness evidence)
   const inc = stream.incremental;
   const runStart = new Date();
   let incrementalFrom: string | undefined;
@@ -237,7 +275,7 @@ export async function runStream(opts: {
   let completed = false;
 
   const summary: RunSummary = {
-    runId, stream: stream.name, status: "running", requests: 0, recordsOk: 0, recordsQuarantined: 0, retries: 0, rateLimitedMs: 0, resumed,
+    runId, stream: stream.name, status: "running", requests: 0, recordsOk: 0, recordsQuarantined: 0, retries: 0, rateLimitedMs: 0, resumed, syncId,
     ...(incrementalFrom ? { incrementalFrom } : {}),
   };
   const stats: FieldStats = { records: 0, hits: {} };
@@ -284,6 +322,7 @@ export async function runStream(opts: {
       const records: MappedRecord[] = [];
       const quarantined: QuarantineItem[] = [];
       for (const raw of raws) {
+        shapes.add(raw);
         const r = mapRecord(raw, stream.entity, stream.mapping);
         stats.records++;
         for (const f of r.present) stats.hits[f] = (stats.hits[f] ?? 0) + 1;
@@ -300,6 +339,10 @@ export async function runStream(opts: {
             r.record.attributes._raw = text.length > RAW_LIMIT ? { truncated: true, preview: text.slice(0, RAW_LIMIT) } : red;
           }
           records.push(r.record);
+          for (const f of ["timestamp", "last_seen", "last_login"]) {
+            const t = r.record.fields[f];
+            if (typeof t === "string" && (!newest || t > newest)) newest = t;
+          }
         } else quarantined.push({ raw, errors: r.errors });
       }
       const step = paginator.step({ req, headers: res.headers, body, records: raws.length });
@@ -316,11 +359,28 @@ export async function runStream(opts: {
         else seenRequests.set(reqKey(step.next), summary.requests + 1);
       }
       const next = anomaly ? null : step.next;
+      const pageTotals: SyncTotals = {
+        pages: totals.pages + 1, seen: totals.seen + raws.length, accepted: totals.accepted + records.length, quarantined: totals.quarantined + quarantined.length,
+      };
       await store.commitPage({
-        runId, connectorId, stream: stream.name, tenant: conn.metadata.tenant, source: conn.metadata.source,
+        runId, syncId, freshSync, connectorId, stream: stream.name, tenant: conn.metadata.tenant, source: conn.metadata.source,
         entity: stream.entity, fetchedAt: new Date(), records, quarantined, requests: 1,
         // On an anomaly the position is cleared: resuming into a loop would only repeat it.
-        checkpoint: next ? { nextUrl: next.url.href, ...(next.body ? { nextBody: next.body } : {}), configHash: conn.configHash } : null,
+        checkpoint: next
+          ? { nextUrl: next.url.href, ...(next.body ? { nextBody: next.body } : {}), configHash: conn.configHash, syncId, syncTotals: pageTotals }
+          : null,
+      });
+      Object.assign(totals, pageTotals);
+      freshSync = false;
+      positionKept = next !== null;
+      pages.push({
+        n: totals.pages,
+        request_sha256: createHash("sha256").update(reqKey(req)).digest("hex"), // the URL may carry paging tokens: hashed, not stored
+        status: res.status,
+        body_sha256: createHash("sha256").update(res.body).digest("hex"),
+        records: raws.length,
+        quarantined: quarantined.length,
+        ...(next ? {} : { end: anomaly ? `anomaly: ${anomaly}` : step.next === null && step.end === "complete" ? "provider signalled the last page" : "position cleared" }),
       });
       summary.recordsOk += records.length;
       summary.recordsQuarantined += quarantined.length;
@@ -357,29 +417,93 @@ export async function runStream(opts: {
     }
   }
 
-  // Watermark rules (incremental streams). Advance only after a clean run:
-  //   - every page was seen (no cap hit, no pagination anomaly, no failure);
+  // ---- Integrity (T8): judge the whole sync from its evidence, then decide what may be published (T7). ----
+  const schema: SchemaEvidence = shapes.result();
+  const baseline = schema.sampled > 0 && completed ? ((await store.baselineSchema?.(connectorId, stream.name)) ?? null) : null;
+  const diff = baseline && Object.keys(baseline).length ? diffSchema(baseline, schema.shape, stream.mapping) : null;
+  const drift = summary.status === "degraded" && summary.lastError?.startsWith("schema drift: ") ? summary.lastError.slice(14).split("; ") : [];
+  const verdict = evaluateIntegrity({
+    status: summary.status, completed, stopReason, lastError: summary.lastError, resumable: positionKept, lockLost: isLockLoss(summary.lastError),
+    seen: totals.seen, accepted: totals.accepted, quarantined: totals.quarantined, drift, schemaBreaking: diff?.breaking ?? [],
+    maxQuarantineRatio: stream.expect?.max_quarantine_ratio ?? DEFAULT_MAX_QUARANTINE_RATIO, minRecords: stream.expect?.min_records ?? 0,
+  });
+  // A held sync is a degraded run: it needs a human, and its watermark does not move.
+  if (verdict.decision === "held" && (summary.status === "success" || summary.status === "partial")) {
+    summary.status = "degraded";
+    summary.lastError = `held for review: ${verdict.reasons.join("; ")}`;
+  }
+
+  // Watermark rules (incremental streams). Advance only after a clean, verified run:
+  //   - every page was seen (no cap hit, no pagination anomaly, no failure) and the sync was verified;
   //   - nothing was quarantined: the previous watermark is kept and the window is replayed next run
   //     (upserts absorb the duplicates). We don't try to place the watermark "just before" a bad record:
   //     that depends on the provider's timestamp precision and whether its filter is inclusive;
-  //   - the run is not degraded (schema drift: the mapping may be silently dropping data).
-  // The watermark is written by finishRun, in the same transaction as the success status.
+  //   - the run is not degraded or held (the mapping may be silently dropping data).
+  // The watermark is written by finishRun, in the same transaction as the success status and the publication.
   if (inc && completed && summary.status === "partial" && summary.recordsQuarantined > 0)
     summary.watermarkHeld = `${summary.recordsQuarantined} record(s) quarantined; watermark kept so the window is replayed`;
-  else if (inc && summary.status === "degraded") summary.watermarkHeld = "run degraded (schema drift): watermark not advanced";
+  else if (inc && summary.status === "degraded") summary.watermarkHeld = "run degraded or held: watermark not advanced";
   const watermark =
-    inc && completed && maxCursor && summary.status === "success" && (!cp?.cursorValue || Date.parse(maxCursor) > Date.parse(cp.cursorValue))
+    inc && completed && maxCursor && summary.status === "success" && verdict.publish && (!cp?.cursorValue || Date.parse(maxCursor) > Date.parse(cp.cursorValue))
       ? maxCursor
       : undefined;
   if (summary.watermarkHeld && summary.status !== "degraded") summary.lastError = `${summary.lastError ?? ""}${summary.lastError ? "; " : ""}watermark held: ${summary.watermarkHeld}`;
 
+  const finishedAt = new Date();
+  const receipt: Record<string, unknown> = {
+    receipt_version: 1,
+    sync_id: syncId,
+    run_id: runId,
+    connector: { id: connectorId, source: conn.metadata.source, tenant: conn.metadata.tenant, config_hash: conn.configHash },
+    stream: { name: stream.name, entity: stream.entity, records_path: stream.records_path ?? "$", pagination: stream.pagination.type },
+    run: { trigger: opts.trigger ?? "manual", resumed, started_at: runStart.toISOString(), finished_at: finishedAt.toISOString(), status: summary.status, last_error: summary.lastError ?? null },
+    pages,
+    counts: {
+      this_run: { requests: summary.requests, records_seen: summary.recordsOk + summary.recordsQuarantined, accepted: summary.recordsOk, quarantined: summary.recordsQuarantined, retries: summary.retries, rate_limited_ms: summary.rateLimitedMs },
+      sync: totals,
+    },
+    pagination: { completed, termination: stopReason ?? (completed ? "provider signalled the last page" : (summary.lastError ?? "not completed")) },
+    schema: {
+      fingerprint: schema.fingerprint, sampled_records: schema.sampled, paths: schema.paths, shape: schema.shape,
+      baseline_fingerprint: baseline ? "from last published sync" : null, breaking: diff?.breaking ?? [], added_paths: diff?.added ?? 0, removed_paths: diff?.removed ?? 0,
+    },
+    freshness: { newest_record_at: newest ?? null, age_seconds: newest ? Math.max(0, Math.round((finishedAt.getTime() - Date.parse(newest)) / 1000)) : null },
+    watermark: { before: cp?.cursorValue ?? null, proposed: watermark ?? null, held: summary.watermarkHeld ?? null },
+    decision: verdict.decision,
+    reasons: verdict.reasons,
+    // Facts: observed and recorded by IntegrateX. Inferences: conclusions drawn from them. Not claimed: see NOT_CLAIMED.
+    facts: [
+      `${pages.length} page(s) fetched in this run; HTTP ${[...new Set(pages.map((p) => p.status))].join(", ") || "none"}; each body's sha256 recorded`,
+      `${totals.seen} record(s) seen in this sync, ${totals.accepted} accepted, ${totals.quarantined} quarantined`,
+      `records envelope "${stream.records_path ?? "$"}" present on every page that was committed`,
+      `config ${conn.configHash.slice(0, 12)}… (broker-signed version) produced this run`,
+    ],
+    inferences: [
+      completed ? "pagination complete: inferred from the provider's last-page signal, not independently verified" : "pagination not complete",
+      diff ? (diff.breaking.length ? "schema not compatible with the last published sync" : "schema compatible with the last published sync (fingerprint diff)") : "no schema baseline yet",
+    ],
+    not_claimed: NOT_CLAIMED,
+  };
+
   const finished = await store.finishRun({
     runId, connectorId, stream: stream.name, status: summary.status, requests: summary.requests, retries: summary.retries,
     rateLimitedMs: summary.rateLimitedMs, fieldStats: stats, lastError: summary.lastError, ...(watermark ? { watermark } : {}),
+    publication: {
+      syncId, decision: verdict.decision, publish: verdict.publish, discard: verdict.discard, hold: verdict.decision === "held", reasons: verdict.reasons, receipt,
+    },
   });
   summary.status = finished.status;
   summary.lastError = finished.lastError;
   if (finished.watermarkSaved) summary.watermark = watermark;
+  summary.decision = isLockLoss(finished.lastError) ? "incomplete" : verdict.decision;
+  summary.decisionReasons = verdict.reasons;
+  if (finished.published !== undefined) summary.published = finished.published;
+  if (finished.receiptId !== undefined) {
+    summary.receiptId = finished.receiptId;
+    summary.receiptDigest = finished.digest;
+    // Anchor the digest in the broker's hash-chained ledger. Not fatal: an unanchored receipt is reported as such.
+    await broker.anchorReceipt?.(finished.receiptId).catch((e: Error) => log.warn({ ...ctx, receipt: finished.receiptId, err: e.message }, "receipt not anchored"));
+  }
   if (summary.status === "degraded" || summary.status === "auth_failed")
     await store.raiseAlert(connectorId, summary.status, `${stream.name}: ${summary.lastError}`);
   if (FAILURE.includes(summary.status) && !isLockLoss(summary.lastError)) {

@@ -27,6 +27,7 @@ import { ADMIN_HEADER } from "./remote.ts";
 import { hostAllowed } from "./policy.ts";
 import { configSigKey, signConfig, verifyConfigSig } from "./configSig.ts";
 import { appendLedger, verifyLedger } from "./ledger.ts";
+import { receiptDigest } from "../engine/receipt.ts";
 import { DenialLog } from "./limits.ts";
 import type { Clock } from "./retry.ts";
 import { chainSecretSources, dbSecretSource, deleteSecret, envSecretSource, listSecrets, putSecret } from "./secrets.ts";
@@ -78,7 +79,7 @@ export function createBrokerServer(opts: BrokerServerOptions) {
   const sigKey = configSigKey(opts.masterKey);
   const store = dbSecretSource(opts.pool, opts.masterKey);
   const secrets: SecretSource = opts.envSecrets ? chainSecretSources(store, envSecretSource(env)) : store;
-  const audit = (e: Parameters<typeof appendLedger>[1]) => appendLedger(opts.pool, e);
+  const audit = async (e: Parameters<typeof appendLedger>[1]): Promise<void> => void (await appendLedger(opts.pool, e));
 
   const cache = new Map<string, { conn: ResolvedConnector; at: number }>();
   const lastHash = new Map<string, string>(); // config hash each connector's cached token was minted under
@@ -154,6 +155,25 @@ export function createBrokerServer(opts: BrokerServerOptions) {
   app.post("/v1/request", async (req) => broker.request(req.body as BrokerRequest));
 
   app.get("/v1/credential-info/:id", async (req) => broker.credentialInfo((req.params as { id: string }).id));
+
+  // Anchor a Sync Integrity Receipt: the broker reads the stored receipt itself, recomputes its digest from the body,
+  // and appends it to the hash-chained ledger once. The caller only names the receipt; it can't supply the digest.
+  // Later edits to the receipt no longer match its anchor (ix receipt verify). Evidence, not proof of upstream truth.
+  app.post("/v1/receipts/:id/anchor", async (req) => {
+    const id = Number((req.params as { id: string }).id);
+    if (!Number.isSafeInteger(id) || id <= 0) throw Object.assign(new Error("bad receipt id"), { statusCode: 400 });
+    const r = (await opts.pool.query("select id, connector_id, stream, decision, body, digest, anchored_seq from sync_receipts where id = $1", [id])).rows[0];
+    if (!r) throw Object.assign(new Error(`receipt ${id} not found`), { statusCode: 404 });
+    if (r.anchored_seq) throw Object.assign(new Error(`receipt ${id} is already anchored (ledger #${r.anchored_seq})`), { statusCode: 409 });
+    const digest = receiptDigest(r.body);
+    if (digest !== r.digest) {
+      await audit({ connectorId: r.connector_id, action: "receipt", path: r.stream, decision: `deny: receipt #${id} body does not match its digest` });
+      throw Object.assign(new Error(`receipt ${id} was changed after it was written`), { statusCode: 409 });
+    }
+    const seq = await appendLedger(opts.pool, { connectorId: r.connector_id, action: "receipt", path: r.stream, decision: `${r.decision} receipt #${id} sha256:${digest}` });
+    await opts.pool.query("update sync_receipts set anchored_seq = $2 where id = $1 and anchored_seq is null", [id, seq]);
+    return { seq };
+  });
 
   // ---- admin socket: API and CLI, with the admin token ----
   const adminApp = makeApp();
@@ -238,6 +258,7 @@ export function createBrokerServer(opts: BrokerServerOptions) {
       }
       for (const t of ["users", "devices", "events"]) records += (await client.query(`delete from ${t} where connector_id = $1`, [id])).rowCount ?? 0;
       await client.query("delete from quarantine where connector_id = $1", [id]);
+      await client.query("delete from sync_receipts where connector_id = $1", [id]); // staging cascades with the connector
       await client.query("delete from alerts where connector_id = $1", [id]);
       await client.query("delete from connectors where id = $1", [id]); // cascades versions, runs, checkpoints
       await client.query("commit");

@@ -29,6 +29,7 @@ export async function closeRegPool(): Promise<void> {
 }
 
 export async function clearData(pool: Pool): Promise<void> {
-  for (const t of ["quarantine", "runs", "checkpoints", "users", "devices", "events", "alerts"]) await pool.query(`delete from ${t}`);
+  for (const t of ["quarantine", "runs", "checkpoints", "users", "devices", "events", "alerts", "stage_records", "stage_syncs"]) await pool.query(`delete from ${t}`);
+  await regPool().query("delete from sync_receipts"); // insert-only for the app role
   for (const t of ["credentials", "connector_versions", "connectors", "tenants"]) await regPool().query(`delete from ${t}`);
 }

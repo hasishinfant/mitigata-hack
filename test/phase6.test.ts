@@ -14,6 +14,7 @@ import { BrokerError } from "../src/broker/types.ts";
 import { appendLedger } from "../src/broker/ledger.ts";
 import { DenialLog } from "../src/broker/limits.ts";
 import { getPosture } from "../src/security/posture.ts";
+import { verifyReceipt } from "../src/store/staging.ts";
 import { assertNoBrokerSecrets, withoutBrokerSecrets } from "../src/envfiles.ts";
 import { runConnector } from "../src/engine/runner.ts";
 import { scanForSecrets } from "../src/security/leakcheck.ts";
@@ -247,11 +248,43 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     ]);
   });
 
+  it("receipts: the broker anchors each digest in the ledger once; the app role can't change one; edits are detected", async () => {
+    await remote.register(fixture("mock-github-members.yaml"), "add");
+    await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer);
+    const conn = await loadActiveConnector(appPool, "mock-github-members", env);
+    const [r] = await runConnector({ connector: conn, broker: remote, store: createPgRunStore(appPool) });
+    expect(r).toMatchObject({ status: "success", decision: "verified", published: 250 });
+    const rc = (await appPool.query("select id, digest, anchored_seq from sync_receipts where run_id = $1", [r!.runId])).rows[0];
+    expect(rc.anchored_seq).toBeTruthy();
+    const anchor = (await appPool.query("select action, connector_id, decision from audit_ledger where seq = $1", [rc.anchored_seq])).rows[0];
+    expect(anchor).toEqual({ action: "receipt", connector_id: "mock-github-members", decision: `verified receipt #${rc.id} sha256:${rc.digest}` });
+    expect(await verifyReceipt(appPool, Number(rc.id))).toEqual({ id: Number(rc.id), digestMatches: true, anchored: true, anchorMatches: true });
+    await expect(remote.anchorReceipt!(Number(rc.id))).rejects.toMatchObject({ statusCode: 409 }); // once only
+
+    // Insert-only for the app role.
+    await expect(appPool.query("update sync_receipts set decision = 'verified' where id = $1", [rc.id])).rejects.toThrow(/permission denied/);
+    await expect(appPool.query("delete from sync_receipts where id = $1", [rc.id])).rejects.toThrow(/permission denied/);
+    // Someone with more access edits it anyway: the digest and the ledger anchor no longer match.
+    await adminPool.query("update sync_receipts set body = jsonb_set(body, '{records_published}', '999') where id = $1", [rc.id]);
+    expect(await verifyReceipt(appPool, Number(rc.id))).toMatchObject({ digestMatches: false, anchorMatches: false });
+    expect((await remote.verifyLedger()).ok).toBe(true); // the ledger itself is intact; the receipt is what changed
+
+    // A receipt whose body doesn't match its digest is never anchored.
+    const forged = (
+      await appPool.query(
+        "insert into sync_receipts (sync_id, connector_id, stream, kind, decision, published, body, digest) values ($1, 'mock-github-members', 'members', 'run', 'verified', true, '{\"x\": 1}', $2) returning id",
+        ["00000000-0000-4000-8000-0000000000aa", "0".repeat(64)],
+      )
+    ).rows[0].id;
+    await expect(remote.anchorReceipt!(Number(forged))).rejects.toMatchObject({ statusCode: 409, message: expect.stringMatching(/changed after it was written/) });
+    expect((await ledger()).map((e) => e.decision)).toContain(`deny: receipt #${forged} body does not match its digest`);
+  });
+
   it("summarised denials keep exact counts: posture reports denied requests, not ledger rows", async () => {
     const id = `posture-count-${randomBytes(3).toString("hex")}`; // its own id: posture counts are not scoped to this test
     await remote.register(fixture("mock-github-members.yaml").replace("id: mock-github-members", `id: ${id}`), "add");
     const t = 5_000_000;
-    const log = new DenialLog((e) => appendLedger(brokerPool, e), 60_000, () => t);
+    const log = new DenialLog(async (e) => void (await appendLedger(brokerPool, e)), 60_000, () => t);
     const deny = { connectorId: id, action: "alert", decision: "deny: alert rate limit (per connector)" };
     for (let i = 0; i < 51; i++) await log.record(`notify:${id}`, deny);
     await log.close();

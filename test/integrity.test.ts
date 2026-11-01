@@ -192,7 +192,8 @@ describe("incremental watermark", () => {
       id: { path: uuid, required: true }
       type: { path: eventType, required: true }
       timestamp: { path: published, transform: to_iso8601 }
-      description: { path: msg }`);
+      description: { path: msg }
+    expect: { max_quarantine_ratio: 1 }`); // these tests are about the watermark; publication limits are tested in staging tests
   const ev = (n: number, extra: Record<string, unknown> = {}) => ({ uuid: `u${n}`, eventType: "login", published: `2026-01-0${n}T00:00:00.000Z`, msg: "m", ...extra });
 
   it("a clean run advances to the newest accepted record", async () => {

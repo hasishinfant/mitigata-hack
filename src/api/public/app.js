@@ -75,9 +75,15 @@ function card(c) {
     meta,
     strip,
     c.posture && c.posture.risk === "high" ? el("div", { class: "flag flag-high" }, `⚠ ${c.posture.flags[0].message}`) : null,
+    // Integrity (T7/T8): latest receipt decision per stream, and syncs waiting for review.
+    c.integrity && c.integrity.streams.length
+      ? el("div", { class: "badges", title: "latest Sync Integrity Receipt per stream" },
+        c.integrity.streams.map((s) => el("span", { class: `badge d-${s.decision}` }, `${s.stream}: ${s.decision.replace("_", " ")}${s.anchored ? "" : " (unanchored)"}`)))
+      : null,
+    c.integrity && c.integrity.held ? el("div", { class: "flag flag-medium" }, `⏸ ${c.integrity.held} sync(s) held for review: nothing published`) : null,
     c.reason ? el("div", { class: "error", title: c.reason }, c.reason) : null,
     c.last_error && c.last_error !== c.reason ? el("div", { class: "error", title: c.last_error }, c.last_error) : null,
-    el("div", { class: "actions" }, runBtn, el("button", { onclick: () => showHistory(c.id) }, "History"), el("button", { onclick: () => showPosture(c.id) }, "Posture")),
+    el("div", { class: "actions" }, runBtn, el("button", { onclick: () => showHistory(c.id) }, "History"), el("button", { onclick: () => showPosture(c.id) }, "Posture"), el("button", { onclick: () => showReceipts(c.id) }, "Receipts")),
   );
 }
 
@@ -159,6 +165,75 @@ async function showPosture(id) {
   $("posture").showModal();
 }
 $("posture-close").addEventListener("click", () => $("posture").close());
+
+// ---------- integrity receipts and held syncs ----------
+async function showReceipts(id) {
+  $("receipts-title").textContent = `Sync Integrity Receipts: ${id}`;
+  $("receipts-detail").replaceChildren();
+  const [{ receipts }, { held }] = await Promise.all([
+    api(`/v1/connectors/${encodeURIComponent(id)}/receipts?limit=30`),
+    api(`/v1/held?connector=${encodeURIComponent(id)}`),
+  ]);
+  $("receipts-held").replaceChildren(...held.map((h) => el("div", { class: "held-box" },
+    el("div", {}, `⏸ Held: ${h.stream} · ${h.records} records staged · ${ago(h.created_at)} · sync ${h.sync_id}`),
+    el("div", { class: "muted" }, h.held_reason || ""),
+    el("div", { class: "actions" },
+      el("button", { class: "primary", onclick: () => resolveHeld(id, h.sync_id, "approve") }, "Approve: publish"),
+      el("button", { onclick: () => resolveHeld(id, h.sync_id, "discard") }, "Discard")))));
+  const rows = receipts.map((r) => ({
+    id: r.id, when: ago(r.created_at), stream: r.stream, decision: r.decision, published: r.records_published ?? 0,
+    seen: r.sync_counts ? r.sync_counts.seen : "", quarantined: r.sync_counts ? r.sync_counts.quarantined : "",
+    anchored: r.anchored_seq ? `ledger #${r.anchored_seq}` : "no", digest: `${String(r.digest).slice(0, 12)}…`,
+  }));
+  table($("receipts-table"), rows, ["id", "when", "stream", "decision", "published", "seen", "quarantined", "anchored", "digest"]);
+  for (const tr of $("receipts-table").querySelectorAll("tbody tr")) {
+    const rid = tr.firstChild.textContent;
+    tr.style.cursor = "pointer";
+    tr.title = "show and verify this receipt";
+    tr.addEventListener("click", () => showReceipt(rid));
+  }
+  $("receipts").showModal();
+}
+
+async function showReceipt(rid) {
+  const { receipt: r, verification: v } = await api(`/v1/receipts/${encodeURIComponent(rid)}`);
+  const b = r.body;
+  const ok = v.digestMatches && (!v.anchored || v.anchorMatches);
+  $("receipts-detail").replaceChildren(
+    el("h4", {}, `Receipt #${r.id}: `, el("span", { class: `d-${r.decision}` }, r.decision)),
+    el("div", { class: "kv" },
+      el("div", {}, "Verification"), el("div", { class: ok ? "ok" : "bad" },
+        `digest ${v.digestMatches ? "matches body" : "DOES NOT match body"} · ledger anchor ${v.anchored ? (v.anchorMatches ? "matches" : "DOES NOT match") : "missing"}`),
+      el("div", {}, "Sync / run"), el("div", {}, `${r.sync_id} / ${r.run_id || "-"}`),
+      el("div", {}, "Config"), el("div", {}, b.connector ? `v${b.connector.config_version} · ${String(b.connector.config_hash || "").slice(0, 12)}…` : "—"),
+      el("div", {}, "Sync totals"), el("div", {}, b.counts && b.counts.sync ? `${b.counts.sync.pages} pages · ${b.counts.sync.seen} seen · ${b.counts.sync.accepted} accepted · ${b.counts.sync.quarantined} quarantined` : "—"),
+      el("div", {}, "Published"), el("div", {}, String(b.records_published ?? (b.records && b.records.promoted) ?? 0)),
+      el("div", {}, "Pagination"), el("div", {}, b.pagination ? b.pagination.termination : "—"),
+      el("div", {}, "Schema"), el("div", {}, b.schema ? `${String(b.schema.fingerprint).slice(0, 12)}… · ${b.schema.paths} paths${b.schema.breaking && b.schema.breaking.length ? ` · breaking: ${b.schema.breaking.join("; ")}` : ""}` : "—"),
+      el("div", {}, "Newest record"), el("div", {}, b.freshness && b.freshness.newest_record_at ? `${b.freshness.newest_record_at} (${ago(b.freshness.newest_record_at)})` : "—"),
+      el("div", {}, "Watermark"), el("div", {}, b.watermark ? `before ${b.watermark.before || "none"} · proposed ${b.watermark.proposed || "none"}${b.watermark.held ? ` · held: ${b.watermark.held}` : ""}` : "—"),
+      el("div", {}, "Reasons"), el("div", {}, (b.reasons || []).join(" | ") || "—"),
+      el("div", {}, "Facts"), el("div", {}, (b.facts || []).join(" | ") || "—"),
+      el("div", {}, "Inferred"), el("div", {}, (b.inferences || []).join(" | ") || "—"),
+      el("div", {}, "Not claimed"), el("div", { class: "muted" }, (b.not_claimed || []).join(" | ")),
+      el("div", {}, "Digest"), el("div", {}, r.digest),
+    ),
+  );
+}
+
+async function resolveHeld(id, syncId, action) {
+  if (!ensureToken()) return;
+  if (!confirm(action === "approve" ? "Publish this held sync's records to the common tables?" : "Discard this held sync's staged records?")) return;
+  try {
+    const r = await api(`/v1/syncs/${encodeURIComponent(syncId)}/${action}`, { method: "POST", headers: { authorization: `Bearer ${tokenInput.value}` } });
+    alert(`${action === "approve" ? "Published" : "Discarded"} ${r.records} records · receipt #${r.receiptId}`);
+  } catch (e) {
+    alert(`${action} failed: ${e.message}`);
+  }
+  await showReceipts(id);
+  refresh();
+}
+$("receipts-close").addEventListener("click", () => $("receipts").close());
 
 // ---------- kill switch ----------
 $("panic").addEventListener("click", async () => {

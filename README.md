@@ -91,6 +91,42 @@ open http://localhost:7070    # dashboard: health cards, run history, records, q
 | `POST /v1/connectors/:id/runs` | Run now (admin) |
 | `POST /v1/panic` | Disable every connector, cancel queued runs, wipe broker token caches, and return a revocation checklist (admin; accepts `{"purge_secrets":true}`) |
 
+## Data integrity: staged syncs and Sync Integrity Receipts
+
+A run's records are **staged**, not published. The common `users`, `devices` and `events` tables only change when the whole sync is judged trustworthy. A sync is one or more runs of a stream, resumed from checkpoints. Publication then happens in one transaction on the run's lock session, together with the run's status, the watermark and the receipt.
+
+| Decision | When | What happens |
+|---|---|---|
+| `verified` | Every page seen, the provider signalled the last page, within quality limits | Staged records are published |
+| `verified_empty` | Complete, and the provider explicitly returned no records | Nothing to publish; that is a valid result |
+| `held` | Complete, but the schema changed (a field the mapping reads disappeared or changed type), too much was quarantined (default over 10%), or fewer records than `expect.min_records` | **Nothing is published.** It waits for `ix approve <sync>` or `ix discard <sync>`, or the dashboard's Receipts panel. Approval is refused if a newer sync has been published since. |
+| `incomplete` | A per-run cap was hit, the run failed with a resumable position, or the lock was lost | Staged records are kept; the next run continues the same sync |
+| `rejected` | Pagination anomaly, or a failure with no position to resume from | Staged records are discarded |
+
+Per-stream limits: `expect: { max_quarantine_ratio: 0.1, min_records: 0 }`.
+
+**Receipts.** Every run, approval and discard writes a **Sync Integrity Receipt**. It records:
+- the config hash and version;
+- each page's HTTP status and body sha256;
+- record counts for the run and for the sync;
+- how pagination ended;
+- a recursive **schema fingerprint**, and its difference from the last published sync;
+- freshness of the newest record;
+- the watermark decision;
+- the decision and its reasons;
+- what was published.
+
+Receipts separate **facts** (observed) from **inferences** ("pagination complete" is inferred from the provider's last-page signal). They also list what they **don't claim**: that the provider's data is true or complete.
+
+**Tamper evidence.** `digest` is the sha256 of the receipt's canonical JSON. The broker re-reads each receipt, recomputes its digest and anchors it once in the hash-chained audit ledger. The app role can insert receipts but never change or delete one. `ix receipt <id>` (or a click in the dashboard) recomputes the digest and checks the anchor. An edited receipt shows as "does not match".
+
+Commands: `ix receipts <connector>`, `ix receipt <id> [--json]`, `ix held`, `ix approve <sync>`, `ix discard <sync>`.
+
+Limits:
+- A receipt proves what IntegrateX saw and decided, not that upstream data is true.
+- Staging holds a whole sync in Postgres. Large backfills are bounded by `max_records_per_run`, and continue over several runs.
+- Records deleted at the source are still not removed (there's no deletion tracking yet).
+
 ## Security model (what a breached hub gives up)
 
 - **Broker process.** It is the only process with the master key and the broker database role. It listens on two Unix sockets, both mode `0600`.

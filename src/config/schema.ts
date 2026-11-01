@@ -116,6 +116,13 @@ export const StreamSchema = z.strictObject({
     })
     .optional(),
   mapping: z.record(z.string(), FieldSpecSchema),
+  // Integrity limits for publication (T7/T8). Over a limit, the sync is held for review instead of published.
+  expect: z
+    .strictObject({
+      max_quarantine_ratio: z.number().min(0).max(1).optional(), // default 0.1
+      min_records: z.number().int().nonnegative().optional(), // default 0: an explicit empty result is valid
+    })
+    .optional(),
 });
 
 // ---- top level ----

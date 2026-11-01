@@ -31,7 +31,8 @@ export function canonical(row: Row): string {
 }
 export const chainHash = (prev: string, row: Row) => createHash("sha256").update(prev + canonical(row)).digest("hex");
 
-export async function appendLedger(pool: pg.Pool, e: AuditEntry): Promise<void> {
+/** Append one entry; returns its seq. */
+export async function appendLedger(pool: pg.Pool, e: AuditEntry): Promise<number> {
   const client = await pool.connect();
   try {
     await client.query("begin");
@@ -42,12 +43,17 @@ export async function appendLedger(pool: pg.Pool, e: AuditEntry): Promise<void> 
       method: e.method ?? null, host: e.host ?? null, path: e.path ?? null, status: e.status ?? null, records: e.records ?? null,
       decision: e.decision,
     };
-    await client.query(
-      `insert into audit_ledger (ts, actor, connector_id, action, method, host, path, status, records, decision, prev_hash, hash)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [row.ts, row.actor, row.connectorId, row.action, row.method, row.host, row.path, row.status, row.records, row.decision, prev, chainHash(prev, row)],
+    const seq = Number(
+      (
+        await client.query(
+          `insert into audit_ledger (ts, actor, connector_id, action, method, host, path, status, records, decision, prev_hash, hash)
+           values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning seq`,
+          [row.ts, row.actor, row.connectorId, row.action, row.method, row.host, row.path, row.status, row.records, row.decision, prev, chainHash(prev, row)],
+        )
+      ).rows[0].seq,
     );
     await client.query("commit");
+    return seq;
   } catch (err) {
     await client.query("rollback").catch(() => {});
     throw err;
