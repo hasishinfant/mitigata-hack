@@ -1,0 +1,57 @@
+apiVersion: ix/v1
+kind: Connector
+metadata:
+  id: github-repos
+  source: github
+  tenant: demo
+  owner: secops@example.com
+
+connection:
+  base_url: https://api.github.com
+  auth: { type: bearer, secret_ref: github_pat }   # fine-grained token: Metadata read (repos it can see)
+
+streams:
+  - name: repos
+    entity: event
+    request:
+      method: GET
+      path: /user/repos
+      headers: { Accept: application/vnd.github+json, X-GitHub-Api-Version: "2022-11-28" }
+      params: { per_page: 100, sort: pushed }
+    records_path: $
+    pagination: { type: link_header, rel: next }
+    mapping:
+      id:          { path: id, required: true }
+      type:        { const: repository }
+      severity:    { path: visibility, map_enum: { public: medium, internal: low, private: info }, default: info }   # public = exposed
+      timestamp:   { path: [pushed_at, updated_at], transform: to_iso8601 }
+      description: { path: full_name, required: true }
+      attributes:  { pick: [name, visibility, private, fork, archived, default_branch, language, html_url, owner.login] }
+
+schedule: { every: 6h, jitter: 5m }
+
+reliability:
+  timeout: 20s
+  retries: { max: 3, backoff: exponential, base: 1s, jitter: true }
+  rate_limit: { requests_per_minute: 60, respect_retry_after: true, max_wait: 120s }
+  circuit_breaker: { failures_to_open: 5, cool_down: 10m }
+
+policy:
+  allowed_hosts: [api.github.com]
+  allowed_paths: [/user/repos]
+  methods: [GET]
+  max_requests_per_run: 50
+  max_records_per_run: 5000
+  anomaly_multiplier: 5
+
+credential:
+  expected_scopes: ["metadata:read"]
+  forbid_scopes: ["*:write", "admin:*", "delete_repo"]
+  max_age_days: 90
+  idle_disable_days: 14
+  provider_ip_restriction: unknown
+  scopes_header: X-OAuth-Scopes
+
+data: { store_raw: false, redact_secrets: true, retention_days: 30 }
+alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }
+capabilities: { ip_allowlist: supported, audit_log: available }
