@@ -8,8 +8,13 @@
 // Lock connections come from their own small pool, never the data pool: with N concurrent runs each holding a lock
 // connection and also needing data connections for page commits, a shared pool of size <= N would deadlock.
 //
-// Limit: if the lock connection itself dies mid-run (database restart, network), the lock is gone while the run
-// continues; another run could then start. That is logged when it happens and reported at release.
+// Lock loss fails closed. If the lock's session dies mid-run (database restart, network, terminated backend), another
+// run may take the lock, so the original run must stop:
+//   - check() runs before every provider request: it pings the lock session and throws if it is gone;
+//   - every page-commit transaction (and the final watermark write) re-checks in pg_locks that the lock is still
+//     granted to this run's session, and aborts if not (see fenceQuery).
+// Residual window: the time between that fence check and the COMMIT of the same transaction (milliseconds; a new
+// run would also have to take the lock and fetch a page from the provider inside it).
 import { createHash } from "node:crypto";
 import pg from "pg";
 import { log } from "../log.ts";
@@ -19,7 +24,30 @@ export function runLockKey(connectorId: string): string {
   return createHash("sha256").update(`ix-run:${connectorId}`).digest().readBigInt64BE(0).toString();
 }
 
-export type RunLock = { connectorId: string; pid: number; release(): Promise<void> };
+export type RunLock = {
+  connectorId: string;
+  /** Backend pid of the session holding the lock (for the commit-time fence). */
+  pid: number;
+  key: string;
+  /** Throws LockLost if the lock's session is gone. */
+  check(): Promise<void>;
+  release(): Promise<void>;
+};
+
+export class LockLost extends Error {}
+
+/**
+ * SQL that returns a row only while `pid` still holds the advisory lock `key` (granted, session-level).
+ * pg_locks shows a bigint advisory key as classid = high 32 bits, objid = low 32 bits, objsubid = 1.
+ */
+export function fenceQuery(lock: Pick<RunLock, "pid" | "key">): { text: string; values: unknown[] } {
+  const k = BigInt(lock.key);
+  return {
+    text: `select 1 from pg_locks where locktype = 'advisory' and granted and pid = $1
+           and classid = $2::bigint::oid and objid = $3::bigint::oid and objsubid = 1`,
+    values: [lock.pid, BigInt.asUintN(32, k >> 32n).toString(), BigInt.asUintN(32, k).toString()],
+  };
+}
 
 const lockPools = new WeakMap<pg.Pool, pg.Pool>();
 function lockPoolFor(data: pg.Pool): pg.Pool {
@@ -72,6 +100,19 @@ export async function acquireRunLock(data: pg.Pool, connectorId: string): Promis
   return {
     connectorId,
     pid,
+    key,
+    async check() {
+      if (released) throw new LockLost(`run lock for ${connectorId} was already released`);
+      if (!lost) {
+        try {
+          await client.query("select 1"); // the session is alive, so the session-level lock is still ours
+          return;
+        } catch {
+          lost = true;
+        }
+      }
+      throw new LockLost(`run lock for ${connectorId} was lost (its database session ended); stopping this run`);
+    },
     async release() {
       if (released) return;
       released = true;

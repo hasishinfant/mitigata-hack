@@ -1,13 +1,24 @@
 // Postgres implementation of the engine's RunStore, plus run history queries.
 import type pg from "pg";
-import type { Checkpoint, FieldStats, PageCommit, RunStatus, RunStore } from "../engine/runner.ts";
+import type pgTypes from "pg";
+import { RunFailure, type Checkpoint, type FieldStats, type FinishedRun, type PageCommit, type RunStatus, type RunStore } from "../engine/runner.ts";
 import { withTx } from "./db.ts";
 import { insertQuarantine } from "./quarantine.ts";
 import { upsertRecords } from "./upsert.ts";
 import { raiseAlertOnce } from "../security/alerts.ts";
-import { acquireRunLock } from "./runLock.ts";
+import { acquireRunLock, fenceQuery, LockLost, type RunLock } from "./runLock.ts";
 
 export function createPgRunStore(pool: pg.Pool): RunStore {
+  const held = new Map<string, RunLock>(); // connector -> the run lock this store's run holds
+  /** Inside a transaction: is this connector's run lock still held by our run's session? */
+  const fenced = async (c: pgTypes.PoolClient, connectorId: string): Promise<boolean> => {
+    const lock = held.get(connectorId);
+    if (!lock) return true; // no lock taken through this store (e.g. a store used without runConnector)
+    const q = fenceQuery(lock);
+    return ((await c.query(q.text, q.values)).rowCount ?? 0) > 0;
+  };
+  const LOST = "run lock lost (its database session ended); nothing more was committed";
+
   return {
     async startRun(r) {
       await pool.query(
@@ -18,6 +29,8 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
 
     async commitPage(p: PageCommit) {
       await withTx(pool, async (c) => {
+        // Fail closed: if another run may hold the lock now, this run commits nothing.
+        if (!(await fenced(c, p.connectorId))) throw new RunFailure("failed", LOST);
         await upsertRecords(c, p.entity, p.records, {
           tenant: p.tenant, source: p.source, connectorId: p.connectorId, runId: p.runId, fetchedAt: p.fetchedAt,
         });
@@ -39,16 +52,35 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
       });
     },
 
-    async finishRun(r) {
-      await withTx(pool, async (c) => {
+    // Status and watermark in one transaction. A crash or failed commit leaves neither: the run stays "running"
+    // (an abandoned run) with the old watermark, so the next run re-fetches the same window.
+    async finishRun(r): Promise<FinishedRun> {
+      return withTx(pool, async (c) => {
+        let { status, lastError } = r;
+        let watermarkSaved = false;
+        if (r.watermark) {
+          if (await fenced(c, r.connectorId)) {
+            // Only cursor_value: the page position (page_state) is left as the last page commit wrote it.
+            await c.query(
+              `insert into checkpoints (connector_id, stream, cursor_value, updated_at) values ($1, $2, $3, now())
+               on conflict (connector_id, stream) do update set cursor_value = excluded.cursor_value, updated_at = now()`,
+              [r.connectorId, r.stream, r.watermark],
+            );
+            watermarkSaved = true;
+          } else {
+            status = "failed";
+            lastError = `${LOST}; watermark not advanced`;
+          }
+        }
         // requests is authoritative here: failed requests never reach commitPage.
         await c.query(
           `update runs set status = $2, finished_at = now(), last_error = $3, requests = $4, retries = $5, rate_limited_ms = $6, field_stats = $7
            where id = $1`,
-          [r.runId, r.status, r.lastError ?? null, r.requests, r.retries, r.rateLimitedMs, JSON.stringify(r.fieldStats)],
+          [r.runId, status, lastError ?? null, r.requests, r.retries, r.rateLimitedMs, JSON.stringify(r.fieldStats)],
         );
-        if (["success", "partial", "degraded"].includes(r.status))
+        if (["success", "partial", "degraded"].includes(status))
           await c.query("update connectors set last_success_at = now() where id = $1", [r.connectorId]);
+        return { status, ...(lastError !== undefined ? { lastError } : {}), watermarkSaved };
       });
     },
 
@@ -104,20 +136,30 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
       );
     },
 
-    async saveWatermark(connectorId, stream, value) {
-      await pool.query(
-        `insert into checkpoints (connector_id, stream, cursor_value, updated_at) values ($1, $2, $3, now())
-         on conflict (connector_id, stream) do update set cursor_value = excluded.cursor_value, updated_at = now()`,
-        [connectorId, stream, value],
-      );
-    },
-
     // De-duplicated per connector and kind for an hour, so a bad key on a 15-minute schedule doesn't spam.
     async raiseAlert(connectorId, kind, message) {
       await raiseAlertOnce(pool, connectorId, kind, message, 1);
     },
 
-    lockConnector: (connectorId) => acquireRunLock(pool, connectorId),
+    async lockConnector(connectorId) {
+      const lock = await acquireRunLock(pool, connectorId);
+      if (!lock) return null;
+      held.set(connectorId, lock);
+      return {
+        check: async () => {
+          try {
+            await lock.check();
+          } catch (e) {
+            if (e instanceof LockLost) throw new RunFailure("failed", LOST);
+            throw e;
+          }
+        },
+        release: async () => {
+          if (held.get(connectorId) === lock) held.delete(connectorId);
+          await lock.release();
+        },
+      };
+    },
   };
 }
 

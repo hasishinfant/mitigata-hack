@@ -36,21 +36,31 @@ export type PageCommit = {
 export type FinishRun = {
   runId: string;
   connectorId: string;
+  stream: string;
   status: RunStatus;
   requests: number;
   retries: number;
   rateLimitedMs: number;
   fieldStats: FieldStats;
   lastError?: string;
+  /** Incremental watermark to save, atomically with the run's final status (only for a successful run). */
+  watermark?: string;
 };
+/** What finishRun actually committed: it may refuse the watermark (e.g. run lock lost) and fail the run instead. */
+export type FinishedRun = { status: RunStatus; lastError?: string; watermarkSaved: boolean };
+/** Held for a whole run. check() throws if the lock was lost (the run must stop before committing anything else). */
+export type RunLockHandle = { release(): Promise<void>; check(): Promise<void> };
 
 export interface RunStore {
   startRun(r: { runId: string; connectorId: string; stream: string; configHash: string; startedAt: Date; resumed: boolean; trigger: RunTrigger }): Promise<void>;
+  /** Must refuse (throw) if the connector's run lock is no longer held by this run. */
   commitPage(p: PageCommit): Promise<void>;
-  finishRun(r: FinishRun): Promise<void>;
+  /**
+   * Final status and, for a successful incremental run, the new watermark, in ONE transaction: a crash can never
+   * leave an advanced watermark next to a run that was not recorded as complete. The only watermark write path.
+   */
+  finishRun(r: FinishRun): Promise<FinishedRun>;
   loadCheckpoint(connectorId: string, stream: string): Promise<Checkpoint | null>;
-  /** Incremental sync: highest cursor_field value seen in a fully completed run. */
-  saveWatermark(connectorId: string, stream: string, value: string): Promise<void>;
   previousFieldStats(connectorId: string, stream: string, excludeRunId: string): Promise<FieldStats | null>;
   connectorState(connectorId: string): Promise<{ status: string; pausedUntil: Date | null; reason: string | null }>;
   recentStatuses(connectorId: string, n: number): Promise<RunStatus[]>;
@@ -61,7 +71,7 @@ export interface RunStore {
    * Single-flight: take the connector's run lock for the whole run, or null if another run holds it.
    * Optional so pure in-memory stores (tests) can omit it; the Postgres store always provides it.
    */
-  lockConnector?(connectorId: string): Promise<{ release(): Promise<void> } | null>;
+  lockConnector?(connectorId: string): Promise<RunLockHandle | null>;
 }
 
 /** Another run of this connector (worker, `ix run`, ...) holds its run lock. Nothing was done. */
@@ -185,6 +195,8 @@ export async function runStream(opts: {
   broker: Broker;
   store: RunStore;
   trigger?: RunTrigger;
+  /** The connector's run lock (runConnector passes it). Checked before every request. */
+  lock?: RunLockHandle;
 }): Promise<RunSummary> {
   const { connector: conn, stream, broker, store } = opts;
   const connectorId = conn.metadata.id;
@@ -233,6 +245,7 @@ export async function runStream(opts: {
   if (req) seenRequests.set(reqKey(req), 1);
   try {
     while (req) {
+      await opts.lock?.check(); // lost the run lock: stop before fetching or committing anything more
       if (summary.requests >= conn.runtime.maxRequestsPerRun) {
         stopReason = `stopped at policy.max_requests_per_run (${conn.runtime.maxRequestsPerRun}); next run continues from checkpoint`;
         break;
@@ -341,20 +354,23 @@ export async function runStream(opts: {
   //     (upserts absorb the duplicates). We don't try to place the watermark "just before" a bad record:
   //     that depends on the provider's timestamp precision and whether its filter is inclusive;
   //   - the run is not degraded (schema drift: the mapping may be silently dropping data).
-  if (inc && completed && summary.status === "partial" && summary.recordsQuarantined > 0) {
+  // The watermark is written by finishRun, in the same transaction as the success status.
+  if (inc && completed && summary.status === "partial" && summary.recordsQuarantined > 0)
     summary.watermarkHeld = `${summary.recordsQuarantined} record(s) quarantined; watermark kept so the window is replayed`;
-  } else if (inc && completed && maxCursor && summary.status === "success") {
-    if (!cp?.cursorValue || Date.parse(maxCursor) > Date.parse(cp.cursorValue)) {
-      await store.saveWatermark(connectorId, stream.name, maxCursor);
-      summary.watermark = maxCursor;
-    }
-  } else if (inc && summary.status === "degraded") summary.watermarkHeld = "run degraded (schema drift): watermark not advanced";
+  else if (inc && summary.status === "degraded") summary.watermarkHeld = "run degraded (schema drift): watermark not advanced";
+  const watermark =
+    inc && completed && maxCursor && summary.status === "success" && (!cp?.cursorValue || Date.parse(maxCursor) > Date.parse(cp.cursorValue))
+      ? maxCursor
+      : undefined;
   if (summary.watermarkHeld && summary.status !== "degraded") summary.lastError = `${summary.lastError ?? ""}${summary.lastError ? "; " : ""}watermark held: ${summary.watermarkHeld}`;
 
-  await store.finishRun({
-    runId, connectorId, status: summary.status, requests: summary.requests, retries: summary.retries,
-    rateLimitedMs: summary.rateLimitedMs, fieldStats: stats, lastError: summary.lastError,
+  const finished = await store.finishRun({
+    runId, connectorId, stream: stream.name, status: summary.status, requests: summary.requests, retries: summary.retries,
+    rateLimitedMs: summary.rateLimitedMs, fieldStats: stats, lastError: summary.lastError, ...(watermark ? { watermark } : {}),
   });
+  summary.status = finished.status;
+  summary.lastError = finished.lastError;
+  if (finished.watermarkSaved) summary.watermark = watermark;
   if (summary.status === "degraded" || summary.status === "auth_failed")
     await store.raiseAlert(connectorId, summary.status, `${stream.name}: ${summary.lastError}`);
   if (FAILURE.includes(summary.status)) {
@@ -397,7 +413,7 @@ export async function runConnector(opts: {
   const lock = store.lockConnector ? await store.lockConnector(conn.metadata.id) : undefined;
   if (lock === null) throw new ConnectorBusy(conn.metadata.id);
   try {
-    return await runLocked(opts);
+    return await runLocked({ ...opts, ...(lock ? { lock } : {}) });
   } finally {
     await lock?.release(); // also on failure or throw
   }
@@ -409,6 +425,7 @@ async function runLocked(opts: {
   store: RunStore;
   streams?: string[];
   trigger?: RunTrigger;
+  lock?: RunLockHandle;
 }): Promise<RunSummary[]> {
   const { connector: conn, store } = opts;
   const state = await store.connectorState(conn.metadata.id);

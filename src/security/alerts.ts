@@ -13,7 +13,7 @@ export async function raiseAlertOnce(pool: pg.Pool, connectorId: string, kind: s
   return true;
 }
 
-export type DeliveryReport = { sent: number; noChannel: number; failed: number };
+export type DeliveryReport = { sent: number; noChannel: number; failed: number; alreadyDelivered: number };
 
 /**
  * Deliver pending alerts through the broker. The broker reads each row itself, sends it and marks it delivered;
@@ -28,7 +28,7 @@ export async function deliverAlerts(pool: pg.Pool, admin: BrokerAdmin, limit = 2
       [limit],
     )
   ).rows as { id: number; connector_id: string | null; kind: string; message: string }[];
-  const report: DeliveryReport = { sent: 0, noChannel: 0, failed: 0 };
+  const report: DeliveryReport = { sent: 0, noChannel: 0, failed: 0, alreadyDelivered: 0 };
   for (const a of rows) {
     if (!a.connector_id) {
       await pool.query("update alerts set delivered = true, channel = 'none', delivered_at = now() where id = $1", [a.id]);
@@ -40,8 +40,15 @@ export async function deliverAlerts(pool: pg.Pool, admin: BrokerAdmin, limit = 2
       if (r.delivered) report.sent++;
       else if (r.channel === "none") report.noChannel++;
       else report.failed++;
-    } catch {
-      await pool.query("update alerts set channel = 'error' where id = $1", [a.id]);
+    } catch (e) {
+      // The broker may have delivered and committed the alert even though we got an error (e.g. its response was
+      // lost). Only a still-pending row is marked as an error: a delivered row keeps channel 'slack' and stays in the
+      // throttle's count. "Already delivered" means it is done, not that this delivery failed.
+      if ((e as { statusCode?: number }).statusCode === 409) {
+        report.alreadyDelivered++;
+        continue;
+      }
+      await pool.query("update alerts set channel = 'error' where id = $1 and delivered = false", [a.id]);
       report.failed++;
     }
   }

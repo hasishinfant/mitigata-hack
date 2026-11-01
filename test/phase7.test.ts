@@ -230,7 +230,7 @@ describe.skipIf(!hasDb)("breach features", () => {
     expect(kinds).toEqual(["auth_failed", "consecutive_failures"]); // auth_failed de-duplicated; streak alert fires once at 2
 
     const d = await deliverAlerts(appPool, remote);
-    expect(d).toEqual({ sent: 2, noChannel: 0, failed: 0 });
+    expect(d).toEqual({ sent: 2, noChannel: 0, failed: 0, alreadyDelivered: 0 });
     expect(mock.slack.map((m) => m.text)).toEqual([
       ":rotating_light: [IntegrateX] mock-github-members · auth_failed: members: HTTP 401: credentials rejected",
       ":rotating_light: [IntegrateX] mock-github-members · consecutive_failures: 2 consecutive failed runs; last: HTTP 401: credentials rejected",
@@ -273,7 +273,7 @@ describe.skipIf(!hasDb)("breach features", () => {
     ({ srv, worker } = await start());
     try {
       await expect(worker.notify(await alert("other-members", "six"))).rejects.toMatchObject({ statusCode: 429 });
-      expect(await deliverAlerts(appPool, worker)).toEqual({ sent: 0, noChannel: 0, failed: 3 });
+      expect(await deliverAlerts(appPool, worker)).toEqual({ sent: 0, noChannel: 0, failed: 3, alreadyDelivered: 0 });
     } finally {
       await srv.app.close();
     }
@@ -286,11 +286,43 @@ describe.skipIf(!hasDb)("breach features", () => {
     expect((await appPool.query("select message from alerts where not delivered order by id")).rows.map((r) => r.message)).toEqual(["three", "five", "six"]);
   });
 
+  it("lost broker response after a committed delivery: the alert stays delivered and still counts toward the throttle", async () => {
+    const hook = `http://localhost:${env.MOCK_PORT}/services/T0001/B0001/${randomBytes(12).toString("hex")}`;
+    await remote.register(ghWith(GH_CRED, "alerts: { slack_webhook_ref: slack_secops }\n"), "add");
+    await remote.putSecret("demo", "slack_secops", hook);
+    const srv = createBrokerServer({ pool: brokerPool, masterKey, env, alertHosts: ["localhost"], notifyLimit: { perConnector: 1, total: 10, windowMs: 60_000 } });
+    const sock = join(tmpdir(), `ixb7l-${process.pid}-${randomBytes(3).toString("hex")}.sock`);
+    await listenOnSocket(srv.app, sock);
+    try {
+      const real = createRemoteBroker(sock);
+      // The broker sends and commits; then its answer never arrives (socket reset).
+      const lossy = { ...real, notify: async (id: number) => (await real.notify(id), Promise.reject(new Error("socket hang up"))) };
+      await appPool.query("insert into alerts (connector_id, kind, message) values ('mock-github-members', 'test', 'first')");
+      expect(await deliverAlerts(appPool, lossy)).toEqual({ sent: 0, noChannel: 0, failed: 1, alreadyDelivered: 0 });
+      expect((await appPool.query("select delivered, channel from alerts where message = 'first'")).rows[0]).toEqual({ delivered: true, channel: "slack" });
+      expect(mock.slack).toHaveLength(1);
+
+      // It still counts: the per-connector limit (1) is used up, so the next alert is throttled, not sent.
+      await appPool.query("insert into alerts (connector_id, kind, message) values ('mock-github-members', 'test', 'second')");
+      expect(await deliverAlerts(appPool, real)).toEqual({ sent: 0, noChannel: 0, failed: 1, alreadyDelivered: 0 });
+      expect(mock.slack).toHaveLength(1);
+
+      // A caller that sees "already delivered" (e.g. it read the row before another delivery committed) counts it as done.
+      const id = Number((await appPool.query("select id from alerts where message = 'first'")).rows[0].id);
+      const stale = { ...real, notify: async () => real.notify(id) };
+      await appPool.query("update alerts set delivered = false, channel = 'error' where message = 'second'"); // still pending
+      expect((await deliverAlerts(appPool, stale)).alreadyDelivered).toBe(1);
+      expect((await appPool.query("select delivered, channel from alerts where message = 'first'")).rows[0]).toEqual({ delivered: true, channel: "slack" });
+    } finally {
+      await srv.app.close();
+    }
+  });
+
   it("alert webhook pointing at a non-allowed host is refused and retried later", async () => {
     await remote.register(ghWith(GH_CRED, "alerts: { slack_webhook_ref: slack_secops }\n"), "add");
     await remote.putSecret("demo", "slack_secops", "https://exfil.example/services/a/b/c");
     await appPool.query("insert into alerts (connector_id, kind, message) values ('mock-github-members', 'test', 'hello')");
-    expect(await deliverAlerts(appPool, remote)).toEqual({ sent: 0, noChannel: 0, failed: 1 });
+    expect(await deliverAlerts(appPool, remote)).toEqual({ sent: 0, noChannel: 0, failed: 1, alreadyDelivered: 0 });
     expect((await appPool.query("select delivered, channel from alerts")).rows[0]).toEqual({ delivered: false, channel: "error" });
   });
 
@@ -301,7 +333,7 @@ describe.skipIf(!hasDb)("breach features", () => {
     await appPool.query(
       "insert into alerts (connector_id, kind, message, created_at) values ('mock-github-members', 'old', 'still pending', now() - interval '2 days')",
     );
-    expect(await deliverAlerts(appPool, remote)).toEqual({ sent: 1, noChannel: 0, failed: 0 });
+    expect(await deliverAlerts(appPool, remote)).toEqual({ sent: 1, noChannel: 0, failed: 0, alreadyDelivered: 0 });
   });
 
   it("incremental sync: watermark injected next run; only changed records fetched; never moves backwards", async () => {

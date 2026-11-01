@@ -29,7 +29,7 @@ export class DenialLog {
       this.arm();
       return;
     }
-    if (w) await this.summary(w);
+    if (w?.suppressed) await this.summary(w); // only when something was suppressed: no records = 0 rows
     this.windows.set(key, { start: t, suppressed: 0, entry });
     await this.audit({ ...entry, records: 1 });
   }

@@ -49,3 +49,29 @@ describe("secret scanner", () => {
     expect(findSecrets("00u1a2b3-c4d5-4e6f-8a9b-0c1d2e3f4a5b 550e8400-e29b-41d4-a716-446655440000")).toEqual([]);
   });
 });
+
+describe("bounded denial log", () => {
+  it("writes a summary only when something was suppressed; counts stay exact", async () => {
+    const { DenialLog } = await import("../src/broker/limits.ts");
+    const rows: { records?: number | null; decision: string }[] = [];
+    let t = 0;
+    const log = new DenialLog(async (e) => void rows.push({ records: e.records, decision: e.decision }), 60_000, () => t);
+    const d = { action: "admin", decision: "deny: x" };
+    await log.record("k", d); // window 1: one denial, nothing suppressed
+    t += 61_000;
+    await log.record("k", d); // window 2: no summary for window 1
+    await log.record("k", d);
+    await log.record("k", d); // two suppressed
+    t += 61_000;
+    await log.record("k", d); // window 3: summary for window 2 first
+    await log.close();
+    expect(rows).toEqual([
+      { records: 1, decision: "deny: x" },
+      { records: 1, decision: "deny: x" },
+      { records: 2, decision: "deny: x (and 2 more within 60 s, summarised)" },
+      { records: 1, decision: "deny: x" },
+    ]);
+    expect(rows.every((r) => (r.records ?? 0) > 0)).toBe(true);
+    expect(rows.reduce((n, r) => n + (r.records ?? 0), 0)).toBe(5);
+  });
+});

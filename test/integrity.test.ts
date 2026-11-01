@@ -50,13 +50,12 @@ function memStore() {
     },
     async finishRun(r) {
       s.runs.push(r);
+      if (r.watermark) s.watermark = r.watermark; // same contract as Postgres: status and watermark together
+      return { status: r.status, ...(r.lastError !== undefined ? { lastError: r.lastError } : {}), watermarkSaved: Boolean(r.watermark) };
     },
     async loadCheckpoint() {
       if (!s.checkpoint && !s.watermark) return null;
       return { ...(s.checkpoint ?? { configHash: "" }), ...(s.watermark ? { cursorValue: s.watermark } : {}) };
-    },
-    async saveWatermark(_c, _s, v) {
-      s.watermark = v;
     },
     async previousFieldStats(): Promise<FieldStats | null> {
       return [...s.runs].reverse().find((r) => r.status === "success" || r.status === "partial")?.fieldStats ?? null;
