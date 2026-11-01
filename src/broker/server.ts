@@ -336,7 +336,7 @@ export function createBrokerServer(opts: BrokerServerOptions) {
         return r;
       } catch (e) {
         await audit({ action: "advisor", method: "POST", host: gHost, path: "/chat/completions", decision: `error: ${(e as Error).name}` });
-        throw Object.assign(new Error(`Groq call failed: ${(e as Error).message.slice(0, 200)}`), { statusCode: 502 });
+        throw Object.assign(new Error(`Groq call failed: ${(e as Error).message.slice(0, 200)}`), { statusCode: 424 }); // 4xx so the reason (provider message, no secrets) reaches the operator
       }
     }
     const baseURL = env.IX_ADVISOR_BASE_URL || undefined;
@@ -348,7 +348,7 @@ export function createBrokerServer(opts: BrokerServerOptions) {
       return r;
     } catch (e) {
       await audit({ action: "advisor", method: "POST", host, path: "/v1/messages", decision: `error: ${(e as Error).name}` });
-      throw Object.assign(new Error(`Claude call failed: ${(e as Error).message.slice(0, 200)}`), { statusCode: 502 });
+      throw Object.assign(new Error(`Claude call failed: ${(e as Error).message.slice(0, 200)}`), { statusCode: 424 }); // 4xx so the reason (provider message, no secrets) reaches the operator
     }
   });
 
