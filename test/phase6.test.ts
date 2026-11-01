@@ -361,6 +361,18 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
       expect(req.headers.authorization).toBe("Bearer gsk_test_key_000000000000");
       expect(JSON.stringify(req.body)).not.toContain("gsk_test");
       expect(JSON.stringify(req.body.messages)).toContain("<evidence_pack>");
+      // A model without strict schema decoding (Llama): JSON mode, schema in the system prompt.
+      const s3 = createBrokerServer({ pool: brokerPool, masterKey, env: { ...env, IX_ADVISOR_GROQ_BASE_URL: groqUrl, IX_ADVISOR_GROQ_MODEL: "llama-3.3-70b-versatile" }, adminToken });
+      const a3 = join(tmpdir(), `ixb-groq3-${process.pid}.sock`);
+      await listenOnSocket(s3.adminApp, a3);
+      try {
+        await advise(appPool, { ai: true, narrate: (x) => createRemoteBroker(socketPath, { adminSocketPath: a3, adminToken }).narrate(x) });
+        const llama = seen.at(-1)!;
+        expect(llama.body).toMatchObject({ model: "llama-3.3-70b-versatile", response_format: { type: "json_object" } });
+        expect(String((llama.body.messages as { content: string }[])[0]!.content)).toContain('"evidence_ids"');
+      } finally {
+        await s3.adminApp.close();
+      }
     } finally {
       await s2.adminApp.close();
       await groq.close();

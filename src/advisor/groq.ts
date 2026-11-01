@@ -9,6 +9,13 @@ export const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
 
 export async function groqNarrative(o: { apiKey: string; baseURL?: string; model?: string; system: string; user: string }): Promise<ClaudeNarrative> {
   const model = o.model || GROQ_DEFAULT_MODEL;
+  // Strict JSON-schema decoding exists only on some Groq models (gpt-oss). Others (e.g. Llama) get JSON mode with the
+  // schema in the system prompt; the caller validates the result either way.
+  const strict = /gpt-oss/.test(model);
+  const responseFormat = strict
+    ? { type: "json_schema", json_schema: { name: "advisor_output", strict: true, schema: ADVISOR_JSON_SCHEMA } }
+    : { type: "json_object" };
+  const system = strict ? o.system : `${o.system}\nReply with one JSON object only, matching this JSON Schema:\n${JSON.stringify(ADVISOR_JSON_SCHEMA)}`;
   const res = await request(`${(o.baseURL || GROQ_BASE_URL).replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: { authorization: `Bearer ${o.apiKey}`, "content-type": "application/json" },
@@ -16,9 +23,9 @@ export async function groqNarrative(o: { apiKey: string; baseURL?: string; model
       model,
       temperature: 0.2,
       max_completion_tokens: 4000,
-      response_format: { type: "json_schema", json_schema: { name: "advisor_output", strict: true, schema: ADVISOR_JSON_SCHEMA } },
+      response_format: responseFormat,
       messages: [
-        { role: "system", content: o.system },
+        { role: "system", content: system },
         { role: "user", content: o.user },
       ],
     }),
