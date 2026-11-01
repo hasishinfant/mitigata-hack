@@ -121,6 +121,15 @@ Limits:
 - A worker can still create ledger rows through policy-denied `/v1/request` calls (one row per denial; posture cards count them). Per-connector request rate limits for denials aren't implemented yet.
 - In `pnpm dev`, every process runs as **one OS user**. Code running as that user can read `.env.broker` and `.env.admin` from disk. The socket split stops a worker that can only talk to the broker; it does not stop full code execution as the same user. For real isolation, run the broker as its own OS user and make `.env.broker` readable only by it.
 
+## Accepted residual risks
+
+Accepted on 2026-11-01 for the current development and hackathon scope only. These are **known, unresolved risks, not security controls**. They don't justify any claim of production-grade isolation or alert integrity.
+
+| Risk | What remains possible | Planned fix |
+|---|---|---|
+| Alert provenance and an unbounded pending queue | The app role can insert alert rows, so a compromised worker can queue forged alerts. The throttle limits how fast they're sent, not how many queue up. Forged rows ahead of real ones can delay real alerts. | T11 |
+| Same-UID process isolation | In `pnpm dev` the broker, API, worker and scheduler run as one OS user. Code running as that user can read `.env.broker` and `.env.admin`, which defeats the socket split and the encryption at rest. | T12 |
+
 ## Where things are
 
 | Path | What |
