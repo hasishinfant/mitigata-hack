@@ -351,6 +351,7 @@ $("panic-close").addEventListener("click", () => $("panic-result").close());
 async function loadRecords() {
   const params = new URLSearchParams({ limit: "200" });
   if ($("source").value.trim()) params.set("source", $("source").value.trim());
+  if ($("search").value.trim()) params.set("q", $("search").value.trim());
   try {
     const r = await api(`/v1/records/${$("entity").value}?${params}`);
     table($("records"), r.rows);
@@ -360,6 +361,7 @@ async function loadRecords() {
   }
 }
 $("load-records").addEventListener("click", loadRecords);
+for (const id of ["source", "search"]) $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") loadRecords(); });
 
 // ---------- quarantine ----------
 async function loadQuarantine() {

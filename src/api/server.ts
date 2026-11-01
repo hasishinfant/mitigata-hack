@@ -99,7 +99,7 @@ export function buildApi(opts: ApiOptions) {
     const q = req.query as Record<string, string | undefined>;
     if (q.since && Number.isNaN(Date.parse(q.since))) return reply.code(400).send({ error: "since must be an ISO date" });
     return queryRecords(opts.pool, entity, {
-      source: q.source, since: q.since, type: q.type, tenant: q.tenant,
+      source: q.source, since: q.since, type: q.type, tenant: q.tenant, search: q.q?.slice(0, 200),
       limit: Math.min(Number(q.limit) || 50, 1000), offset: Math.max(Number(q.offset) || 0, 0), withAttributes: q.attributes === "1",
     });
   });
