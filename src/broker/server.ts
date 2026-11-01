@@ -29,8 +29,9 @@ import { configSigKey, signConfig, verifyConfigSig } from "./configSig.ts";
 import { appendLedger, verifyLedger } from "./ledger.ts";
 import { receiptDigest } from "../engine/receipt.ts";
 import { DenialLog } from "./limits.ts";
+import { canaryKey, containsCanary, makeCanary, makeCanaryUrl } from "./canary.ts";
 import type { Clock } from "./retry.ts";
-import { chainSecretSources, dbSecretSource, deleteSecret, envSecretSource, listSecrets, putSecret } from "./secrets.ts";
+import { chainSecretSources, dbSecretSource, deleteSecret, envSecretSource, listSecrets, putSecret, unseal } from "./secrets.ts";
 import { BrokerError, type BrokerRequest, type SecretSource } from "./types.ts";
 
 const CONFIG_TTL_MS = 2000;
@@ -78,7 +79,36 @@ export function createBrokerServer(opts: BrokerServerOptions) {
   const env = opts.env ?? process.env;
   const sigKey = configSigKey(opts.masterKey);
   const store = dbSecretSource(opts.pool, opts.masterKey);
-  const secrets: SecretSource = opts.envSecrets ? chainSecretSources(store, envSecretSource(env)) : store;
+  const rawSecrets: SecretSource = opts.envSecrets ? chainSecretSources(store, envSecretSource(env)) : store;
+  // Canary guard: every secret the broker is about to USE is checked. A decoy is never used; using one is an alarm.
+  const ckey = canaryKey(opts.masterKey);
+  const canaryAlert = async (message: string) => {
+    await opts.pool.query("insert into alerts (connector_id, kind, message) values (null, 'canary_triggered', $1)", [message.slice(0, 1000)]);
+  };
+  const secrets: SecretSource = {
+    async get(tenant, ref) {
+      const v = await rawSecrets.get(tenant, ref);
+      if (v && containsCanary(ckey, v)) {
+        const msg = `decoy credential ${tenant}/${ref} was about to be used inside the hub: a config or request references a canary. Treat the credential store as exposed.`;
+        await denials.record(`canary:${tenant}/${ref}`, { action: "canary", path: `${tenant}/${ref}`, decision: `deny: ${msg}` });
+        await canaryAlert(msg);
+        throw new BrokerError("policy_denied", `secret "${ref}" is a decoy credential; refusing to use it (security alert raised)`);
+      }
+      return v;
+    },
+  };
+  /** Decrypt every stored secret and keep the decoys (no last_used_at update: listing is not use). */
+  const canaries = async (tenant?: string) => {
+    const rows = (
+      await opts.pool.query("select tenant_id, ref, ciphertext, wrapped_dek, nonce, created_at from credentials where ($1::text is null or tenant_id = $1) order by tenant_id, ref", [tenant ?? null])
+    ).rows;
+    const out: { tenant: string; ref: string; kind: "url" | "key"; value: string; created_at: string }[] = [];
+    for (const r of rows) {
+      const value = unseal(opts.masterKey, r.tenant_id, r.ref, { ciphertext: r.ciphertext, wrappedDek: r.wrapped_dek, nonce: r.nonce });
+      if (containsCanary(ckey, value)) out.push({ tenant: r.tenant_id, ref: r.ref, kind: /^https?:\/\//.test(value) ? "url" : "key", value, created_at: r.created_at });
+    }
+    return out;
+  };
   const audit = async (e: Parameters<typeof appendLedger>[1]): Promise<void> => void (await appendLedger(opts.pool, e));
 
   const cache = new Map<string, { conn: ResolvedConnector; at: number }>();
@@ -281,6 +311,35 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     forget(id);
     await audit({ connectorId: id, action: "enable", decision: "allow" });
     return { id, status: "enabled" };
+  });
+
+  // ---- credential canaries ----
+  adminApp.post("/v1/canaries", async (req) => {
+    const { tenant = "demo", ref, kind = "key", prefix = "" } = (req.body ?? {}) as { tenant?: string; ref?: string; kind?: string; prefix?: string };
+    if (!TENANT_RE.test(tenant) || typeof ref !== "string" || !REF_RE.test(ref)) throw Object.assign(new Error("bad tenant or ref"), { statusCode: 400 });
+    if (kind !== "key" && kind !== "url") throw Object.assign(new Error('kind must be "key" or "url"'), { statusCode: 400 });
+    if (!/^[A-Za-z0-9_]{0,12}$/.test(prefix)) throw Object.assign(new Error("prefix: up to 12 letters, digits or _"), { statusCode: 400 });
+    if ((await opts.pool.query("select 1 from credentials where tenant_id = $1 and ref = $2", [tenant, ref])).rowCount)
+      throw Object.assign(new Error(`secret ${tenant}/${ref} already exists; a canary never replaces a real secret`), { statusCode: 409 });
+    const base = env.IX_CANARY_BASE_URL || `http://localhost:${env.IX_API_PORT || 7070}`;
+    const value = kind === "url" ? makeCanaryUrl(ckey, base) : makeCanary(ckey, prefix);
+    await putSecret(opts.pool, opts.masterKey, tenant, ref, value);
+    await audit({ action: "canary_create", path: `${tenant}/${ref}`, decision: `allow: ${kind} decoy` });
+    // The value is a decoy, so returning it is safe: the operator may plant copies (fake .env files, docs, tickets).
+    return { tenant, ref, kind, value };
+  });
+  adminApp.get("/v1/canaries", async (req) =>
+    ({ canaries: (await canaries((req.query as { tenant?: string }).tenant)).map(({ value: _v, ...c }) => c) }));
+  // The API's canary listener forwards anything that looks like a token; only the broker can tell a decoy.
+  adminApp.post("/v1/canaries/check", async (req) => {
+    const { text = "", ip = null, ua = null } = (req.body ?? {}) as { text?: string; ip?: string | null; ua?: string | null };
+    if (!containsCanary(ckey, String(text))) return { canary: false };
+    const hit = (await canaries()).find((c) => String(text).includes(c.kind === "url" ? c.value.split("/").pop()! : c.value));
+    const what = hit ? `${hit.tenant}/${hit.ref}` : "an unknown decoy";
+    const msg = `decoy credential ${what} was USED OUTSIDE the hub, from ${ip ?? "unknown IP"}${ua ? ` (${String(ua).slice(0, 120)})` : ""}. Someone has a copy of the credential store or a planted file.`;
+    await denials.record(`canary-hit:${what}`, { action: "canary", path: what, host: ip ? String(ip).slice(0, 64) : null, decision: `deny: ${msg}` });
+    await canaryAlert(msg);
+    return { canary: true, ref: hit?.ref ?? null };
   });
 
   adminApp.put("/v1/secrets/:tenant/:ref", async (req) => {

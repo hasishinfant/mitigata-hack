@@ -196,6 +196,35 @@ program
     }),
   );
 
+const canary = program.command("canary").description("decoy credentials: stored like real secrets; any use raises a critical alert");
+canary
+  .command("create")
+  .description("create a decoy secret (never replaces a real one)")
+  .argument("<ref>", "a believable name, e.g. okta_admin_token, aws_root_key, slack_webhook_prod")
+  .option("--url", "a webhook-style URL decoy that points at the hub's canary listener (detects use outside the hub)")
+  .option("--prefix <p>", "token prefix to look real, e.g. ghp_ or sk_live_", "")
+  .option("-t, --tenant <tenant>", "tenant", "demo")
+  .option("--print", "print the decoy value, to plant copies (fake .env files, tickets, docs)")
+  .action(
+    action(async (ref: string, opts: { url?: boolean; prefix: string; tenant: string; print?: boolean }) => {
+      const r = await broker().createCanary({ tenant: opts.tenant, ref, kind: opts.url ? "url" : "key", prefix: opts.prefix });
+      console.log(`${green("✔")} decoy ${r.tenant}/${r.ref} (${r.kind}) stored encrypted, indistinguishable from a real secret`);
+      if (opts.print) console.log(r.value);
+      else console.log(dim("  use --print to get the value to plant elsewhere"));
+    }),
+  );
+canary
+  .command("list")
+  .description("which stored secrets are decoys (only the broker can tell)")
+  .option("-t, --tenant <tenant>", "tenant")
+  .action(
+    action(async (opts: { tenant?: string }) => {
+      const rows = await broker().listCanaries(opts.tenant);
+      if (!rows.length) return console.log(dim("no decoys"));
+      for (const c of rows) console.log(`${c.tenant}/${c.ref}  ${c.kind}  ${String(c.created_at).slice(0, 19)}`);
+    }),
+  );
+
 program
   .command("receipts")
   .description("Sync Integrity Receipts for a connector: decision, what was published, digest and ledger anchor")

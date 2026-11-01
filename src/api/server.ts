@@ -113,6 +113,16 @@ export function buildApi(opts: ApiOptions) {
     return { alerts: (await opts.pool.query("select id, connector_id, kind, message, created_at, delivered, channel from alerts order by id desc limit $1", [limit])).rows };
   });
 
+  // ---- canary listener ----
+  // Decoy URLs point here. Anything that looks like a token is forwarded to the broker (the only process that can
+  // recognise a decoy); a hit is a critical alert with the caller's IP. Always answers like a dead webhook.
+  const canaryListener = async (req: FastifyRequest, reply: FastifyReply) => {
+    const text = `${req.url} ${typeof req.body === "string" ? req.body.slice(0, 4096) : ""} ${String(req.headers.authorization ?? "")}`;
+    if (/[A-Za-z0-9_]{40,}/.test(text)) await opts.admin?.checkCanary({ text, ip: req.ip, ua: String(req.headers["user-agent"] ?? "") }).catch(() => {});
+    return reply.code(403).type("text/plain").send("invalid_token");
+  };
+  app.route({ method: ["GET", "POST", "PUT"], url: "/hooks/*", handler: canaryListener });
+
   // ---- integrity receipts and held syncs (T7/T8) ----
   app.get("/v1/connectors/:id/receipts", async (req) => {
     const limit = Math.min(Number((req.query as { limit?: string }).limit) || 20, 200);

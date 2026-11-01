@@ -12,6 +12,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import pg from "pg";
 import { parseMasterKey, unseal } from "../broker/secrets.ts";
+import { canaryKey, containsCanary } from "../broker/canary.ts";
 import { BROKER_ONLY_VARS, loadBrokerEnv } from "../envfiles.ts";
 
 export type Secret = { ref: string; value: string };
@@ -80,10 +81,10 @@ async function main(): Promise<void> {
   const masterKey = parseMasterKey(process.env.IX_MASTER_KEY);
   const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL_BROKER });
   const rows = (await pool.query("select tenant_id, ref, ciphertext, wrapped_dek, nonce from credentials")).rows;
-  const secrets: Secret[] = rows.map((r) => ({
-    ref: `${r.tenant_id}/${r.ref}`,
-    value: unseal(masterKey, r.tenant_id, r.ref, { ciphertext: r.ciphertext, wrappedDek: r.wrapped_dek, nonce: r.nonce }),
-  }));
+  const ckey = canaryKey(masterKey);
+  const secrets: Secret[] = rows
+    .map((r) => ({ ref: `${r.tenant_id}/${r.ref}`, value: unseal(masterKey, r.tenant_id, r.ref, { ciphertext: r.ciphertext, wrappedDek: r.wrapped_dek, nonce: r.nonce }) }))
+    .filter((s) => !containsCanary(ckey, s.value)); // decoys are meant to be planted: not a leak
   await pool.end();
 
   const repoFiles = execFileSync("git", ["ls-files", "-co", "--exclude-standard"], { encoding: "utf8" }).split("\n").filter(Boolean);

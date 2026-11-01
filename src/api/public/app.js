@@ -95,6 +95,18 @@ async function refresh() {
       ...Object.entries(h.summary).filter(([k]) => k !== "total").map(([k, v]) => el("span", { class: `chip` }, `${v} ${k.replace("_", " ")}`)),
     );
     $("cards").replaceChildren(...h.connectors.map(card));
+    // A canary fired: the credential store may be exposed. Shown above everything until it ages out (7 days).
+    const sec = (h.security && h.security.canary_alerts) || [];
+    let banner = $("canary-banner");
+    if (!banner) {
+      banner = el("div", { id: "canary-banner", class: "canary-banner hidden" });
+      $("cards").before(banner);
+    }
+    banner.classList.toggle("hidden", sec.length === 0);
+    banner.replaceChildren(...(sec.length
+      ? [el("strong", {}, `🚨 Decoy credential used (${sec.length} in the last 7 days): treat the credential store as exposed. Consider the kill switch.`),
+        ...sec.map((a) => el("div", {}, `${ago(a.created_at)}: ${a.message}`))]
+      : []));
     $("empty").classList.toggle("hidden", h.connectors.length > 0);
     $("updated").textContent = `updated ${new Date(h.generated_at).toLocaleTimeString()}`;
   } catch (e) {

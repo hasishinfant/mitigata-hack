@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { pathAllowed, hostAllowed } from "../src/broker/policy.ts";
 import { parsePath, resolvePath } from "../src/mapping/paths.ts";
@@ -125,5 +126,23 @@ describe("schema fingerprint and integrity evaluator", () => {
     const { receiptDigest } = await import("../src/engine/receipt.ts");
     expect(receiptDigest({ a: 1, b: { c: [1, 2], d: "x" } })).toBe(receiptDigest({ b: { d: "x", c: [1, 2] }, a: 1 }));
     expect(receiptDigest({ a: 1 })).not.toBe(receiptDigest({ a: 2 }));
+  });
+});
+
+describe("credential canaries", () => {
+  it("decoys carry a tag only the master key can produce; found in any text, never in random tokens", async () => {
+    const { canaryKey, containsCanary, makeCanary, makeCanaryUrl } = await import("../src/broker/canary.ts");
+    const k = canaryKey(Buffer.alloc(32, 7));
+    const other = canaryKey(Buffer.alloc(32, 8));
+    const c = makeCanary(k, "ghp_");
+    expect(c).toMatch(/^ghp_[0-9A-Za-z]{40}$/);
+    expect(containsCanary(k, c)).toBe(true);
+    expect(containsCanary(k, `Authorization: token ${c}`)).toBe(true);
+    expect(containsCanary(other, c)).toBe(false); // without the right master key it's just a random-looking token
+    const u = makeCanaryUrl(k, "https://hub.example.test/");
+    expect(u).toMatch(/^https:\/\/hub\.example\.test\/hooks\/services\/T\w{9}\/B\w{11}\/\w{40}$/);
+    expect(containsCanary(k, `POST ${new URL(u).pathname}`)).toBe(true);
+    for (let i = 0; i < 200; i++) expect(containsCanary(k, randomBytes(30).toString("base64url").replace(/[-]/g, "a"))).toBe(false);
+    expect(containsCanary(k, "ghp_" + "a".repeat(36))).toBe(false);
   });
 });

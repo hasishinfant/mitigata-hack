@@ -127,5 +127,9 @@ export async function getHealth(pool: pg.Pool, env: Record<string, string | unde
   }
   const summary: Record<string, number> = { total: items.length };
   for (const i of items) summary[i.health] = (summary[i.health] ?? 0) + 1;
-  return { generated_at: new Date(now).toISOString(), summary, connectors: items };
+  // Security banner: any canary that fired in the last 7 days means the credential store may be exposed.
+  const canaryAlerts = (
+    await pool.query("select id, message, created_at from alerts where kind = 'canary_triggered' and created_at > now() - interval '7 days' order by id desc limit 5")
+  ).rows;
+  return { generated_at: new Date(now).toISOString(), summary, connectors: items, security: { canary_alerts: canaryAlerts } };
 }

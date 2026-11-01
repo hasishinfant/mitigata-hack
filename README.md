@@ -152,6 +152,11 @@ Limits:
   - The provider must support DPoP (Okta does for service apps, for example); verify yours before enabling it.
   - Posture shows `token_binding` and flags OAuth connectors without it.
   - It doesn't help if an attacker controls the live broker process: they can sign proofs while they're inside it.
+- **Credential canaries (decoys).** `ix canary create okta_admin_token` stores a decoy that looks and is encrypted exactly like a real secret. Its value carries an HMAC tag keyed from the master key, so only the broker can tell it's a decoy (`ix canary list`).
+  - **Inside the hub:** if anything makes the broker use a decoy (a config or request referencing it), it's refused before any outbound call, logged, and raised as a critical `canary_triggered` alert.
+  - **Outside the hub:** `--url` decoys look like webhooks pointing at the hub's `/hooks/...` listener. Using one alarms with the caller's IP and user agent, and the dashboard shows a red banner. Use `--print` to plant copies in fake files.
+  - The leak check ignores decoys.
+  - Limit: a decoy API key tried directly at a real provider is only detected if that provider reports it. In production the listener must be reachable at `IX_CANARY_BASE_URL`; in dev the API binds to localhost.
 - **The app database role cannot undo the kill switch.** It can disable and pause connectors, but cannot re-enable a disabled one or change the active config version (column grants plus a trigger). `ix enable` goes through the broker.
 - **Signed configs.** Configs are registered through the broker, which signs each version (an HMAC keyed from the master key). At request time it only honours versions it signed, so a rogue config row can't point a stored secret at a new host.
   - This holds even if someone writes that row straight into the database.

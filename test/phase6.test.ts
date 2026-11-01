@@ -248,6 +248,44 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     ]);
   });
 
+  it("canaries: stored like real secrets; any use inside the hub is refused before calling out, and raises an alert", async () => {
+    await remote.putSecret("demo", "real_token", "a-real-secret-value-0000");
+    await expect(remote.createCanary({ ref: "real_token" })).rejects.toMatchObject({ statusCode: 409 }); // never replaces a real one
+    const c = await remote.createCanary({ ref: "mock_bearer", prefix: "ghp_" });
+    expect(c.value).toMatch(/^ghp_/);
+    expect((await remote.listSecrets("demo")).map((x) => x.ref)).toEqual(["mock_bearer", "real_token"]); // looks like any secret
+    expect(await remote.listCanaries("demo")).toEqual([expect.objectContaining({ ref: "mock_bearer", kind: "key" })]);
+    const raw = (await brokerPool.query("select ciphertext from credentials where ref = 'mock_bearer'")).rows[0].ciphertext as Buffer;
+    expect(raw.toString("latin1")).not.toContain(c.value); // encrypted like the rest
+
+    // A connector (e.g. registered by an intruder) that references the decoy: the broker refuses, nothing is sent.
+    await remote.register(fixture("mock-github-members.yaml"), "add", "test", { confirmHosts: true });
+    mock.calls.length = 0;
+    await expect(remote.request({ connectorId: "mock-github-members", method: "GET", url: `http://localhost:${port()}/orgs/acme/members` })).rejects.toMatchObject({
+      kind: "policy_denied", message: expect.stringMatching(/decoy credential; refusing to use it/),
+    });
+    expect(mock.calls).toHaveLength(0);
+    expect((await appPool.query("select kind, message from alerts where kind = 'canary_triggered'")).rows[0].message).toMatch(/demo\/mock_bearer was about to be used inside the hub/);
+    expect((await ledger()).map((e) => e.action)).toContain("canary");
+  });
+
+  it("canaries: a decoy URL used OUTSIDE the hub fires the alarm with the caller's IP; the dashboard shows a banner", async () => {
+    const c = await remote.createCanary({ ref: "slack_webhook_prod", kind: "url" });
+    expect(c.value).toMatch(/\/hooks\/services\//);
+    const app = buildApi({ pool: appPool, env, admin: remote, broker: remote, adminToken: "admin-token-for-test-123456" });
+    const path = new URL(c.value).pathname;
+    const res = await app.inject({ method: "POST", url: path, payload: { text: "hello" }, headers: { "user-agent": "curl/8.7.1" } });
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toBe("invalid_token"); // looks like a dead webhook
+    const alert = (await appPool.query("select message from alerts where kind = 'canary_triggered'")).rows[0].message;
+    expect(alert).toMatch(/demo\/slack_webhook_prod was USED OUTSIDE the hub, from 127\.0\.0\.1 \(curl\/8\.7\.1\)/);
+    // Random probes of the listener are not alarms.
+    await app.inject({ method: "GET", url: `/hooks/services/T1/B2/${"x".repeat(40)}` });
+    expect((await appPool.query("select count(*)::int n from alerts where kind = 'canary_triggered'")).rows[0].n).toBe(1);
+    const health = (await app.inject({ url: "/v1/health" })).json();
+    expect(health.security.canary_alerts).toHaveLength(1);
+  });
+
   it("receipts: the broker anchors each digest in the ledger once; the app role can't change one; edits are detected", async () => {
     await remote.register(fixture("mock-github-members.yaml"), "add");
     await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer);
