@@ -39,7 +39,7 @@ streams:
       description: { path: displayMessage }
       attributes:  { pick: [actor.alternateId, outcome.result, outcome.reason, client.ipAddress, "target[*].alternateId"] }
 
-schedule: { every: 15m, jitter: 60s }
+schedule: { every: 15m, jitter: 60s, incident_every: 2m }   # incident mode: poll the audit log every 2 minutes
 
 reliability:
   timeout: 20s

@@ -15,6 +15,7 @@ import { enqueueRun } from "../scheduler/queue.ts";
 import { panic } from "../security/panic.ts";
 import { getPosture } from "../security/posture.ts";
 import { capabilityMatrix } from "../security/capabilities.ts";
+import { closeIncident, declareIncident, incidentState } from "../security/incident.ts";
 import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "../store/connectors.ts";
 import { getHealth } from "../store/health.ts";
 import { listQuarantine } from "../store/quarantine.ts";
@@ -115,6 +116,16 @@ export function buildApi(opts: ApiOptions) {
   app.get("/v1/alerts", async (req) => {
     const limit = Math.min(Number((req.query as { limit?: string }).limit) || 50, 500);
     return { alerts: (await opts.pool.query("select id, connector_id, kind, message, created_at, delivered, channel from alerts order by id desc limit $1", [limit])).rows };
+  });
+
+  // ---- incident mode ----
+  app.get("/v1/incident", async () => incidentState(opts.pool));
+  app.post("/v1/incident", { preHandler: requireAdmin }, async (req, reply) => {
+    const { action, reason } = (req.body ?? {}) as { action?: string; reason?: string };
+    if (action === "start") await declareIncident(opts.pool, String(reason || "declared by an operator"), "api");
+    else if (action === "stop") await closeIncident(opts.pool, "api");
+    else return reply.code(400).send({ error: 'action must be "start" or "stop"' });
+    return incidentState(opts.pool);
   });
 
   // ---- canary listener ----

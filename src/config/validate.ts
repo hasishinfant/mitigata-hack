@@ -375,6 +375,9 @@ function semanticChecks(cfg: ConnectorConfig, add: Add): void {
     if (durationMs(cfg.schedule.every) < 60_000) add("error", ["schedule", "every"], "schedule.every must be at least 1m");
     if (cfg.schedule.jitter && durationMs(cfg.schedule.jitter) >= durationMs(cfg.schedule.every))
       add("error", ["schedule", "jitter"], "jitter must be shorter than every");
+    const ie = cfg.schedule.incident_every;
+    if (ie && durationMs(ie) < 60_000) add("error", ["schedule", "incident_every"], "incident_every must be at least 1m (rate limits still apply)");
+    if (ie && durationMs(ie) >= durationMs(cfg.schedule.every)) add("error", ["schedule", "incident_every"], "incident_every must be shorter than every");
   }
 
   // data minimisation

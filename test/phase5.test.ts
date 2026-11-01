@@ -12,6 +12,7 @@ import { enqueueRun, RUN_QUEUE, startBoss, type RunJob } from "../src/scheduler/
 import { createScheduler, nextRunAt } from "../src/scheduler/scheduler.ts";
 import { createPool, type Pool } from "../src/store/db.ts";
 import { registerConnector } from "../src/store/connectors.ts";
+import { validateConfigText } from "../src/config/validate.ts";
 import { deriveHealth } from "../src/store/health.ts";
 import { acquireRunLock, closeRunLocks } from "../src/store/runLock.ts";
 import { createPgRunStore } from "../src/store/runs.ts";
@@ -125,6 +126,46 @@ describe.skipIf(!hasDb)("scheduler, worker, API", () => {
     } finally {
       await live!.release();
     }
+  });
+
+  it("incident mode: a security alert pulls fast connectors in and polls them at incident_every; stop or expiry restores normal", async () => {
+    const fastYaml = fixture("mock-github-members.yaml").replace("schedule: { every: 1h }", "schedule: { every: 1h, incident_every: 2m }");
+    await registerConnector(regPool(), fastYaml, { env });
+    await register("mock-nvd-cves.yaml"); // every 6h, no incident_every
+    await scheduler().tick(); // both run once (first sighting)
+    await boss.deleteAllJobs(RUN_QUEUE);
+    t += 5 * 60_000;
+    expect((await scheduler().tick()).enqueued).toEqual([]); // nothing due for an hour
+
+    // A canary fires (raised by the broker): incident mode.
+    await pool.query("insert into alerts (connector_id, kind, message) values (null, 'canary_triggered', 'decoy used')");
+    const r = await scheduler().tick();
+    expect(r.incident?.active).toBe(true);
+    expect(r.fast).toEqual(["mock-github-members"]);
+    expect(r.enqueued).toEqual(["mock-github-members"]); // pulled in to now
+    const next = (await pool.query("select id, next_run_at from connectors order by id")).rows;
+    expect(next[0].next_run_at).toBe(new Date(t + 2 * 60_000).toISOString()); // every 2m during the incident
+    expect(Date.parse(next[1].next_run_at)).toBeGreaterThan(t + 60 * 60_000); // the other connector is untouched
+
+    // Stop: back to the normal interval on its next run.
+    await boss.deleteAllJobs(RUN_QUEUE);
+    await pool.query("insert into alerts (connector_id, kind, message, delivered) values (null, 'incident_closed', 'closed', true)");
+    t += 2 * 60_000;
+    const after = await scheduler().tick();
+    expect(after.incident?.active).toBe(false);
+    expect(after.enqueued).toEqual(["mock-github-members"]); // it was already due
+    expect((await pool.query("select next_run_at from connectors where id = 'mock-github-members'")).rows[0].next_run_at).toBe(new Date(t + 3_600_000).toISOString());
+
+    // Expiry: a security alert older than the window (2h) no longer counts.
+    await pool.query("insert into alerts (connector_id, kind, message, created_at) values (null, 'foreign_ip_use', 'old', $1)", [new Date(t - 3 * 3_600_000)]);
+    expect((await scheduler().tick()).incident?.active).toBe(false);
+  });
+
+  it("incident_every is validated: at least 1m, and shorter than every", () => {
+    const v = (sched: string) => validateConfigText(fixture("mock-github-members.yaml").replace("schedule: { every: 1h }", sched), { env }).errors.map((e) => e.message);
+    expect(v("schedule: { every: 1h, incident_every: 30s }")).toContain("incident_every must be at least 1m (rate limits still apply)");
+    expect(v("schedule: { every: 10m, incident_every: 10m }")).toContain("incident_every must be shorter than every");
+    expect(v("schedule: { every: 15m, incident_every: 2m }")).toEqual([]);
   });
 
   it("exclusive queue: a manual run can't double up with a queued one", async () => {

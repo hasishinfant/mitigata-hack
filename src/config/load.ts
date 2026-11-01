@@ -20,7 +20,7 @@ export type ResolvedConnector = ConnectorConfig & {
     retries: { max: number; baseMs: number; jitter: boolean };
     rateLimit: { requestsPerMinute: number; respectRetryAfter: boolean; maxWaitMs: number };
     breaker: { failuresToOpen: number; coolDownMs: number };
-    schedule?: { everyMs: number; jitterMs: number };
+    schedule?: { everyMs: number; jitterMs: number; incidentEveryMs?: number };
     allowedPaths: string[]; // GET paths (plus the OAuth token path, POST only)
     readOnlyPost: string[]; // declared read-only search endpoints
     tokenPath?: string; // OAuth token endpoint path: the only other POST target
@@ -55,7 +55,12 @@ export function resolveConnector(cfg: ConnectorConfig, configHash: string): Reso
         coolDownMs: durationMs(r.circuit_breaker?.cool_down ?? "10m"),
       },
       ...(cfg.schedule
-        ? { schedule: { everyMs: durationMs(cfg.schedule.every), jitterMs: cfg.schedule.jitter ? durationMs(cfg.schedule.jitter) : 0 } }
+        ? {
+            schedule: {
+              everyMs: durationMs(cfg.schedule.every), jitterMs: cfg.schedule.jitter ? durationMs(cfg.schedule.jitter) : 0,
+              ...(cfg.schedule.incident_every ? { incidentEveryMs: durationMs(cfg.schedule.incident_every) } : {}),
+            },
+          }
         : {}),
       allowedPaths: cfg.policy.allowed_paths ?? implicitPaths,
       readOnlyPost: cfg.policy.read_only_post ?? [],

@@ -90,3 +90,4 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 .canary-banner div { margin-top: 4px; }
 .cap-enforced, .cap-monitored { color: var(--green); } .cap-available { color: var(--amber); font-weight: 600; }
 .cap-unknown { color: var(--amber); } .cap-unsupported, .cap-not_applicable { color: var(--muted); }
+.incident-banner { border: 2px solid var(--amber); background: #422006; color: #fde68a; border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 13px; }

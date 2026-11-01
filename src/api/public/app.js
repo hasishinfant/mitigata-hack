@@ -58,7 +58,7 @@ function card(c) {
     el("dt", {}, "Records pulled"), el("dd", {}, lr ? `${num(lr.records_pulled)} (last run)` : "—"),
     el("dt", {}, "In store"), el("dd", {}, num(c.records_in_store)),
     el("dt", {}, "Quarantined"), el("dd", {}, num(c.quarantine_total)),
-    el("dt", {}, "Schedule"), el("dd", {}, c.schedule_every ? `every ${c.schedule_every} · next ${ago(c.next_run_at)}` : "on demand"),
+    el("dt", {}, "Schedule"), el("dd", {}, c.schedule_every ? `every ${c.schedule_every}${c.schedule_incident_every ? ` (incident: ${c.schedule_incident_every})` : ""} · next ${ago(c.next_run_at)}` : "on demand"),
     lr && (lr.retries || lr.rate_limited_ms) ? [el("dt", {}, "Reliability"), el("dd", {}, `${lr.retries} retries · waited ${(lr.rate_limited_ms / 1000).toFixed(1)}s`)] : null,
   );
   const strip = el("div", { class: "strip", title: "recent runs, newest first" },
@@ -103,6 +103,20 @@ async function refresh() {
       $("cards").before(banner);
     }
     banner.classList.toggle("hidden", sec.length === 0);
+    // Incident mode: audit-log connectors poll faster until the window passes or someone stops it.
+    const inc = h.security && h.security.incident;
+    let ib = $("incident-banner");
+    if (!ib) {
+      ib = el("div", { id: "incident-banner", class: "incident-banner hidden" });
+      banner.after(ib);
+    }
+    ib.classList.toggle("hidden", !(inc && inc.active));
+    const fastIds = h.connectors.filter((c) => c.schedule_incident_every).map((c) => `${c.id} every ${c.schedule_incident_every}`);
+    ib.replaceChildren(...(inc && inc.active
+      ? [el("strong", {}, `⚡ Incident mode since ${ago(inc.since)} (until ${new Date(inc.until).toLocaleTimeString()}): `),
+        el("span", {}, fastIds.length ? `polling faster: ${fastIds.join(", ")}` : "no connector has schedule.incident_every"),
+        el("div", { class: "muted" }, inc.reason || "")]
+      : []));
     banner.replaceChildren(...(sec.length
       ? [el("strong", {}, `🚨 Decoy credential used (${sec.length} in the last 7 days): treat the credential store as exposed. Consider the kill switch.`),
         ...sec.map((a) => el("div", {}, `${ago(a.created_at)}: ${a.message}`))]

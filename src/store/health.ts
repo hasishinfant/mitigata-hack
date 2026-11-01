@@ -4,6 +4,7 @@ import type pg from "pg";
 import { getPosture } from "../security/posture.ts";
 import { loadActiveConnector } from "./connectors.ts";
 import { integritySummary } from "./staging.ts";
+import { incidentState } from "../security/incident.ts";
 
 export type Health = "healthy" | "warning" | "degraded" | "failing" | "stale" | "running" | "paused" | "disabled" | "never_run" | "config_error";
 
@@ -106,6 +107,7 @@ export async function getHealth(pool: pg.Pool, env: Record<string, string | unde
       entities: cfg ? [...new Set(cfg.streams.map((s) => s.entity))] : [],
       streams: latest.map((r) => ({ name: r.stream, status: r.status, records_ok: r.records_ok, last_error: r.last_error, started_at: r.started_at })),
       schedule_every: cfg?.schedule?.every ?? null,
+      schedule_incident_every: cfg?.schedule?.incident_every ?? null,
       next_run_at: c.next_run_at,
       last_run: last
         ? {
@@ -131,5 +133,5 @@ export async function getHealth(pool: pg.Pool, env: Record<string, string | unde
   const canaryAlerts = (
     await pool.query("select id, message, created_at from alerts where kind = 'canary_triggered' and created_at > now() - interval '7 days' order by id desc limit 5")
   ).rows;
-  return { generated_at: new Date(now).toISOString(), summary, connectors: items, security: { canary_alerts: canaryAlerts } };
+  return { generated_at: new Date(now).toISOString(), summary, connectors: items, security: { canary_alerts: canaryAlerts, incident: await incidentState(pool, now) } };
 }

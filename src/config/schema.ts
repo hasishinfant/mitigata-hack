@@ -153,7 +153,8 @@ export const ConnectorSchema = z.strictObject({
   }),
   connection: z.strictObject({ base_url: z.string().min(1), auth: AuthSchema }),
   streams: z.array(StreamSchema).min(1),
-  schedule: z.strictObject({ every: duration, jitter: duration.optional() }).optional(),
+  // incident_every: poll this often while an incident is active (a canary fired, foreign-IP use, or ix incident start).
+  schedule: z.strictObject({ every: duration, jitter: duration.optional(), incident_every: duration.optional() }).optional(),
   reliability: z
     .strictObject({
       timeout: duration.optional(),

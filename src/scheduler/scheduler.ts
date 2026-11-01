@@ -8,10 +8,17 @@ import type pg from "pg";
 import { loadActiveConnector } from "../store/connectors.ts";
 import { enqueueRun } from "./queue.ts";
 import { recoverAbandonedRuns } from "../store/runs.ts";
+import { incidentState, type IncidentState } from "../security/incident.ts";
 
 const LOCK_KEY = 74_201_105; // arbitrary constant for pg_try_advisory_lock
 
-export type TickResult = { enqueued: string[]; skipped: { id: string; reason: string }[]; recovered: { connectorId: string; runs: number }[] };
+export type TickResult = {
+  enqueued: string[];
+  skipped: { id: string; reason: string }[];
+  recovered: { connectorId: string; runs: number }[];
+  incident: IncidentState | null;
+  fast: string[]; // connectors on their incident_every interval this tick
+};
 
 export function nextRunAt(fromMs: number, everyMs: number, jitterMs: number, random: () => number = Math.random): Date {
   return new Date(fromMs + everyMs + Math.floor(random() * jitterMs));
@@ -30,7 +37,7 @@ export function createScheduler(opts: {
   const say = opts.log ?? (() => {});
 
   async function tick(): Promise<TickResult> {
-    const out: TickResult = { enqueued: [], skipped: [], recovered: [] };
+    const out: TickResult = { enqueued: [], skipped: [], recovered: [], incident: null, fast: [] };
     const client = await opts.pool.connect();
     try {
       const locked = (await client.query("select pg_try_advisory_lock($1) as ok", [LOCK_KEY])).rows[0].ok as boolean;
@@ -43,6 +50,8 @@ export function createScheduler(opts: {
           await client.query("select id, status, paused_until, next_run_at from connectors where status in ('enabled', 'paused') order by id")
         ).rows as { id: string; status: string; paused_until: Date | null; next_run_at: Date | null }[];
         const t = now();
+        const incident = await incidentState(opts.pool, t);
+        out.incident = incident;
         for (const row of rows) {
           let conn;
           try {
@@ -56,9 +65,21 @@ export function createScheduler(opts: {
             out.skipped.push({ id: row.id, reason: "no schedule" });
             continue;
           }
+          // Incident mode: poll at incident_every; a next run further away than that is pulled in to now.
+          const fast = incident.active && sched.incidentEveryMs ? sched.incidentEveryMs : undefined;
+          const every = fast ?? sched.everyMs;
+          const jitter = fast ? Math.min(sched.jitterMs, Math.floor(fast / 4)) : sched.jitterMs;
+          if (fast) {
+            out.fast.push(row.id);
+            if (row.next_run_at && new Date(row.next_run_at).getTime() > t + fast) {
+              await client.query("update connectors set next_run_at = $2 where id = $1", [row.id, new Date(t)]);
+              row.next_run_at = new Date(t);
+              say(`incident mode: ${row.id} pulled in (every ${Math.round(fast / 60_000)}m)`);
+            }
+          }
           // First sighting: run soon (within the jitter window) rather than waiting a full interval.
           if (!row.next_run_at) {
-            const first = new Date(t + Math.floor(random() * sched.jitterMs));
+            const first = new Date(t + Math.floor(random() * jitter));
             await client.query("update connectors set next_run_at = $2 where id = $1", [row.id, first]);
             row.next_run_at = first;
           }
@@ -69,7 +90,7 @@ export function createScheduler(opts: {
             continue;
           }
           const jobId = await enqueueRun(opts.boss, { connectorId: row.id, trigger: "schedule" });
-          await client.query("update connectors set next_run_at = $2 where id = $1", [row.id, nextRunAt(t, sched.everyMs, sched.jitterMs, random)]);
+          await client.query("update connectors set next_run_at = $2 where id = $1", [row.id, nextRunAt(t, every, jitter, random)]);
           if (jobId) {
             out.enqueued.push(row.id);
             say(`enqueued ${row.id}`);

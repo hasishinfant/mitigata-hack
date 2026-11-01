@@ -15,6 +15,7 @@ import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "
 import { panic } from "../security/panic.ts";
 import { getPosture, type Level } from "../security/posture.ts";
 import { capabilityMatrix } from "../security/capabilities.ts";
+import { closeIncident, declareIncident, incidentState } from "../security/incident.ts";
 import { runRehearsal } from "../security/rehearsal.ts";
 import { enqueueRun, startBoss } from "../scheduler/queue.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
@@ -253,6 +254,31 @@ program
       console.log(dim("AVAILABLE = the provider supports it but it isn't enabled; unknown = declare it under capabilities: in the config"));
     }),
   );
+
+const incident = program.command("incident").description("incident mode: connectors with schedule.incident_every poll faster");
+incident
+  .command("start")
+  .argument("[reason...]")
+  .description("declare an incident (also starts automatically on a canary or foreign-IP alert)")
+  .action(action(async (reason: string[]) => {
+    await declareIncident(db(), reason.join(" ") || "declared by an operator", process.env.USER ?? "cli");
+    const s = await incidentState(db());
+    console.log(`${yellow("⚡ incident mode on")} until ${s.until} (extends with every new security alert)`);
+  }));
+incident.command("stop").description("end incident mode").action(action(async () => {
+  await closeIncident(db(), process.env.USER ?? "cli");
+  console.log(`${green("✔")} incident mode off: normal schedules`);
+}));
+incident.command("status").description("is incident mode on, and why").action(action(async () => {
+  const s = await incidentState(db());
+  if (!s.active) return console.log(dim("no active incident"));
+  console.log(`${yellow("⚡ incident mode on")} since ${s.since}, until ${s.until}\n  ${s.reason}`);
+  const fast = (await db().query("select id from connectors where status <> 'disabled' order by id")).rows.map((r) => r.id as string);
+  for (const id of fast) {
+    const c = await loadActiveConnector(db(), id).catch(() => null);
+    if (c?.schedule?.incident_every) console.log(`  ${id}: every ${c.schedule.incident_every} (normally ${c.schedule.every})`);
+  }
+}));
 
 program
   .command("receipts")
