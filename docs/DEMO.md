@@ -1,5 +1,9 @@
 # IntegrateX: 5-minute demo script
 
+**Story:** a breached integration hub (the 2025 Drift scenario). We show that IntegrateX gives up as little as possible, notices within seconds, and hands the decision to a human with the evidence.
+
+Every step below is real code. `test/demo-rehearsal.test.ts` runs the same story end to end on every test run.
+
 ## Before you present (10 min before)
 
 ```sh
@@ -7,83 +11,86 @@ cd ~/mitigata-hack
 export NODE_EXTRA_CA_CERTS=/opt/homebrew/etc/ca-certificates/cert.pem
 alias ix="npx tsx src/cli/ix.ts"
 
-# Terminal 1: the platform (+ mock server for the failure demos)
-MOCK_PORT=4010 npx pnpm@10.28.0 dev:mock
+# Terminal 1: the platform plus the mock provider, with DPoP required
+MOCK_REQUIRE_DPOP=1 MOCK_PORT=4010 IX_EGRESS_IPS=198.51.100.10 npx pnpm@10.28.0 dev:mock
 
-# Terminal 2: reset for the live add and warm everything up
-ix rm cisa-kev --yes                 # so step 3 can add it from a blank file
-for c in github-members github-issues okta-users okta-logs nvd-cves; do ix run $c; done
-ix rehearse                          # dry-run: broker, ledger, posture, panic preview (changes nothing)
-open http://localhost:7070           # the Kill switch button asks for the admin token (IX_ADMIN_TOKEN in .env)
+# Terminal 2: register the two demo connectors, then set their (fake) secrets. Registering first means no host approval is needed.
+MOCK_PORT=4010 ix add test/fixtures/configs/mock-okta-dpop.yaml
+MOCK_PORT=4010 ix add test/fixtures/configs/mock-okta-logs.yaml
+ix secret set mock_client_id        # mock-client-id
+ix secret set mock_client_secret    # mock-client-secret-7890
+ix secret set mock_ssws             # mock-ssws-token-9012
+curl -s "localhost:4010/__attack?ip="      # no attack yet
+ix run mock-okta-dpop; ix run mock-okta-logs
+ix canary create okta_admin_token --prefix 00
+ix canary create slack_webhook_prod --url --print   # copy this URL: you'll "loot" it in step 4
+ix incident stop                                     # start the demo in normal mode
+open http://localhost:7070
 ```
 
-Have ready: `test/fixtures/configs/cisa-kev.yaml` open in a side window (the file you will type).
-Offline fallback: if Wi-Fi fails, the mock server (`dev:mock`) serves every failure demo; point CISA at
-`http://localhost:4010/public/kev.json` (allowed host `localhost`) instead of www.cisa.gov.
+Optional: `ix secret set anthropic_api_key` lets the advisor add Claude's explanation. Without it the advisor shows the rules only, which is still a complete demo.
 
 ---
 
-## 1. Hook (30 s)
-> "In 2025, attackers stole the OAuth tokens stored in one integration hub, Salesloft Drift, and replayed them against hundreds of companies. Integration hubs hold keys to everything. We built a config-driven integration platform designed so that a breached hub gives up as little as possible."
+## 1. Hook (20 s)
+> "In 2025 attackers broke into one integration hub, Salesloft Drift, stole the OAuth tokens it held, and replayed them against hundreds of companies' CRMs. Integration hubs hold keys to everything. IntegrateX is built for the day the hub itself is breached."
 
-## 2. It works on real sources (45 s)
-- Dashboard: GitHub, Okta, NVD cards green.
+## 2. It works, and it's honest about it (45 s)
+- Dashboard: both cards are green, and each stream shows **`verified`** (its latest Sync Integrity Receipt).
 ```sh
-ix query users            # GitHub members + Okta users in ONE table (source column)
-ix query events -n 5      # NVD CVEs, Okta logs, GitHub issues: same schema
+ix receipt <id>     # from: ix receipts mock-okta-dpop
 ```
-> "Four real sources, four auth types (none, API key, Bearer, OAuth2), three paging styles, one common schema."
+> "One YAML file per source, one engine. Nothing is published until the whole sync is verified, and every run leaves a receipt: pages, hashes, counts, schema fingerprint, the decision. It separates facts from inferences and is anchored in a tamper-evident ledger."
+- Click **Capabilities**:
+> "For every connector and every control: enforced, available, unsupported or not applicable. We don't pretend every API supports everything."
 
-## 3. Add a new source live, from a blank file (90 s)
+## 3. The breach: the attacker steals a token (45 s)
 ```sh
-code connectors/cisa-kev.yaml        # type it (copy from the fixture); make ONE typo: trasform
-ix validate connectors/cisa-kev.yaml # -> line 17: unknown key "trasform" (did you mean "transform"?)
-#   fix the typo
-ix test connectors/cisa-kev.yaml     # live: HTTP 200, 1,7xx records, 3 mapped samples, nothing written
-ix add connectors/cisa-kev.yaml
-ix run cisa-kev                      # fourth card turns green on the dashboard
-git status                           # proof: the ONLY change is one new YAML file
-grep -riE "github|okta|nvd|cisa" src/engine src/broker   # prints nothing: no provider code
+T=$(curl -s localhost:4010/__dpop/stolen | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $T" "localhost:4010/api/v1/users"   # 401
 ```
+> "That's a real access token lifted from the hub. It's **DPoP-bound** to a key that exists only in broker memory, so on the attacker's machine it's rejected. They'd need the key, and the key never touches disk."
 
-## 4. Failures behave the same for every connector (60 s)
-Use the mock connectors (`ix add test/fixtures/configs/mock-nvd-cves.yaml` etc. beforehand, with `MOCK_PORT=4010`).
+## 4. They try a looted webhook URL (30 s)
 ```sh
-curl "localhost:4010/__fault?mode=429&count=1&retry_after=30&after=1"; ix run mock-nvd-cves
-#   -> waits 30 s (Retry-After), retries the same page, no duplicates
-curl "localhost:4010/__fault?mode=drop&count=100&after=1"; ix run mock-nvd-cves
-#   -> retries 1 s / 2 s / 4 s, fails, keeps checkpoint
-curl "localhost:4010/__fault?mode=clear"; ix run mock-nvd-cves
-#   -> "resumed from checkpoint"
-curl "localhost:4010/__fault?mode=envelope&count=1&after=1"; ix run mock-nvd-cves
-#   -> 200 OK but the wrong shape: failed, "records_path vulnerabilities[*] not found", never "0 records, success"
-ix quarantine                        # bad records with reasons; run was "partial", not crashed
-ix receipts mock-nvd-cves            # one receipt per run: incomplete (interrupted) -> verified (published once complete)
-ix receipt <id>                      # facts vs inferences, schema fingerprint, digest + ledger anchor verified
-curl "localhost:4010/__drift?rename_email=1"; ix run mock-okta-users   # schema change -> HELD, nothing published
-ix held; ix approve <sync-id>        # a human publishes it (or ix discard); the approval gets its own receipt
+curl -s -X POST "<the slack_webhook_prod URL from setup>" -d '{"text":"hi"}'    # invalid_token
 ```
-Bad key: `ix secret set github_org_pat` (type junk) → `ix run github-members` → `auth_failed`, one attempt, alert raised. Then store the real token again.
+- Dashboard: **red banner**, "Decoy credential used … from 127.0.0.1", plus an **amber incident-mode banner**.
+> "That webhook was a **canary**: a decoy stored exactly like a real secret. Only the broker can tell the difference. The moment anyone uses one, we know the store was dumped. Incident mode turns on, and the audit-log connector now polls every 2 minutes instead of 15."
 
-## 5. The breach part (60 s)
+## 5. The provider's own log catches the replay (40 s)
 ```sh
-npx pnpm@10.28.0 leakcheck -- /tmp/ix-dev.log   # zero hits: repo, logs, DB dump, worker/API process memory env
-ix add test/fixtures/configs/bad-delete.yaml    # refused: connectors are read-only by contract
-ix audit log --deny -n 5                        # runtime calls outside the allow-list, denied and logged
-ix posture okta-users                           # blast radius: hosts, paths, scopes, age, revocability
+curl -s "localhost:4010/__attack?ip=203.0.113.7"      # the attacker replays our credential elsewhere
+ix run mock-okta-logs                                 # incident mode would pick it up within 2 minutes anyway
+ix alerts -n 3                                        # foreign_ip_use: 4 events from 203.0.113.7
 ```
-- Dashboard: click **Posture** on a card; click **Kill switch** → every connector disabled, Okta token revoked at Okta, checklist for the rest.
+> "Okta's own audit log shows **our** OAuth client used from an IP that isn't the hub. The IP allow-list says the hub is 198.51.100.10, so this is stolen-credential use, recorded in the sync's receipt."
+
+## 6. The advisor (40 s)
+- Click **Advisor** (admin token):
+> "Fixed rules turn the last 24 hours into one decision: **kill switch recommended**, with every finding citing its evidence: `alert:…`, `ledger:…`. Claude writes the explanation. Any claim citing evidence that doesn't exist is dropped, attacker text in the logs can't change the recommendation, and the advisor never presses the button."
+
+## 7. Kill switch (30 s)
+- Click **Kill switch** and enter the admin token.
+> "Every connector disabled, queued runs cancelled, the OAuth token **revoked at Okta**, and a checklist for what only a human can revoke. The app's database role can't undo it: re-enabling goes through the broker."
 ```sh
-ix audit verify                                 # hash chain intact; an edited row would be detected
+ix audit verify      # hash chain intact
 ```
-After the demo: `for c in $(psql -d integratex -tAc "select id from connectors"); do ix enable $c; done`
 
-## 6. Close (15 s)
-> "One YAML file per source. The same retries, rate limiting and quarantine for every connector. And a breached hub gives up as little as possible: one broker holds the secrets, configs are signed allow-lists, every call is in a tamper-evident ledger, and one button revokes everything."
+## 8. Close (15 s)
+> "One engine and one YAML file per source. Every sync is verified before it's trusted. And a breached hub gives up as little as possible: tokens bound to an in-memory key, decoys that turn theft into an alarm, the provider's own log watching for replays, and one button that revokes everything."
 
-**Honest limit, if asked:** none of this stops someone who already stole a provider token from replaying it from their own machine. It shrinks what a breach of the hub itself can hand over.
+**Honest limits, if asked:**
+- An attacker who controls the live broker process can use its keys while they're inside it.
+- DPoP and IP allow-lists depend on what each provider supports. The Capabilities panel shows it.
+- In dev all processes run as one OS user. That's a documented, accepted risk for this scope.
+
+**After the demo:** `for c in mock-okta-dpop mock-okta-logs; do ix enable $c; done; ix incident stop; curl -s "localhost:4010/__attack?ip="`
+
+## Fallback (no Wi-Fi)
+Everything above runs locally against the mock provider; nothing needs the internet. The real connectors (GitHub, Okta, NVD, CISA, Elastic) are optional extra proof: `ix receipts okta-users`.
 
 ## Numbers to quote
-- 163 automated tests; all 4 PRD failure tests pass
-- 6 real connectors (GitHub ×2, Okta ×2, NVD, CISA KEV) plus 5 vendor coverage connectors from the mentors' list
-- 35 mentor products rated in `docs/coverage.md`: 12 fit today, 14 need a small generic feature, 9 out of scope
+- About 225 automated tests, including an end-to-end rehearsal of this exact story
+- 7 real sources verified live; 5 vendor coverage configs from the mentors' list (`docs/coverage.md`)
+- One engine: `grep -riE "github|okta|nvd|cisa" src/engine src/broker` prints nothing

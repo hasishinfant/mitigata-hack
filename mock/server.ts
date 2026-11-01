@@ -504,6 +504,31 @@ export function buildMock(opts: MockOptions = {}): Mock {
     })),
   }));
 
+  // ---- Okta-like System Log (for foreign-IP detection demos) ----
+  // Normal traffic: user logins, and our OAuth client's token grants from the hub's IP. /__attack?ip=X adds token
+  // grants by the SAME client from X: what you'd see if the hub's credential were stolen and replayed elsewhere.
+  let attackIp = "";
+  app.get("/__attack", async (req) => {
+    attackIp = qp(req).ip ?? "";
+    return { attack_ip: attackIp || null };
+  });
+  app.get("/api/v1/logs", async (req, reply) => {
+    if (req.headers.authorization !== `SSWS ${t.ssws}` && !(await hasToken(req, reply))) return reply.sent ? reply : unauthorized(reply, "Invalid token provided");
+    const ev = (i: number, type: string, actor: string, ip: string) => ({
+      uuid: `log-${type}-${ip}-${i}`, published: new Date(Date.parse("2026-11-01T08:00:00Z") + i * 60_000).toISOString(), eventType: type,
+      severity: "INFO", displayMessage: type, actor: { alternateId: actor, type: actor === t.clientId ? "PublicClientApp" : "User" },
+      client: { ipAddress: ip }, outcome: { result: "SUCCESS" },
+    });
+    const out = [
+      ...Array.from({ length: 5 }, (_, i) => ev(i, "user.session.start", `user${i}@example.test`, `192.0.2.${10 + i}`)),
+      ...Array.from({ length: 3 }, (_, i) => ev(10 + i, "app.oauth2.as.token.grant.access_token", t.clientId, "198.51.100.10")),
+      ...(attackIp ? Array.from({ length: 4 }, (_, i) => ev(20 + i, "app.oauth2.as.token.grant.access_token", t.clientId, attackIp)) : []),
+    ];
+    return out;
+  });
+  // Demo only: plays "the attacker dumped broker memory" by handing out the last issued access token.
+  app.get("/__dpop/stolen", async () => ({ token: dpop.issued.at(-1) ?? null, note: "demo only: the token an attacker would have stolen" }));
+
   app.get("/__health", async () => ({ ok: true }));
   return { app, calls, options, setFault, oauth, slack, dpop };
 }
@@ -518,6 +543,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
       ...(process.env.MOCK_SSWS_TOKEN ? { ssws: process.env.MOCK_SSWS_TOKEN } : {}),
     },
     ...(process.env.MOCK_GITHUB_SCOPES ? { githubScopes: process.env.MOCK_GITHUB_SCOPES } : {}),
+    ...(process.env.MOCK_REQUIRE_DPOP === "1" ? { requireDpop: true } : {}),
   });
   await app.listen({ host: "127.0.0.1", port });
   console.log(`mock providers on http://localhost:${port}`);

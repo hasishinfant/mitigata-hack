@@ -1,0 +1,30 @@
+# Demo: Okta-like System Log with a foreign-IP detection rule for the hub's own OAuth client.
+apiVersion: ix/v1
+kind: Connector
+metadata: { id: mock-okta-logs, source: okta, tenant: demo }
+connection:
+  base_url: http://localhost:${env.MOCK_PORT}
+  auth: { type: api_key, in: header, name: Authorization, prefix: "SSWS ", secret_ref: mock_ssws }
+streams:
+  - name: logs
+    entity: event
+    request: { method: GET, path: /api/v1/logs }
+    records_path: $
+    pagination: { type: none }
+    detect:
+      - name: hub OAuth client used from outside the hub
+        match: { "actor.alternateId": mock-client-id, eventType: app.oauth2.as.token.grant.access_token }
+        ip_path: client.ipAddress
+        allowed_ips: ["${env.IX_EGRESS_IPS:-198.51.100.10}"]
+    mapping:
+      id:          { path: uuid, required: true }
+      type:        { path: eventType, required: true }
+      severity:    { path: severity, map_enum: { INFO: info, WARN: medium, ERROR: high }, default: info }
+      timestamp:   { path: published, transform: to_iso8601, required: true }
+      description: { path: displayMessage }
+      attributes:  { pick: [actor.alternateId, client.ipAddress] }
+schedule: { every: 15m, incident_every: 2m }
+reliability: { rate_limit: { requests_per_minute: 600 } }
+policy: { allowed_hosts: [localhost], allowed_paths: [/api/v1/logs], methods: [GET], max_requests_per_run: 5 }
+credential: { max_age_days: 90, idle_disable_days: 14 }
+capabilities: { ip_allowlist: supported, audit_log: ingested }
