@@ -16,7 +16,7 @@ import {
 
 const MAX_BYTES = 64 * 1024 * 1024;
 const MAX_RATE_LIMIT_WAITS = 5;
-const FORBIDDEN_HEADERS = new Set(["authorization", "proxy-authorization", "cookie", "host", "x-api-key", "content-length"]);
+const FORBIDDEN_HEADERS = new Set(["authorization", "proxy-authorization", "cookie", "host", "x-api-key", "content-length", "dpop"]);
 
 export type LocalBrokerOptions = {
   /** In the broker process this loads the broker-signed config from the database. */
@@ -77,8 +77,13 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
     await opts.audit({ connectorId: conn.metadata.id, action: "request", method, host, path, decision: `deny: ${e.message.replace(/^policy denied: /, "")}` });
   }
 
-  /** One logical call with throttle, retries and rate-limit waits. Returns the final response. */
-  async function send(conn: ResolvedConnector, method: string, url: URL, headers: Record<string, string>, body?: string): Promise<Sent> {
+  /**
+   * One logical call with throttle, retries and rate-limit waits. Returns the final response.
+   * headers may be a function: it is called for every attempt, so per-request values (a DPoP proof) are never reused.
+   */
+  async function send(
+    conn: ResolvedConnector, method: string, url: URL, headers: Record<string, string> | (() => Promise<Record<string, string>>), body?: string,
+  ): Promise<Sent> {
     const { retries: retryCfg, rateLimit, timeoutMs } = conn.runtime;
     const where = { connector: conn.metadata.id, method, host: url.host, path: url.pathname };
     let errorAttempts = 0; // timeouts / network errors / 5xx
@@ -90,7 +95,7 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
       await bucketFor(conn).take(clock);
       let res: HttpResult;
       try {
-        res = await httpCall(method, url, headers, { timeoutMs, maxBytes: MAX_BYTES, body });
+        res = await httpCall(method, url, typeof headers === "function" ? await headers() : headers, { timeoutMs, maxBytes: MAX_BYTES, body });
       } catch (e) {
         if (e instanceof BrokerError && (e.kind === "timeout" || e.kind === "network") && errorAttempts < retryCfg.max) {
           const wait = backoffMs(errorAttempts, retryCfg.baseMs, retryCfg.jitter, opts.random);
@@ -170,11 +175,14 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
       const auth = conn.connection.auth;
       const started = clock.now();
       let refreshed = false;
+      let nonceRetried = false;
       let retries = 0;
       let rateLimitedMs = 0;
       for (;;) {
         const target = { url: new URL(url), headers: { ...headers } };
         let used: string[];
+        let headersFor: Record<string, string> | (() => Promise<Record<string, string>>) = target.headers;
+        let dpopToken: string | undefined;
         if (auth.type === "oauth2_client_credentials") {
           const t = await tokens.get(conn, opts.secrets, async (tokenUrl, h, b) => {
             try {
@@ -187,8 +195,14 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
             await opts.audit?.({ connectorId: conn.metadata.id, action: "token", method: "POST", host: tokenUrl.host, path: tokenUrl.pathname, status: r.status, decision: "allow" });
             return r;
           }, clock.now());
-          target.headers.authorization = `Bearer ${t.token}`;
           used = t.used;
+          if (t.dpop) {
+            // RFC 9449: "Authorization: DPoP <token>" plus a fresh proof per attempt, bound to this token (ath).
+            target.headers.authorization = `DPoP ${t.token}`;
+            dpopToken = t.token;
+            const base = { ...target.headers };
+            headersFor = async () => ({ ...base, dpop: await tokens.dpopProof(conn.metadata.id, req.method, target.url, Date.now(), t.token) });
+          } else target.headers.authorization = `Bearer ${t.token}`;
         } else {
           used = await applyStaticAuth(auth, conn.metadata.tenant, target, opts.secrets);
         }
@@ -196,7 +210,7 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
 
         let sent: Sent;
         try {
-          sent = await send(conn, req.method, target.url, target.headers, body);
+          sent = await send(conn, req.method, target.url, headersFor, body);
         } catch (e) {
           if (e instanceof BrokerError) {
             e.retries += retries;
@@ -209,6 +223,11 @@ export function createLocalBroker(opts: LocalBrokerOptions): LocalBroker {
         retries += sent.retries;
         rateLimitedMs += sent.rateLimitedMs;
 
+        // DPoP: the API may demand a (new) nonce. Retry once with it, same token.
+        if (dpopToken && sent.res.status === 401 && /use_dpop_nonce/.test(sent.res.headers["www-authenticate"] ?? "") && !nonceRetried && tokens.learnNonce(target.url, sent.res.headers)) {
+          nonceRetried = true;
+          continue;
+        }
         // OAuth: a 401 may mean the token was revoked or expired early. Refresh once, then give up.
         if (auth.type === "oauth2_client_credentials" && sent.res.status === 401 && !refreshed) {
           log.warn({ connector: conn.metadata.id }, "401 with cached token, refreshing once");

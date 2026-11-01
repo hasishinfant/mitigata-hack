@@ -145,6 +145,13 @@ Limits:
   - **Throttle:** delivery is limited per connector and overall, counted from the delivery history in `alerts`, so a broker restart doesn't reset it. Throttled alerts stay pending and are retried.
   - **Gap:** the broker doesn't check where an alert row came from, and the pending queue has no size limit. A compromised worker can insert forged alerts. The throttle limits how fast they are sent, not how many queue up, and forged rows ahead of real ones use up the throttle first, which delays real alerts.
   - **Denial floods:** repeated bad admin tokens or throttled alerts write one ledger row per minute. Each row stores how many requests it stands for in `records`, which is inside the hash chain. Posture counts requests, not rows, and shows both. If the broker crashes without a clean shutdown, denials suppressed in the open window are lost; the first one of each window is always written.
+- **DPoP-bound OAuth tokens (RFC 9449).** With `connection.auth.dpop: true`, every access token is bound to a P-256 key that exists only in broker memory. The key is generated per token, never stored, and dropped with the token.
+  - The token request and every API call (including retries) carry a fresh proof. API proofs are tied to the token (`ath`) and to the request's method and URL. Server nonces are handled.
+  - **A stolen token is rejected** whether presented as Bearer, with another key, or with a replayed proof.
+  - If a provider returns an unbound Bearer token anyway, the broker refuses it. Workers can't set a `DPoP` header.
+  - The provider must support DPoP (Okta does for service apps, for example); verify yours before enabling it.
+  - Posture shows `token_binding` and flags OAuth connectors without it.
+  - It doesn't help if an attacker controls the live broker process: they can sign proofs while they're inside it.
 - **The app database role cannot undo the kill switch.** It can disable and pause connectors, but cannot re-enable a disabled one or change the active config version (column grants plus a trigger). `ix enable` goes through the broker.
 - **Signed configs.** Configs are registered through the broker, which signs each version (an HMAC keyed from the master key). At request time it only honours versions it signed, so a rogue config row can't point a stored secret at a new host.
   - This holds even if someone writes that row straight into the database.

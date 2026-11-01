@@ -2,9 +2,9 @@
 // the real sources (Link header + page, offset + totalResults, Link header + opaque cursor,
 // body cursor + isLast) with deterministic data. Tokens here are fake test values.
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { createPublicKey } from "node:crypto";
+import { createHash, createPublicKey } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { decodeProtectedHeader, jwtVerify } from "jose";
+import { calculateJwkThumbprint, decodeProtectedHeader, EmbeddedJWK, jwtVerify } from "jose";
 
 export type MockOptions = {
   members?: number;
@@ -25,6 +25,10 @@ export type MockOptions = {
   githubScopes?: string;
   /** Directory users (by index) whose lastUpdated is bumped to a later date (incremental sync tests). */
   touchedUsers?: number[];
+  /** OAuth: require DPoP (RFC 9449) at the token endpoint; issued tokens are bound to the proof key. */
+  requireDpop?: boolean;
+  /** DPoP: the nonce the token endpoint and the API require (empty = no nonce). */
+  dpopNonce?: string;
 };
 
 export type FaultMode = "429" | "500" | "503" | "timeout" | "drop" | "ratelimit403" | "envelope" | "empty";
@@ -44,6 +48,8 @@ export type Mock = {
   options: Required<Omit<MockOptions, "tokens">> & { tokens: Required<NonNullable<MockOptions["tokens"]>> };
   setFault(spec: FaultSpec | null): void;
   oauth: { tokenCalls: number; revoked: number; lastAssertion?: { header: Record<string, unknown>; payload: Record<string, unknown> }; revokeAll(): void };
+  /** DPoP: every issued access token (test-only: lets a test play the attacker who stole one), proofs seen, rejections. */
+  dpop: { issued: string[]; proofs: string[]; rejected: string[] };
   slack: { path: string; text: string }[];
 };
 
@@ -83,6 +89,8 @@ export function buildMock(opts: MockOptions = {}): Mock {
     tokenTtlS: opts.tokenTtlS ?? 1799,
     githubScopes: opts.githubScopes ?? "read:org",
     touchedUsers: opts.touchedUsers ?? [],
+    requireDpop: opts.requireDpop ?? false,
+    dpopNonce: opts.dpopNonce ?? "",
     tokens: { ...MOCK_TOKENS, ...opts.tokens },
   };
   const t = options.tokens;
@@ -213,7 +221,7 @@ export function buildMock(opts: MockOptions = {}): Mock {
       },
     }));
   app.get("/api/v1/users", async (req, reply) => {
-    if (req.headers.authorization !== `SSWS ${t.ssws}` && !hasToken(req)) return unauthorized(reply, "Invalid token provided");
+    if (req.headers.authorization !== `SSWS ${t.ssws}` && !(await hasToken(req, reply))) return reply.sent ? reply : unauthorized(reply, "Invalid token provided");
     const q = qp(req);
     const limit = intParam(q.limit, 200, 200) || 200;
     let all = dirUsers();
@@ -259,9 +267,56 @@ export function buildMock(opts: MockOptions = {}): Mock {
   const oauth: Mock["oauth"] = { tokenCalls: 0, revoked: 0, revokeAll: () => validTokens.clear() };
   const slack: Mock["slack"] = [];
   const validTokens = new Set<string>();
-  const hasToken = (req: FastifyRequest) => {
+  // ---- DPoP (RFC 9449), verified the way a real server does ----
+  const boundTo = new Map<string, string>(); // access token -> JWK thumbprint of the key it is bound to
+  const seenJti = new Set<string>();
+  const dpop: Mock["dpop"] = { issued: [], proofs: [], rejected: [] };
+  const b64u = (b: Buffer) => b.toString("base64url");
+  /** Verify a DPoP proof for this request. Returns the key thumbprint, or a rejection reason. */
+  const verifyProof = async (req: FastifyRequest, accessToken?: string): Promise<{ jkt: string } | { error: string; nonce?: boolean }> => {
+    const proof = req.headers.dpop;
+    if (typeof proof !== "string") return { error: "missing DPoP proof" };
+    dpop.proofs.push(proof);
+    try {
+      const { payload, protectedHeader } = await jwtVerify(proof, EmbeddedJWK, { typ: "dpop+jwt", algorithms: ["ES256", "ES384", "RS256", "PS256", "EdDSA"] });
+      const u = new URL(req.url, origin(req));
+      if (payload.htm !== req.method) return { error: "htm mismatch" };
+      if (payload.htu !== `${u.origin}${u.pathname}`) return { error: "htu mismatch" };
+      if (typeof payload.iat !== "number" || Math.abs(Date.now() / 1000 - payload.iat) > 60) return { error: "iat outside the allowed window" };
+      if (typeof payload.jti !== "string" || seenJti.has(payload.jti)) return { error: "replayed proof (jti seen before)" };
+      if (options.dpopNonce && payload.nonce !== options.dpopNonce) return { error: "nonce required", nonce: true };
+      if (accessToken !== undefined && payload.ath !== b64u(createHash("sha256").update(accessToken).digest())) return { error: "ath does not match the access token" };
+      seenJti.add(payload.jti);
+      return { jkt: await calculateJwkThumbprint(protectedHeader.jwk!) };
+    } catch (e) {
+      return { error: `bad proof: ${(e as Error).message}` };
+    }
+  };
+  const dpopChallenge = (reply: FastifyReply, error: string, nonce: boolean) => {
+    if (nonce) reply.header("dpop-nonce", options.dpopNonce);
+    reply.header("www-authenticate", `DPoP error="${nonce ? "use_dpop_nonce" : "invalid_token"}", algs="ES256"`);
+    return reply.code(401).send({ error: nonce ? "use_dpop_nonce" : "invalid_token", error_description: error });
+  };
+  /** Bearer for unbound tokens; DPoP + a valid proof from the bound key for bound ones. Sends the challenge itself. */
+  const hasToken = async (req: FastifyRequest, reply: FastifyReply): Promise<boolean> => {
     const h = req.headers.authorization ?? "";
-    return h.startsWith("Bearer ") && validTokens.has(h.slice(7));
+    const [scheme, token] = [h.split(" ")[0] ?? "", h.slice(h.indexOf(" ") + 1)];
+    if (!validTokens.has(token)) return false;
+    const jkt = boundTo.get(token);
+    if (!jkt) return scheme === "Bearer";
+    if (scheme !== "DPoP") {
+      dpop.rejected.push("bound token presented as Bearer");
+      dpopChallenge(reply, "token is DPoP-bound", false);
+      return false;
+    }
+    const v = await verifyProof(req, token);
+    if ("error" in v || v.jkt !== jkt) {
+      const why = "error" in v ? v.error : "proof key is not the key the token is bound to";
+      dpop.rejected.push(why);
+      dpopChallenge(reply, why, "error" in v && Boolean(v.nonce));
+      return false;
+    }
+    return true;
   };
   app.addContentTypeParser("application/x-www-form-urlencoded", { parseAs: "string" }, (_req, body, done) => {
     done(null, Object.fromEntries(new URLSearchParams(body as string)));
@@ -291,9 +346,21 @@ export function buildMock(opts: MockOptions = {}): Mock {
       clientOk = f.client_id === t.clientId && f.client_secret === t.clientSecret;
     }
     if (!clientOk) return reply.code(401).send({ error: "invalid_client", error_description: "Client authentication failed" });
+    let jkt: string | undefined;
+    if (options.requireDpop) {
+      const v = await verifyProof(req);
+      if ("error" in v) {
+        dpop.rejected.push(`token endpoint: ${v.error}`);
+        if (v.nonce) reply.header("dpop-nonce", options.dpopNonce);
+        return reply.code(400).send({ error: v.nonce ? "use_dpop_nonce" : "invalid_dpop_proof", error_description: v.error });
+      }
+      jkt = v.jkt;
+    }
     const token = `mock-access-${oauth.tokenCalls}-${Math.random().toString(36).slice(2, 10)}`;
     validTokens.add(token);
-    return { access_token: token, token_type: "Bearer", expires_in: options.tokenTtlS, scope: options.grantedScope || f.scope || "" };
+    if (jkt) boundTo.set(token, jkt);
+    dpop.issued.push(token);
+    return { access_token: token, token_type: jkt ? "DPoP" : "Bearer", expires_in: options.tokenTtlS, scope: options.grantedScope || f.scope || "" };
   };
   app.post("/oauth2/token", tokenHandler);
   app.post("/oauth2/v1/token", tokenHandler);
@@ -314,7 +381,7 @@ export function buildMock(opts: MockOptions = {}): Mock {
 
   // ---- CrowdStrike-like hosts: OAuth2 bearer, offset + meta.pagination.total ----
   app.get("/devices/combined/devices/v1", async (req, reply) => {
-    if (!hasToken(req)) return reply.code(401).send({ errors: [{ code: 401, message: "access denied, invalid bearer token" }] });
+    if (!(await hasToken(req, reply))) return reply.sent ? reply : reply.code(401).send({ errors: [{ code: 401, message: "access denied, invalid bearer token" }] });
     const q = qp(req);
     const limit = intParam(q.limit, 100, 100) || 100;
     const offset = intParam(q.offset, 0, 1e6);
@@ -438,7 +505,7 @@ export function buildMock(opts: MockOptions = {}): Mock {
   }));
 
   app.get("/__health", async () => ({ ok: true }));
-  return { app, calls, options, setFault, oauth, slack };
+  return { app, calls, options, setFault, oauth, slack, dpop };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

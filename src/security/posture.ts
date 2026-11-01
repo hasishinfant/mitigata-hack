@@ -27,6 +27,8 @@ export type Posture = {
   scopes: ScopeAssessment & { source: "token_response" | "response_header" | "unknown" };
   revocable_by_api: boolean | "unknown";
   provider_ip_restriction: "yes" | "no" | "unknown";
+  /** dpop: tokens are bound to a key only the broker holds (RFC 9449); none: a stolen token works anywhere; n/a: static key. */
+  token_binding: "dpop" | "none" | "n/a";
   revoke_hint: string | null;
   limits: { max_age_days: number | null; idle_disable_days: number | null };
   data: { store_raw: boolean; retention_days: number | null };
@@ -62,6 +64,8 @@ export function deriveFlags(p: Omit<Posture, "risk" | "flags">): Flag[] {
       flags.push({ level: "medium", message: `${c.ref} unused for ${c.idle_days} days (idle limit ${p.limits.idle_disable_days})` });
   }
   if (p.auth_type !== "none") {
+    if (p.token_binding === "none")
+      flags.push({ level: "low", message: "OAuth token not sender-constrained (no DPoP): a stolen token works anywhere until it expires" });
     if (p.provider_ip_restriction === "no") flags.push({ level: "medium", message: "token works from any IP: a stolen copy is usable anywhere" });
     if (p.provider_ip_restriction === "unknown") flags.push({ level: "low", message: "provider IP restriction unknown" });
     if (p.revocable_by_api !== true) flags.push({ level: "low", message: "manual revocation only (panic can't revoke it for you)" });
@@ -128,6 +132,7 @@ export async function getPosture(pool: pg.Pool, id: string, env: Record<string, 
     scopes: { ...scopes, source: scopeSource },
     revocable_by_api: conn.credential?.revocable_by_api ?? revocableMeta ?? (a.type === "oauth2_client_credentials" && a.revocation_url ? true : a.type === "none" ? false : "unknown"),
     provider_ip_restriction: conn.credential?.provider_ip_restriction ?? "unknown",
+    token_binding: a.type === "oauth2_client_credentials" ? (a.dpop ? "dpop" : "none") : "n/a",
     revoke_hint: conn.credential?.revoke_hint ?? null,
     limits: { max_age_days: conn.credential?.max_age_days ?? null, idle_disable_days: conn.credential?.idle_disable_days ?? null },
     data: { store_raw: conn.data?.store_raw ?? false, retention_days: conn.data?.retention_days ?? null },

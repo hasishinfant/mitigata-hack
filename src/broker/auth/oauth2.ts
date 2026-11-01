@@ -1,15 +1,21 @@
 // OAuth2 client-credentials grant. Tokens live only in broker memory, are refreshed 60 s before
 // expiry, and are dropped on demand (401, disable, panic). Supports client_secret_basic,
 // client_secret_post and private_key_jwt (RFC 7523 client assertion).
-import { createPrivateKey, randomUUID, type KeyObject } from "node:crypto";
-import { SignJWT } from "jose";
+import { createHash, createPrivateKey, randomUUID, type KeyObject } from "node:crypto";
+import { exportJWK, generateKeyPair, SignJWT, type JWK } from "jose";
 import type { ResolvedConnector } from "../../config/load.ts";
 import type { HttpResult } from "../http.ts";
 import { BrokerError, type SecretSource } from "../types.ts";
 
 type OAuthCfg = Extract<ResolvedConnector["connection"]["auth"], { type: "oauth2_client_credentials" }>;
-export type TokenSender = (url: URL, headers: Record<string, string>, body: string) => Promise<HttpResult>;
-export type CachedToken = { token: string; expiresAt: number; scopes?: string[] };
+/** headers() is called for every attempt (including retries), so each attempt gets a fresh DPoP proof. */
+export type TokenSender = (url: URL, headers: () => Promise<Record<string, string>>, body: string) => Promise<HttpResult>;
+export type CachedToken = { token: string; expiresAt: number; scopes?: string[]; dpop?: boolean };
+type DpopKey = { privateKey: CryptoKey | KeyObject; jwk: JWK };
+
+const b64u = (b: Buffer) => b.toString("base64url");
+/** ath claim: base64url(sha256(access token)). */
+export const accessTokenHash = (token: string) => b64u(createHash("sha256").update(token).digest());
 
 const REFRESH_EARLY_MS = 60_000;
 const DEFAULT_TTL_MS = 3_600_000;
@@ -56,13 +62,49 @@ export async function clientAssertion(clientId: string, audience: string, keyMat
 
 export class OAuthTokenManager {
   private cache = new Map<string, CachedToken>();
+  // DPoP: one key per connector token, generated in memory, never stored or exported; dropped with the token.
+  private dpopKeys = new Map<string, DpopKey>();
+  private nonces = new Map<string, string>(); // server origin -> last DPoP-Nonce it asked for
+
+  /** A DPoP proof JWT (RFC 9449 §4) for one request. htu = URL without query and fragment. */
+  async dpopProof(connectorId: string, method: string, url: URL, now: number, accessToken?: string): Promise<string> {
+    let key = this.dpopKeys.get(connectorId);
+    if (!key) {
+      const { privateKey, publicKey } = await generateKeyPair("ES256");
+      const jwk = await exportJWK(publicKey);
+      key = { privateKey, jwk: { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y } };
+      this.dpopKeys.set(connectorId, key);
+    }
+    const nonce = this.nonces.get(url.origin);
+    return new SignJWT({
+      htm: method.toUpperCase(), htu: `${url.origin}${url.pathname}`, jti: randomUUID(),
+      ...(accessToken ? { ath: accessTokenHash(accessToken) } : {}), ...(nonce ? { nonce } : {}),
+    })
+      .setProtectedHeader({ alg: "ES256", typ: "dpop+jwt", jwk: key.jwk })
+      .setIssuedAt(Math.floor(now / 1000))
+      .sign(key.privateKey);
+  }
+
+  /** Remember a server-supplied nonce (DPoP-Nonce header). Returns true if it changed (worth one retry). */
+  learnNonce(url: URL, headers: Record<string, string>): boolean {
+    const n = headers["dpop-nonce"];
+    if (!n || this.nonces.get(url.origin) === n) return false;
+    this.nonces.set(url.origin, n);
+    return true;
+  }
 
   peek(connectorId: string): CachedToken | undefined {
     return this.cache.get(connectorId);
   }
   invalidate(connectorId?: string): void {
-    if (connectorId) this.cache.delete(connectorId);
-    else this.cache.clear();
+    // The DPoP key goes with the token: the next token is bound to a brand-new key.
+    if (connectorId) {
+      this.cache.delete(connectorId);
+      this.dpopKeys.delete(connectorId);
+    } else {
+      this.cache.clear();
+      this.dpopKeys.clear();
+    }
   }
 
   /** Client authentication for the token or revocation endpoint (RFC 6749 §2.3 / RFC 7523). */
@@ -95,9 +137,9 @@ export class OAuthTokenManager {
   }
 
   /** Returns a valid access token plus the secret values involved (for scrubbing). */
-  async get(conn: ResolvedConnector, secrets: SecretSource, send: TokenSender, now: number): Promise<{ token: string; used: string[] }> {
+  async get(conn: ResolvedConnector, secrets: SecretSource, send: TokenSender, now: number): Promise<{ token: string; used: string[]; dpop?: boolean }> {
     const hit = this.cache.get(conn.metadata.id);
-    if (hit && hit.expiresAt - REFRESH_EARLY_MS > now) return { token: hit.token, used: [hit.token] };
+    if (hit && hit.expiresAt - REFRESH_EARLY_MS > now) return { token: hit.token, used: [hit.token], ...(hit.dpop ? { dpop: true } : {}) };
 
     const auth = conn.connection.auth as OAuthCfg;
     const tokenUrl = new URL(auth.token_url, conn.connection.base_url);
@@ -106,12 +148,21 @@ export class OAuthTokenManager {
     if (auth.scopes?.length) form.set("scope", auth.scopes.join(" "));
     if (auth.audience && auth.client_auth !== "private_key_jwt") form.set("audience", auth.audience);
 
-    const res = await send(tokenUrl, headers, form.toString());
-    let json: Record<string, unknown> = {};
-    try {
-      json = JSON.parse(res.body) as Record<string, unknown>;
-    } catch {
-      /* handled below */
+    const useDpop = auth.dpop === true;
+    const attempt = () => send(tokenUrl, async () => (useDpop ? { ...headers, dpop: await this.dpopProof(conn.metadata.id, "POST", tokenUrl, Date.now()) } : headers), form.toString());
+    const parse = (r: HttpResult): Record<string, unknown> => {
+      try {
+        return JSON.parse(r.body) as Record<string, unknown>;
+      } catch {
+        return {};
+      }
+    };
+    let res = await attempt();
+    let json = parse(res);
+    // RFC 9449 §8: the server may demand a nonce; retry once with it.
+    if (useDpop && res.status === 400 && json.error === "use_dpop_nonce" && this.learnNonce(tokenUrl, res.headers)) {
+      res = await attempt();
+      json = parse(res);
     }
     if (res.status < 200 || res.status >= 300 || typeof json.access_token !== "string") {
       const code = typeof json.error === "string" ? json.error : `HTTP ${res.status}`;
@@ -119,11 +170,14 @@ export class OAuthTokenManager {
       const kind = res.status >= 500 ? "network" : "auth_failed";
       throw new BrokerError(kind, `token request failed (${code}${desc})`);
     }
+    // Fail closed: a connector that requires DPoP never uses an unbound token, even if the provider issues one.
+    if (useDpop && String(json.token_type ?? "").toLowerCase() !== "dpop")
+      throw new BrokerError("auth_failed", `provider returned a ${String(json.token_type ?? "untyped")} token, not a DPoP-bound one; refusing it (connection.auth.dpop is set)`);
     const ttl = typeof json.expires_in === "number" ? json.expires_in * 1000 : Number(json.expires_in) * 1000 || DEFAULT_TTL_MS;
     const scopes = typeof json.scope === "string" && json.scope.trim() ? json.scope.trim().split(/\s+/) : undefined;
-    const cached: CachedToken = { token: json.access_token, expiresAt: now + ttl, ...(scopes ? { scopes } : {}) };
+    const cached: CachedToken = { token: json.access_token, expiresAt: now + ttl, ...(scopes ? { scopes } : {}), ...(useDpop ? { dpop: true } : {}) };
     this.cache.set(conn.metadata.id, cached);
-    return { token: cached.token, used: [...used, cached.token] };
+    return { token: cached.token, used: [...used, cached.token], ...(useDpop ? { dpop: true } : {}) };
   }
 
   /** Connector ids that currently hold a cached token. */
@@ -144,7 +198,7 @@ export class OAuthTokenManager {
     const { headers, form } = await this.clientAuth(conn, secrets, url, now);
     form.set("token", t.token);
     form.set("token_type_hint", "access_token");
-    const res = await send(new URL(url), headers, form.toString());
+    const res = await send(new URL(url), async () => headers, form.toString());
     return res.status >= 200 && res.status < 300
       ? { revoked: true, detail: `revoked at ${new URL(url).host}` }
       : { revoked: false, detail: `revocation endpoint answered HTTP ${res.status}` };

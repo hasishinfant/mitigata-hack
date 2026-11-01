@@ -42,6 +42,9 @@ const AuthOAuth2 = z.strictObject({
   scopes: z.array(z.string().min(1)).optional(),
   audience: z.string().optional(),
   revocation_url: z.string().optional(), // RFC 7009 endpoint: panic revokes cached tokens here
+  // RFC 9449: bind every access token to a key that exists only in broker memory. A stolen token is useless
+  // without that key. The provider must support DPoP; if it returns an unbound (Bearer) token, the broker refuses it.
+  dpop: z.boolean().optional(),
 });
 export const AuthSchema = z.discriminatedUnion("type", [AuthNone, AuthApiKey, AuthBasic, AuthBearer, AuthOAuth2]);
 

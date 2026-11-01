@@ -156,6 +156,7 @@ async function showPosture(id) {
       el("div", {}, "Granted scopes"), el("div", {}, ...scopeEls),
       el("div", {}, "Revocable by API"), el("div", {}, String(p.revocable_by_api)),
       el("div", {}, "Provider IP restriction"), el("div", {}, p.provider_ip_restriction),
+      el("div", {}, "Token binding"), el("div", { class: p.token_binding === "none" ? "scope-extra" : "" }, p.token_binding === "dpop" ? "DPoP: token works only with the broker's in-memory key" : p.token_binding === "none" ? "none: a stolen token works anywhere until it expires" : "n/a (static key)"),
       el("div", {}, "Policy violations (7d)"),
       el("div", {}, p.violation_entries_7d !== p.violations_7d ? `${p.violations_7d} (${p.violation_entries_7d} ledger entries)` : String(p.violations_7d)),
       el("div", {}, "Last policy violation"), el("div", {}, p.last_violation ? `${ago(p.last_violation.ts)} · ${p.last_violation.decision}` : "none"),
