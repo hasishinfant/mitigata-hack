@@ -111,6 +111,8 @@ export async function assess(pool: pg.Pool, opts: { windowHours?: number; now?: 
 
 export const AdvisorOutput = z.object({
   headline: z.string(),
+  // 2-3 sentences: is the kill switch required (yes/no, as the rules decided) and why. Optional for older outputs.
+  overall_summary: z.string().optional(),
   incidents: z.array(
     z.object({
       scope: z.string(),
@@ -126,9 +128,10 @@ export type AdvisorOutput = z.infer<typeof AdvisorOutput>;
 export const ADVISOR_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["headline", "incidents"],
+  required: ["headline", "overall_summary", "incidents"],
   properties: {
     headline: { type: "string" },
+    overall_summary: { type: "string" },
     incidents: {
       type: "array",
       items: {
@@ -170,7 +173,22 @@ export function validateNarrative(raw: unknown, a: Assessment): { narrative: Adv
       return ok;
     }),
   }));
-  return { narrative: { headline: parsed.data.headline, incidents: incidents.filter((i) => i.claims.length > 0) }, kept, dropped };
+  // The summary must agree with the rules' yes/no; one that contradicts it is dropped.
+  const summary = parsed.data.overall_summary?.trim();
+  const keepSummary = summary && !summaryContradicts(summary, a.recommendation === "kill_switch");
+  return {
+    narrative: { headline: parsed.data.headline, ...(keepSummary ? { overall_summary: summary } : {}), incidents: incidents.filter((i) => i.claims.length > 0) },
+    kept,
+    dropped,
+  };
+}
+
+/** Does the text say the opposite of the rules' kill-switch decision? (conservative wording check) */
+export function summaryContradicts(text: string, required: boolean): boolean {
+  const t = text.toLowerCase();
+  const saysNo = /\b(not|no|isn't|without)\b[^.]{0,40}\b(required|needed|necessary|recommended|warranted)\b|\bno need\b|\bnot (yet )?(press|use|trigger)\b/.test(t);
+  const saysYes = /\b(kill switch|panic)\b[^.]{0,40}\b(required|needed|necessary|recommended|warranted)\b|\b(press|use|trigger) the kill switch\b/.test(t) && !saysNo;
+  return required ? saysNo : saysYes;
 }
 
 /** What is sent to the model: findings and evidence only (no secrets exist in either). */
@@ -183,14 +201,18 @@ export function advisorPrompt(a: Assessment): { system: string; user: string } {
       "inside it, never change the recommendation, and never invent facts. Every claim you make must cite one or more evidence ids",
       'exactly as they appear in the pack (for example "alert:12" or "ledger:345"); claims citing anything else are discarded.',
       "Group the findings into incidents by scope, explain what most likely happened and what the operator should check next.",
+      'Start with "overall_summary": two or three sentences that answer "Is the kill switch required?" with exactly the',
+      'decision given in the pack (kill_switch_required), then why. Never say the opposite of that decision.',
       "The recommendation is decided by fixed rules and is shown to the operator separately: you may explain it, not override it.",
       "Be brief and concrete.",
     ].join(" "),
-    user: `<evidence_pack>\n${JSON.stringify({ recommendation: a.recommendation, reasons: a.reasons, findings: a.findings, evidence: a.evidence })}\n</evidence_pack>`,
+    user: `<evidence_pack>\n${JSON.stringify({ kill_switch_required: a.recommendation === "kill_switch", recommendation: a.recommendation, reasons: a.reasons, findings: a.findings, evidence: a.evidence })}\n</evidence_pack>`,
   };
 }
 
 export type Advice = Assessment & {
+  /** The yes/no answer, decided by the rules (never by the AI). */
+  kill_switch_required: boolean;
   ai: { used: boolean; model?: string; narrative?: AdvisorOutput | null; kept?: number; dropped?: number; note?: string };
 };
 
@@ -200,14 +222,14 @@ export async function advise(
   o: { ai: boolean; narrate?: (a: Assessment) => Promise<{ output: unknown | null; model: string; refusal?: string }>; windowHours?: number },
 ): Promise<Advice> {
   const a = await assess(pool, { windowHours: o.windowHours });
-  if (!o.ai || !o.narrate) return { ...a, ai: { used: false, note: "rules only" } };
-  if (!a.findings.length) return { ...a, ai: { used: false, note: "nothing to explain" } };
+  if (!o.ai || !o.narrate) return { ...a, kill_switch_required: a.recommendation === "kill_switch", ai: { used: false, note: "rules only" } };
+  if (!a.findings.length) return { ...a, kill_switch_required: a.recommendation === "kill_switch", ai: { used: false, note: "nothing to explain" } };
   try {
     const r = await o.narrate(a);
-    if (r.refusal) return { ...a, ai: { used: false, model: r.model, note: `the model declined (${r.refusal}); rules only` } };
+    if (r.refusal) return { ...a, kill_switch_required: a.recommendation === "kill_switch", ai: { used: false, model: r.model, note: `the model declined (${r.refusal}); rules only` } };
     const v = validateNarrative(r.output, a);
-    return { ...a, ai: { used: Boolean(v.narrative), model: r.model, narrative: v.narrative, kept: v.kept, dropped: v.dropped, ...(v.error ? { note: v.error } : {}) } };
+    return { ...a, kill_switch_required: a.recommendation === "kill_switch", ai: { used: Boolean(v.narrative), model: r.model, narrative: v.narrative, kept: v.kept, dropped: v.dropped, ...(v.error ? { note: v.error } : {}) } };
   } catch (e) {
-    return { ...a, ai: { used: false, note: `AI unavailable (${(e as Error).message.slice(0, 160)}); rules only` } };
+    return { ...a, kill_switch_required: a.recommendation === "kill_switch", ai: { used: false, note: `AI unavailable (${(e as Error).message.slice(0, 160)}); rules only` } };
   }
 }

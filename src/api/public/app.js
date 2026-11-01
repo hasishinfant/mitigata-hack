@@ -270,13 +270,15 @@ $("receipts-close").addEventListener("click", () => $("receipts").close());
 // ---------- incident advisor ----------
 $("advisor-open").addEventListener("click", async () => {
   if (!ensureToken()) return;
-  $("advisor-body").replaceChildren(el("p", { class: "muted" }, "Analysing the last 24 hours (rules, then Claude)…"));
+  $("advisor-body").replaceChildren(el("p", { class: "muted" }, "Analysing the last 24 hours (rules, then AI)…"));
   $("advisor").showModal();
   try {
     const r = await api("/v1/advisor", { headers: { authorization: `Bearer ${tokenInput.value}` } });
     const recText = { kill_switch: "🚨 Kill switch recommended", investigate: "⚠ Investigate", monitor: "Monitor", all_clear: "✓ All clear" }[r.recommendation];
     const ai = r.ai || {};
     $("advisor-body").replaceChildren(
+      el("div", { class: `advisor-verdict ${r.kill_switch_required ? "yes" : "no"}` }, `Kill switch required: ${r.kill_switch_required ? "YES" : "NO"}`),
+      ai.used && ai.narrative && ai.narrative.overall_summary ? el("p", {}, ai.narrative.overall_summary) : null,
       el("div", { class: `advisor-rec rec-${r.recommendation}` }, el("strong", {}, recText), el("span", { class: "muted" }, ` decided by fixed rules over the last ${r.window_hours} h`)),
       el("ul", {}, r.reasons.map((x) => el("li", {}, x))),
       el("h4", {}, "Findings"),

@@ -237,3 +237,14 @@ describe("incident advisor: narrative validation", () => {
     expect(v.narrative!.incidents.map((i) => i.scope)).toEqual(["s"]); // an incident with no valid claim is dropped too
   });
 });
+
+describe("advisor summary must agree with the rules' yes/no", () => {
+  it("drops a summary that contradicts the kill-switch decision", async () => {
+    const { summaryContradicts } = await import("../src/security/advisor.ts");
+    expect(summaryContradicts("The kill switch is not required; this looks like noise.", true)).toBe(true);
+    expect(summaryContradicts("No need to press anything yet.", true)).toBe(true);
+    expect(summaryContradicts("Yes, the kill switch is required: a decoy was used.", true)).toBe(false);
+    expect(summaryContradicts("The kill switch is required immediately.", false)).toBe(true);
+    expect(summaryContradicts("No, the kill switch is not required; fix the Okta secret.", false)).toBe(false);
+  });
+});

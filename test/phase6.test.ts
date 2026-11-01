@@ -338,6 +338,7 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
       seen.push({ headers: req.headers as Record<string, unknown>, body: req.body as Record<string, unknown> });
       const content = JSON.stringify({
         headline: "Credential store compromised",
+        overall_summary: "Yes, the kill switch is required: a decoy credential was used, so the credential store is in someone's hands.",
         incidents: [{ scope: "credential store", summary: "A decoy was used.", next_steps: ["Kill switch"],
           claims: [{ text: "Decoy used", evidence_ids: [`alert:${canaryId}`] }, { text: "Invented", evidence_ids: ["ledger:0"] }] }],
       });
@@ -356,6 +357,9 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
       const r = await advise(appPool, { ai: true, narrate: (x) => adv.narrate(x) });
       expect(r.recommendation).toBe("kill_switch");
       expect(r.ai).toMatchObject({ used: true, model: "openai/gpt-oss-120b", kept: 1, dropped: 1 });
+      expect(r.kill_switch_required).toBe(true);
+      expect(r.ai.narrative!.overall_summary).toMatch(/^Yes, the kill switch is required/);
+      expect(JSON.stringify(seen.at(-1)!.body.messages)).toContain('\\"kill_switch_required\\":true');
       const req = seen.at(-1)!;
       expect(req.body).toMatchObject({ model: "openai/gpt-oss-120b", response_format: { type: "json_schema", json_schema: { strict: true } } });
       expect(req.headers.authorization).toBe("Bearer gsk_test_key_000000000000");

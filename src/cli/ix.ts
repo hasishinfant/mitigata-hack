@@ -289,6 +289,9 @@ program
   .action(
     action(async (opts: { ai: boolean; hours: string }) => {
       const r = await advise(db(), { ai: opts.ai, windowHours: Number(opts.hours), narrate: (a) => broker().narrate(a) });
+      console.log(r.kill_switch_required ? red("Kill switch required: YES") : green("Kill switch required: NO"));
+      if (r.ai.used && r.ai.narrative?.overall_summary) console.log(`${r.ai.narrative.overall_summary}\n`);
+      else console.log("");
       const rec = { kill_switch: red("KILL SWITCH RECOMMENDED"), investigate: yellow("investigate"), monitor: dim("monitor"), all_clear: green("all clear") }[r.recommendation];
       console.log(`${rec}  (rules, last ${r.window_hours} h)`);
       for (const x of r.reasons) console.log(`  · ${x}`);
