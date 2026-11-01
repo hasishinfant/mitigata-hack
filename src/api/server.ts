@@ -16,6 +16,7 @@ import { panic } from "../security/panic.ts";
 import { getPosture } from "../security/posture.ts";
 import { capabilityMatrix } from "../security/capabilities.ts";
 import { closeIncident, declareIncident, incidentState } from "../security/incident.ts";
+import { advise } from "../security/advisor.ts";
 import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "../store/connectors.ts";
 import { getHealth } from "../store/health.ts";
 import { listQuarantine } from "../store/quarantine.ts";
@@ -116,6 +117,16 @@ export function buildApi(opts: ApiOptions) {
   app.get("/v1/alerts", async (req) => {
     const limit = Math.min(Number((req.query as { limit?: string }).limit) || 50, 500);
     return { alerts: (await opts.pool.query("select id, connector_id, kind, message, created_at, delivered, channel from alerts order by id desc limit $1", [limit])).rows };
+  });
+
+  // ---- incident advisor (admin: it summarises security evidence, and the AI part costs money) ----
+  app.get("/v1/advisor", { preHandler: requireAdmin }, async (req) => {
+    const q = req.query as { ai?: string; hours?: string };
+    const admin = opts.admin;
+    return advise(opts.pool, {
+      ai: q.ai !== "0", windowHours: Math.min(Math.max(Number(q.hours) || 24, 1), 168),
+      ...(admin ? { narrate: (a) => admin.narrate(a) } : {}),
+    });
   });
 
   // ---- incident mode ----

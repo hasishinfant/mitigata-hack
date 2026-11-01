@@ -30,6 +30,8 @@ import { appendLedger, verifyLedger } from "./ledger.ts";
 import { receiptDigest } from "../engine/receipt.ts";
 import { DenialLog } from "./limits.ts";
 import { canaryKey, containsCanary, makeCanary, makeCanaryUrl } from "./canary.ts";
+import { advisorPrompt, type Assessment } from "../security/advisor.ts";
+import { claudeNarrative } from "../advisor/claude.ts";
 import type { Clock } from "./retry.ts";
 import { chainSecretSources, dbSecretSource, deleteSecret, envSecretSource, listSecrets, putSecret, unseal } from "./secrets.ts";
 import { BrokerError, type BrokerRequest, type SecretSource } from "./types.ts";
@@ -311,6 +313,27 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     forget(id);
     await audit({ connectorId: id, action: "enable", decision: "allow" });
     return { id, status: "enabled" };
+  });
+
+  // ---- incident advisor: the broker holds the Claude API key and builds the prompt itself ----
+  // (callers send the rule-based assessment, never a prompt, so this can't be used as a general Claude proxy)
+  adminApp.post("/v1/advisor/narrate", async (req) => {
+    const a = (req.body as { assessment?: Assessment } | undefined)?.assessment;
+    if (!a || !Array.isArray(a.findings) || !Array.isArray(a.evidence)) throw Object.assign(new Error("assessment is required"), { statusCode: 400 });
+    const tenant = env.IX_ADVISOR_TENANT || "demo";
+    const apiKey = await secrets.get(tenant, "anthropic_api_key");
+    if (!apiKey) throw Object.assign(new Error(`no Claude API key: ix secret set anthropic_api_key (tenant ${tenant})`), { statusCode: 409 });
+    const baseURL = env.IX_ADVISOR_BASE_URL || undefined;
+    const host = baseURL ? new URL(baseURL).host : "api.anthropic.com";
+    const { system, user } = advisorPrompt(a);
+    try {
+      const r = await claudeNarrative({ apiKey, ...(baseURL ? { baseURL } : {}), system, user });
+      await audit({ action: "advisor", method: "POST", host, path: "/v1/messages", decision: r.refusal ? `error: refusal (${r.refusal})` : "allow" });
+      return r;
+    } catch (e) {
+      await audit({ action: "advisor", method: "POST", host, path: "/v1/messages", decision: `error: ${(e as Error).name}` });
+      throw Object.assign(new Error(`Claude call failed: ${(e as Error).message.slice(0, 200)}`), { statusCode: 502 });
+    }
   });
 
   // ---- credential canaries ----

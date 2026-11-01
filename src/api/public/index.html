@@ -23,6 +23,7 @@
     <div class="right">
       <span id="updated" class="muted"></span>
       <button id="caps-open">Capabilities</button>
+      <button id="advisor-open">Advisor</button>
       <button id="panic" class="danger" title="Emergency stop: disable every connector, wipe tokens, show the revocation checklist">Kill switch</button>
     </div>
   </header>
@@ -185,6 +186,11 @@
   <dialog id="posture">
     <div class="dialog-head"><strong id="posture-title"></strong><button id="posture-close">Close</button></div>
     <div id="posture-body"></div>
+  </dialog>
+
+  <dialog id="advisor">
+    <div class="dialog-head"><strong>Incident advisor</strong><button id="advisor-close">Close</button></div>
+    <div id="advisor-body"></div>
   </dialog>
 
   <dialog id="caps">

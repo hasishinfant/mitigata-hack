@@ -23,6 +23,7 @@ export interface BrokerAdmin {
   panic(opts: { purgeSecrets?: boolean; actor?: string }): Promise<{ revocations: { connectorId: string; revoked: boolean; detail: string }[]; purged: number }>;
   /** Deliver one pending alert row; the broker reads it, builds the text and marks it delivered. */
   notify(alertId: number): Promise<{ delivered: boolean; channel: string; detail: string }>;
+  narrate(assessment: unknown): Promise<{ output: unknown | null; model: string; stop_reason: string | null; refusal?: string }>;
   createCanary(o: { tenant?: string; ref: string; kind?: "key" | "url"; prefix?: string }): Promise<{ tenant: string; ref: string; kind: string; value: string }>;
   listCanaries(tenant?: string): Promise<{ tenant: string; ref: string; kind: string; created_at: string }[]>;
   checkCanary(o: { text: string; ip?: string; ua?: string }): Promise<{ canary: boolean; ref?: string | null }>;
@@ -114,6 +115,7 @@ export function createRemoteBroker(
     panic: (o) => admin("POST", "/v1/panic", o),
     notify: (alertId) => call("POST", "/v1/notify", { alertId }),
     createCanary: (o) => admin("POST", "/v1/canaries", o),
+    narrate: (assessment) => admin("POST", "/v1/advisor/narrate", { assessment }),
     listCanaries: async (tenant) => (await admin<{ canaries: { tenant: string; ref: string; kind: string; created_at: string }[] }>("GET", `/v1/canaries${tenant ? `?tenant=${encodeURIComponent(tenant)}` : ""}`)).canaries,
     checkCanary: (o) => admin("POST", "/v1/canaries/check", o),
     enableConnector: (id) => admin("POST", `/v1/connectors/${encodeURIComponent(id)}/enable`, {}),

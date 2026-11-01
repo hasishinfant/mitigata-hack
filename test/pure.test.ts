@@ -224,3 +224,16 @@ describe("capability registry", () => {
     expect(msgs({ ip_allowlist: "unknown" }).join()).toMatch(/provider IP restriction unknown/);
   });
 });
+
+describe("incident advisor: narrative validation", () => {
+  it("output that doesn't match the schema is rejected; claims need at least one known evidence id", async () => {
+    const { validateNarrative } = await import("../src/security/advisor.ts");
+    const pack = { generated_at: "", window_hours: 24, recommendation: "kill_switch" as const, reasons: [], findings: [], evidence: [{ id: "alert:1", kind: "alert" as const, at: "", connector: null, text: "x" }] };
+    expect(validateNarrative({ headline: 1 }, pack)).toMatchObject({ narrative: null, error: "AI output did not match the schema" });
+    const v = validateNarrative({ headline: "h", incidents: [{ scope: "s", summary: "x", next_steps: [], claims: [
+      { text: "cited", evidence_ids: ["alert:1"] }, { text: "uncited", evidence_ids: [] }, { text: "half", evidence_ids: ["alert:1", "alert:2"] },
+    ] }, { scope: "empty", summary: "no valid claims", next_steps: [], claims: [{ text: "x", evidence_ids: ["ledger:9"] }] }] }, pack);
+    expect(v).toMatchObject({ kept: 1, dropped: 3 });
+    expect(v.narrative!.incidents.map((i) => i.scope)).toEqual(["s"]); // an incident with no valid claim is dropped too
+  });
+});

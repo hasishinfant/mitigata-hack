@@ -16,6 +16,7 @@ import { panic } from "../security/panic.ts";
 import { getPosture, type Level } from "../security/posture.ts";
 import { capabilityMatrix } from "../security/capabilities.ts";
 import { closeIncident, declareIncident, incidentState } from "../security/incident.ts";
+import { advise } from "../security/advisor.ts";
 import { runRehearsal } from "../security/rehearsal.ts";
 import { enqueueRun, startBoss } from "../scheduler/queue.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
@@ -279,6 +280,30 @@ incident.command("status").description("is incident mode on, and why").action(ac
     if (c?.schedule?.incident_every) console.log(`  ${id}: every ${c.schedule.incident_every} (normally ${c.schedule.every})`);
   }
 }));
+
+program
+  .command("advise")
+  .description("incident advisor: rule-based findings and kill-switch recommendation, explained by Claude (claims cite evidence)")
+  .option("--no-ai", "rules only, no Claude call")
+  .option("--hours <n>", "look back this many hours", "24")
+  .action(
+    action(async (opts: { ai: boolean; hours: string }) => {
+      const r = await advise(db(), { ai: opts.ai, windowHours: Number(opts.hours), narrate: (a) => broker().narrate(a) });
+      const rec = { kill_switch: red("KILL SWITCH RECOMMENDED"), investigate: yellow("investigate"), monitor: dim("monitor"), all_clear: green("all clear") }[r.recommendation];
+      console.log(`${rec}  (rules, last ${r.window_hours} h)`);
+      for (const x of r.reasons) console.log(`  · ${x}`);
+      for (const f of r.findings) console.log(`  ${f.severity.toUpperCase().padEnd(8)} ${f.scope}: ${f.title}  ${dim(f.evidence.join(" "))}`);
+      if (r.ai.used && r.ai.narrative) {
+        console.log(`\n${r.ai.narrative.headline}  ${dim(`(${r.ai.model}; ${r.ai.kept} claims kept, ${r.ai.dropped} dropped for citing unknown evidence)`)}`);
+        for (const i of r.ai.narrative.incidents) {
+          console.log(`  ${i.scope}: ${i.summary}`);
+          for (const c of i.claims) console.log(`    - ${c.text} ${dim(`[${c.evidence_ids.join(", ")}]`)}`);
+          for (const s of i.next_steps) console.log(`    → ${s}`);
+        }
+      } else console.log(dim(`\nAI: ${r.ai.note ?? "not used"}`));
+      if (r.recommendation === "kill_switch") console.log(red("\nIf this is confirmed: ix panic --yes (or the dashboard's Kill switch). The advisor never presses it."));
+    }),
+  );
 
 program
   .command("receipts")

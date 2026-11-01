@@ -91,3 +91,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 .cap-enforced, .cap-monitored { color: var(--green); } .cap-available { color: var(--amber); font-weight: 600; }
 .cap-unknown { color: var(--amber); } .cap-unsupported, .cap-not_applicable { color: var(--muted); }
 .incident-banner { border: 2px solid var(--amber); background: #422006; color: #fde68a; border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 13px; }
+.advisor-rec { padding: 8px 10px; border-radius: 8px; border: 2px solid var(--line); margin-bottom: 6px; }
+.rec-kill_switch { border-color: var(--red); background: #450a0a; } .rec-investigate { border-color: var(--amber); } .rec-all_clear { border-color: var(--green); }
+.sev { font-size: 11px; font-weight: 700; } .sev-critical { color: var(--red); } .sev-high { color: var(--orange); } .sev-medium { color: var(--amber); } .sev-low { color: var(--muted); }
+.advisor-incident { border-left: 3px solid var(--line); padding-left: 8px; margin: 6px 0; }

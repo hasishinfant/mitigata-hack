@@ -267,6 +267,40 @@ async function resolveHeld(id, syncId, action) {
 }
 $("receipts-close").addEventListener("click", () => $("receipts").close());
 
+// ---------- incident advisor ----------
+$("advisor-open").addEventListener("click", async () => {
+  if (!ensureToken()) return;
+  $("advisor-body").replaceChildren(el("p", { class: "muted" }, "Analysing the last 24 hours (rules, then Claude)…"));
+  $("advisor").showModal();
+  try {
+    const r = await api("/v1/advisor", { headers: { authorization: `Bearer ${tokenInput.value}` } });
+    const recText = { kill_switch: "🚨 Kill switch recommended", investigate: "⚠ Investigate", monitor: "Monitor", all_clear: "✓ All clear" }[r.recommendation];
+    const ai = r.ai || {};
+    $("advisor-body").replaceChildren(
+      el("div", { class: `advisor-rec rec-${r.recommendation}` }, el("strong", {}, recText), el("span", { class: "muted" }, ` decided by fixed rules over the last ${r.window_hours} h`)),
+      el("ul", {}, r.reasons.map((x) => el("li", {}, x))),
+      el("h4", {}, "Findings"),
+      r.findings.length
+        ? el("ul", {}, r.findings.map((f) => el("li", {}, el("span", { class: `sev sev-${f.severity}` }, f.severity.toUpperCase()), ` ${f.scope}: ${f.title} `, el("span", { class: "muted" }, f.evidence.join(" ")))))
+        : el("p", { class: "muted" }, "none"),
+      el("h4", {}, "Explanation"),
+      ai.used && ai.narrative
+        ? el("div", {},
+          el("p", {}, el("strong", {}, ai.narrative.headline)),
+          ...ai.narrative.incidents.map((i) => el("div", { class: "advisor-incident" },
+            el("div", {}, el("strong", {}, i.scope), `: ${i.summary}`),
+            el("ul", {}, i.claims.map((c) => el("li", {}, `${c.text} `, el("span", { class: "muted" }, `[${c.evidence_ids.join(", ")}]`)))),
+            i.next_steps.length ? el("div", { class: "muted" }, `Next: ${i.next_steps.join(" · ")}`) : null)),
+          el("p", { class: "muted" }, `${ai.model} · ${ai.kept} claims kept, ${ai.dropped} dropped for citing evidence that doesn't exist · the AI can't change the recommendation`))
+        : el("p", { class: "muted" }, `AI: ${ai.note || "not used"}`),
+      r.recommendation === "kill_switch" ? el("p", { class: "error" }, "If confirmed, press Kill switch. The advisor never presses it.") : null,
+    );
+  } catch (e) {
+    $("advisor-body").replaceChildren(el("p", { class: "bad" }, `Advisor failed: ${e.message}`));
+  }
+});
+$("advisor-close").addEventListener("click", () => $("advisor").close());
+
 // ---------- capability registry ----------
 $("caps-open").addEventListener("click", async () => {
   const m = await api("/v1/capabilities");
