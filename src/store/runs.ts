@@ -1,7 +1,7 @@
 // Postgres implementation of the engine's RunStore, plus run history queries.
 import type pg from "pg";
 import type pgTypes from "pg";
-import { RunFailure, type Checkpoint, type FieldStats, type FinishedRun, type PageCommit, type RunStatus, type RunStore } from "../engine/runner.ts";
+import { LOCK_LOST, RunFailure, type Checkpoint, type FieldStats, type FinishedRun, type PageCommit, type RunStatus, type RunStore } from "../engine/runner.ts";
 import { withTx } from "./db.ts";
 import { insertQuarantine } from "./quarantine.ts";
 import { upsertRecords } from "./upsert.ts";
@@ -15,7 +15,7 @@ export type PgRunStoreOptions = {
 
 export function createPgRunStore(pool: pg.Pool, opts: PgRunStoreOptions = {}): RunStore {
   const held = new Map<string, RunLock>(); // connector -> the run lock this store's run holds
-  const LOST = "run lock lost (its database session ended); nothing more was committed";
+  const LOST = `${LOCK_LOST} (its database session ended); nothing more was committed`;
 
   /**
    * A run's writes go through the lock-holding session when the run holds a lock (single-flight is then a property
@@ -130,8 +130,11 @@ export function createPgRunStore(pool: pg.Pool, opts: PgRunStoreOptions = {}): R
 
     async recentStatuses(connectorId, n): Promise<RunStatus[]> {
       const r = await pool.query(
-        "select status from runs where connector_id = $1 and status <> 'running' order by started_at desc, finished_at desc limit $2",
-        [connectorId, n],
+        // Lock-loss failures are coordination failures, not provider failures: they don't count in a streak.
+        `select status from runs where connector_id = $1 and status <> 'running'
+           and not (status = 'failed' and coalesce(last_error, '') like $3)
+         order by started_at desc, finished_at desc limit $2`,
+        [connectorId, n, `${LOCK_LOST}%`],
       );
       return r.rows.map((x) => x.status as RunStatus);
     },

@@ -63,6 +63,7 @@ export interface RunStore {
   loadCheckpoint(connectorId: string, stream: string): Promise<Checkpoint | null>;
   previousFieldStats(connectorId: string, stream: string, excludeRunId: string): Promise<FieldStats | null>;
   connectorState(connectorId: string): Promise<{ status: string; pausedUntil: Date | null; reason: string | null }>;
+  /** Latest finished run statuses, newest first, excluding lock-loss failures (see LOCK_LOST). */
   recentStatuses(connectorId: string, n: number): Promise<RunStatus[]>;
   pause(connectorId: string, until: Date, reason: string): Promise<void>;
   resume(connectorId: string): Promise<void>;
@@ -108,6 +109,14 @@ export class RunFailure extends Error {
 }
 
 const FAILURE: RunStatus[] = ["failed", "auth_failed"];
+
+/**
+ * Prefix of last_error for a run that lost its run lock. That is an execution-coordination failure (a database
+ * session ended), not evidence the provider is unhealthy: it never opens the circuit breaker, never raises a
+ * consecutive-failure alert, and is left out of failure streaks (RunStore.recentStatuses).
+ */
+export const LOCK_LOST = "run lock lost";
+export const isLockLoss = (lastError: string | undefined | null): boolean => Boolean(lastError?.startsWith(LOCK_LOST));
 const DRIFT_MIN_RECORDS = 5;
 const DRIFT_JUMP = 0.5;
 const RAW_LIMIT = 16 * 1024;
@@ -373,7 +382,7 @@ export async function runStream(opts: {
   if (finished.watermarkSaved) summary.watermark = watermark;
   if (summary.status === "degraded" || summary.status === "auth_failed")
     await store.raiseAlert(connectorId, summary.status, `${stream.name}: ${summary.lastError}`);
-  if (FAILURE.includes(summary.status)) {
+  if (FAILURE.includes(summary.status) && !isLockLoss(summary.lastError)) {
     await maybeOpenBreaker(conn, store, summary);
     // Fire once per failure streak, when it reaches alerts.on_consecutive_failures.
     const n = conn.alerts?.on_consecutive_failures ?? 3;

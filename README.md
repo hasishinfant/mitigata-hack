@@ -11,6 +11,8 @@ It is designed for the case where the hub itself is breached. A credential broke
 
 ## Setup (macOS, Homebrew Postgres 16)
 
+**Node 22.19 or later.** That's the real minimum: the broker's HTTP client (`undici` 8) needs Node ≥ 22.19 and the job queue (`pg-boss` 12) needs ≥ 22.12. The ESLint 10 lint gate (Node ≥ 22.13 on the 22 line) fits within that. The earlier `>=20.12` didn't match the dependencies.
+
 ```sh
 npx pnpm@10.28.0 install
 cp .env.example .env                      # app settings (no broker secrets)
@@ -64,6 +66,7 @@ open http://localhost:7070    # dashboard: health cards, run history, records, q
 - **Worker:** runs the queued jobs. Only one run per connector can be queued or active at a time.
 - **Single-flight runs:** every run, from the worker or `ix run`, holds a PostgreSQL session advisory lock for its connector for the whole run, on a dedicated connection. A second run of the same connector is refused: `ix run` exits with code 2 and "already running", and the worker skips the job. Different connectors run in parallel. If the holding process dies, PostgreSQL drops its session and the lock with it.
   - **Writes happen on the lock's session.** Page commits and the final status-plus-watermark transaction run on the connection that holds the lock. PostgreSQL releases the lock only when that session ends, and ending a session rolls back any transaction still open on it. So an old run's write either commits while it still holds the lock or not at all; a replacement can only take the lock after that. A run that lost its lock writes no more records, checkpoints or watermark. Only its own run-history row is marked `failed`, through another connection. A session ping before each request stops it early.
+  - **Lock loss is not a provider failure.** Its run is `failed` with an error starting "run lock lost". That never opens the circuit breaker or raises a consecutive-failure alert, and it's left out of failure streaks. A provider request that was already in flight when the session died may still finish, but its results can't be committed.
 - **Atomic finalisation:** a run's final status and its new watermark are written in one transaction. If that transaction fails, the run stays `running`, the watermark is unchanged, and the next run re-fetches the same window.
 - **API:** read routes are open on localhost. Routes that change state need `Authorization: Bearer $IX_ADMIN_TOKEN`; the dashboard's "Run now" button asks for the token.
 - **Hygiene and alerts:** the scheduler disables connectors past `credential.idle_disable_days`, flags credentials past `max_age_days`, and delivers failure, auth, drift, breaker and panic alerts through the broker. Store webhook URLs as broker secrets; only `hooks.slack.com` is allowed by default (`IX_ALERT_WEBHOOK_HOSTS` can add approved hosts).

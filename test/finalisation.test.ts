@@ -5,7 +5,7 @@
 //     lock is the only one whose records, checkpoint and watermark remain. Deterministic: the old transaction is
 //     paused at a hook just before COMMIT while the test kills its session and runs the replacement.
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type { Broker } from "../src/broker/types.ts";
+import { BrokerError, type Broker } from "../src/broker/types.ts";
 import { runConnector } from "../src/engine/runner.ts";
 import { createPool, type Pool } from "../src/store/db.ts";
 import { loadActiveConnector, registerConnector } from "../src/store/connectors.ts";
@@ -218,5 +218,63 @@ describe.skipIf(!hasDb)("run finalisation and lock loss", () => {
     expect((await one("select cursor_value from checkpoints where connector_id = $1", [ID])).cursor_value).toBe("2026-02-02T00:00:00.000Z");
     const statuses = (await poolA.query("select status from runs where connector_id = $1 order by started_at", [ID])).rows.map((r) => r.status);
     expect(statuses).toEqual(["failed", "success"]);
+  });
+
+  it("lock loss does not feed the circuit breaker or failure streaks; real provider failures still do", async () => {
+    const id = "fin-breaker";
+    await registerConnector(
+      regPool(),
+      YAML.replace(`id: ${ID}`, `id: ${id}`) + "reliability: { circuit_breaker: { failures_to_open: 2 } }\nalerts: { on_consecutive_failures: 2 }\n",
+      { env: {} },
+    );
+    const conn = await loadActiveConnector(poolA, id, {});
+    const down: Broker = {
+      async request() {
+        throw new BrokerError("network", "network error: ECONNREFUSED");
+      },
+      async credentialInfo() {
+        return {};
+      },
+    };
+    const state = async () => (await one("select status from connectors where id = $1", [id])).status;
+    const alertKinds = async () => (await poolA.query("select kind from alerts where connector_id = $1 order by id", [id])).rows.map((r) => r.kind);
+
+    // 1. A real provider failure: one away from both the breaker (2) and the alert (2).
+    expect((await runConnector({ connector: conn, broker: down, store: createPgRunStore(poolA) }))[0]?.status).toBe("failed");
+    expect(await state()).toBe("enabled");
+
+    // 2. The next run loses its lock mid-commit (session terminated before COMMIT): failed, but not a provider failure.
+    let paused!: () => void;
+    const atCommit = new Promise<void>((r) => (paused = r));
+    let resume!: () => void;
+    const gate = new Promise<void>((r) => (resume = r));
+    const store = createPgRunStore(poolA, {
+      beforeCommit: async () => {
+        paused();
+        await gate;
+      },
+    });
+    const lostRun = runConnector({ connector: conn, broker: broker(() => [ev("x", 1)]).b, store });
+    await atCommit;
+    const k = BigInt(runLockKey(id));
+    const pid = (
+      await adminPool.query(
+        "select pid from pg_locks where locktype = 'advisory' and granted and classid = $1::bigint::oid and objid = $2::bigint::oid and objsubid = 1",
+        [BigInt.asUintN(32, k >> 32n).toString(), BigInt.asUintN(32, k).toString()],
+      )
+    ).rows[0].pid;
+    await adminPool.query("select pg_terminate_backend($1)", [pid]);
+    resume();
+    expect((await lostRun)[0]).toMatchObject({ status: "failed", lastError: expect.stringMatching(/^run lock lost/) });
+
+    expect(await state()).toBe("enabled"); // breaker not opened
+    expect(await alertKinds()).toEqual([]); // no consecutive_failures / circuit_open alert
+    expect(await createPgRunStore(poolA).recentStatuses(id, 5)).toEqual(["failed"]); // only the real failure counts
+    expect((await poolA.query("select status from runs where connector_id = $1", [id])).rowCount).toBe(2); // both rows kept
+
+    // 3. Another real failure: the streak is 2 (the lock-loss row neither counted nor broke it), so the breaker opens.
+    await runConnector({ connector: conn, broker: down, store: createPgRunStore(poolA) });
+    expect(await state()).toBe("paused");
+    expect(await alertKinds()).toEqual(["circuit_open", "consecutive_failures"]);
   });
 });
