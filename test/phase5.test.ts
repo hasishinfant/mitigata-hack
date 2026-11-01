@@ -13,6 +13,8 @@ import { createScheduler, nextRunAt } from "../src/scheduler/scheduler.ts";
 import { createPool, type Pool } from "../src/store/db.ts";
 import { registerConnector } from "../src/store/connectors.ts";
 import { deriveHealth } from "../src/store/health.ts";
+import { acquireRunLock, closeRunLocks } from "../src/store/runLock.ts";
+import { createPgRunStore } from "../src/store/runs.ts";
 import { createWorker } from "../src/worker/worker.ts";
 import { buildMock, MOCK_TOKENS, type Mock } from "../mock/server.ts";
 import { clearData, hasDb, regPool, testUrl } from "./helpers/db.ts";
@@ -60,6 +62,7 @@ describe.skipIf(!hasDb)("scheduler, worker, API", () => {
   }, 60_000);
   afterAll(async () => {
     await boss?.stop({ graceful: false });
+    await closeRunLocks(pool);
     await pool?.end();
     await mock?.app.close();
   });
@@ -88,6 +91,40 @@ describe.skipIf(!hasDb)("scheduler, worker, API", () => {
     const next = (await pool.query("select id, next_run_at from connectors order by id")).rows;
     expect(next[0].next_run_at).toBe(new Date(t + 3_600_000).toISOString());
     expect(next[1].next_run_at).toBe(new Date(Date.parse("2026-10-31T12:00:00Z") + 6 * 3_600_000).toISOString());
+  });
+
+  it("catch-up after downtime: a connector overdue by days runs once, then resumes its normal interval", async () => {
+    await register("mock-github-members.yaml"); // every 1h
+    await scheduler().tick(); // first sighting sets next_run_at
+    await boss.deleteAllJobs(RUN_QUEUE);
+    await pool.query("update connectors set next_run_at = $1", [new Date(t - 10 * 86_400_000)]); // hub down for 10 days
+    const r = await scheduler().tick();
+    expect(r.enqueued).toEqual(["mock-github-members"]); // once, not 240 times
+    expect((await queued()).length).toBe(1);
+    expect((await pool.query("select next_run_at from connectors")).rows[0].next_run_at).toBe(new Date(t + 3_600_000).toISOString()); // from now, not from the past
+    expect((await scheduler().tick()).enqueued).toEqual([]);
+  });
+
+  it("abandoned-run recovery: a 'running' row with nobody holding its run lock is marked failed; a live run is left alone", async () => {
+    await register("mock-github-members.yaml");
+    await register("mock-nvd-cves.yaml");
+    const store = createPgRunStore(pool);
+    const start = (id: string, runId: string) => store.startRun({ runId, connectorId: id, stream: "s", configHash: "x", startedAt: new Date(), resumed: false, trigger: "schedule" });
+    await start("mock-github-members", "00000000-0000-4000-8000-0000000000c1"); // its worker crashed: no lock
+    const live = await acquireRunLock(pool, "mock-nvd-cves"); // a run in progress elsewhere
+    await start("mock-nvd-cves", "00000000-0000-4000-8000-0000000000c2");
+    try {
+      const r = await scheduler().tick();
+      expect(r.recovered).toEqual([{ connectorId: "mock-github-members", runs: 1 }]);
+      const rows = (await pool.query("select connector_id, status, last_error from runs order by connector_id")).rows;
+      expect(rows[0]).toMatchObject({ connector_id: "mock-github-members", status: "failed", last_error: expect.stringMatching(/^abandoned: /) });
+      expect(rows[1]).toMatchObject({ connector_id: "mock-nvd-cves", status: "running" });
+      expect(await store.recentStatuses("mock-github-members", 5)).toEqual([]); // not a provider failure: no breaker streak
+      const health = (await buildApi({ pool, env }).inject({ url: "/v1/health" })).json();
+      expect(health.connectors.find((c: { id: string }) => c.id === "mock-github-members").health).not.toBe("running");
+    } finally {
+      await live!.release();
+    }
   });
 
   it("exclusive queue: a manual run can't double up with a queued one", async () => {

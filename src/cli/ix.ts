@@ -15,7 +15,7 @@ import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "
 import { panic } from "../security/panic.ts";
 import { getPosture, type Level } from "../security/posture.ts";
 import { runRehearsal } from "../security/rehearsal.ts";
-import { startBoss } from "../scheduler/queue.ts";
+import { enqueueRun, startBoss } from "../scheduler/queue.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
 import { listQuarantine } from "../store/quarantine.ts";
 import { createPgRunStore, listRuns } from "../store/runs.ts";
@@ -161,12 +161,14 @@ for (const [name, desc] of [
 
 program
   .command("run")
-  .description("sync a connector now")
+  .description("sync a connector now: queued for the worker (same path as scheduled runs), waits for the result")
   .argument("<id>")
-  .option("-s, --stream <name...>", "only these streams")
+  .option("-s, --stream <name...>", "only these streams (runs here, like --local)")
+  .option("--local", "run in this process instead of through the job queue (still single-flight per connector)")
   .action(
-    action(async (id: string, opts: { stream?: string[] }) => {
+    action(async (id: string, opts: { stream?: string[]; local?: boolean }) => {
       const conn = await loadActiveConnector(db(), id);
+      if (!opts.local && !opts.stream) return runQueued(conn.metadata.id, conn.streams.length);
       let results;
       try {
         results = await runConnector({ connector: conn, broker: broker(), store: createPgRunStore(db()), streams: opts.stream });
@@ -298,6 +300,56 @@ for (const [name, action_] of [["approve", "publish a held sync's staged records
         console.log(`${green("✔")} ${name === "approve" ? `published ${r.records}` : `discarded ${r.records}`} records of ${r.connectorId}; receipt #${r.receiptId}${anchored ? "" : yellow(" (not anchored: broker unreachable)")}`);
       }),
     );
+
+/** ix run through the job queue: one execution path for manual and scheduled runs. Waits for the worker's result. */
+async function runQueued(id: string, streams: number): Promise<void> {
+  const boss = await startBoss(process.env.DATABASE_URL_APP!);
+  try {
+    const t0 = new Date(Date.now() - 1000);
+    const jobId = await enqueueRun(boss, { connectorId: id, trigger: "manual" });
+    if (!jobId) {
+      console.log(yellow(`⏳ a run of ${id} is already queued or running; follow it with: ix runs ${id}`));
+      return;
+    }
+    console.log(dim(`queued ${id} (job ${jobId}); waiting for the worker…`));
+    const started = Date.now();
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const rows = (
+        await db().query(
+          `select r.id, r.stream, r.status, r.requests, r.records_ok, r.records_quarantined, r.retries, r.rate_limited_ms, r.resumed, r.last_error,
+                  s.id as receipt_id, s.decision, s.digest, s.sync_id, (s.body->>'records_published')::int as published
+           from runs r left join sync_receipts s on s.run_id = r.id and s.kind = 'run'
+           where r.connector_id = $1 and r.started_at >= $2 order by r.started_at`,
+          [id, t0],
+        )
+      ).rows;
+      if (!rows.length && Date.now() - started > 20_000) {
+        console.log(yellow("no worker picked the job up in 20 s: is the platform running (pnpm dev)? The job stays queued. Or run it here: ix run --local " + id));
+        process.exitCode = 2;
+        return;
+      }
+      if (rows.length < streams || rows.some((r) => r.status === "running")) continue;
+      for (const r of rows) {
+        console.log(
+          `${String(r.stream).padEnd(12)} ${paint(r.status).padEnd(tty ? 21 : 12)} requests=${r.requests} ok=${r.records_ok} quarantined=${r.records_quarantined}` +
+            (r.retries ? ` retries=${r.retries}` : "") + (r.rate_limited_ms ? ` waited=${(r.rate_limited_ms / 1000).toFixed(1)}s` : "") +
+            (r.resumed ? yellow(" (resumed from checkpoint)") : "") + (r.last_error ? dim(`  ${r.last_error}`) : ""),
+        );
+        if (r.decision)
+          console.log(
+            `${"".padEnd(13)}${DECISION_COLOR[r.decision]?.(r.decision) ?? r.decision} · published ${r.published ?? 0}` +
+              dim(` · receipt #${r.receipt_id} sha256:${String(r.digest).slice(0, 12)}…`) +
+              (r.decision === "held" ? yellow(`  → review: ix held · ix approve ${r.sync_id} · ix discard ${r.sync_id}`) : ""),
+          );
+      }
+      if (rows.some((r) => !["success", "partial", "paused"].includes(r.status))) process.exitCode = 1;
+      return;
+    }
+  } finally {
+    await boss.stop({ graceful: false }).catch(() => {});
+  }
+}
 
 program
   .command("runs")

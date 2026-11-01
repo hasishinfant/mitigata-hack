@@ -1,12 +1,12 @@
 // Postgres implementation of the engine's RunStore, plus run history queries.
 import type pg from "pg";
 import type pgTypes from "pg";
-import { LOCK_LOST, RunFailure, type Checkpoint, type FieldStats, type FinishedRun, type PageCommit, type RunStatus, type RunStore } from "../engine/runner.ts";
+import { ABANDONED, LOCK_LOST, RunFailure, type Checkpoint, type FieldStats, type FinishedRun, type PageCommit, type RunStatus, type RunStore } from "../engine/runner.ts";
 import { withTx } from "./db.ts";
 import { insertQuarantine } from "./quarantine.ts";
 import { baselineSchema, discardSync, holdSync, insertReceipt, promoteSync, stagePage } from "./staging.ts";
 import { raiseAlertOnce } from "../security/alerts.ts";
-import { acquireRunLock, LockLost, type RunLock } from "./runLock.ts";
+import { acquireRunLock, isConnectorRunning, LockLost, type RunLock } from "./runLock.ts";
 
 export type PgRunStoreOptions = {
   /** Test hook: called inside a write transaction after its writes, just before COMMIT. */
@@ -176,10 +176,11 @@ export function createPgRunStore(pool: pg.Pool, opts: PgRunStoreOptions = {}): R
     async recentStatuses(connectorId, n): Promise<RunStatus[]> {
       const r = await pool.query(
         // Lock-loss failures are coordination failures, not provider failures: they don't count in a streak.
+        // So are abandoned runs (a crashed worker is not evidence the provider is unhealthy).
         `select status from runs where connector_id = $1 and status <> 'running'
-           and not (status = 'failed' and coalesce(last_error, '') like $3)
+           and not (status = 'failed' and (coalesce(last_error, '') like $3 or coalesce(last_error, '') like $4))
          order by started_at desc, finished_at desc limit $2`,
-        [connectorId, n, `${LOCK_LOST}%`],
+        [connectorId, n, `${LOCK_LOST}%`, `${ABANDONED}%`],
       );
       return r.rows.map((x) => x.status as RunStatus);
     },
@@ -232,4 +233,22 @@ export async function listRuns(pool: pg.Pool, connectorId: string, limit = 20) {
     [connectorId, limit],
   );
   return res.rows;
+}
+
+/**
+ * Abandoned-run recovery. A run row still "running" for a connector whose run lock nobody holds can't be in progress
+ * anywhere (every run holds the lock from before startRun until after finishRun), so its process stopped mid-run.
+ * Mark it failed; its staged sync stays resumable from the last committed checkpoint. No time threshold needed.
+ */
+export async function recoverAbandonedRuns(pool: pg.Pool): Promise<{ connectorId: string; runs: number }[]> {
+  const out: { connectorId: string; runs: number }[] = [];
+  for (const { connector_id } of (await pool.query("select distinct connector_id from runs where status = 'running'")).rows as { connector_id: string }[]) {
+    if (await isConnectorRunning(pool, connector_id)) continue;
+    const r = await pool.query(
+      `update runs set status = 'failed', finished_at = now(), last_error = $2 where connector_id = $1 and status = 'running'`,
+      [connector_id, `${ABANDONED} the process running it stopped mid-run (recovered; the next run resumes from the last checkpoint)`],
+    );
+    if (r.rowCount) out.push({ connectorId: connector_id, runs: r.rowCount });
+  }
+  return out;
 }

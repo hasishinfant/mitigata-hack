@@ -151,6 +151,8 @@ const FAILURE: RunStatus[] = ["failed", "auth_failed"];
  */
 export const LOCK_LOST = "run lock lost";
 export const isLockLoss = (lastError: string | undefined | null): boolean => Boolean(lastError?.startsWith(LOCK_LOST));
+/** Prefix of last_error for a run recovered as abandoned (its process stopped mid-run). Also not a provider failure. */
+export const ABANDONED = "abandoned:";
 const DRIFT_MIN_RECORDS = 5;
 const DRIFT_JUMP = 0.5;
 const RAW_LIMIT = 16 * 1024;

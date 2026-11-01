@@ -147,3 +147,11 @@ export async function acquireRunLock(data: pg.Pool, connectorId: string): Promis
     },
   };
 }
+
+/** Is a run of this connector in progress anywhere? (Someone holds its run lock.) Used by abandoned-run recovery. */
+export async function isConnectorRunning(data: pg.Pool, connectorId: string): Promise<boolean> {
+  const lock = await acquireRunLock(data, connectorId);
+  if (!lock) return true;
+  await lock.release();
+  return false;
+}

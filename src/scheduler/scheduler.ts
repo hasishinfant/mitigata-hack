@@ -7,10 +7,11 @@ import type { PgBoss } from "pg-boss";
 import type pg from "pg";
 import { loadActiveConnector } from "../store/connectors.ts";
 import { enqueueRun } from "./queue.ts";
+import { recoverAbandonedRuns } from "../store/runs.ts";
 
 const LOCK_KEY = 74_201_105; // arbitrary constant for pg_try_advisory_lock
 
-export type TickResult = { enqueued: string[]; skipped: { id: string; reason: string }[] };
+export type TickResult = { enqueued: string[]; skipped: { id: string; reason: string }[]; recovered: { connectorId: string; runs: number }[] };
 
 export function nextRunAt(fromMs: number, everyMs: number, jitterMs: number, random: () => number = Math.random): Date {
   return new Date(fromMs + everyMs + Math.floor(random() * jitterMs));
@@ -29,12 +30,15 @@ export function createScheduler(opts: {
   const say = opts.log ?? (() => {});
 
   async function tick(): Promise<TickResult> {
-    const out: TickResult = { enqueued: [], skipped: [] };
+    const out: TickResult = { enqueued: [], skipped: [], recovered: [] };
     const client = await opts.pool.connect();
     try {
       const locked = (await client.query("select pg_try_advisory_lock($1) as ok", [LOCK_KEY])).rows[0].ok as boolean;
       if (!locked) return out;
       try {
+        // Recovery first, through the same run-lock mechanism every executor uses.
+        out.recovered = await recoverAbandonedRuns(opts.pool);
+        for (const r of out.recovered) say(`recovered ${r.runs} abandoned run(s) of ${r.connectorId}`);
         const rows = (
           await client.query("select id, status, paused_until, next_run_at from connectors where status in ('enabled', 'paused') order by id")
         ).rows as { id: string; status: string; paused_until: Date | null; next_run_at: Date | null }[];
