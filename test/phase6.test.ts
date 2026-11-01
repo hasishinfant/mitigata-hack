@@ -282,7 +282,7 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
 
       // No key yet: rules only, clearly labelled.
       const noKey = await advise(appPool, { ai: true, narrate: (x) => adv.narrate(x) });
-      expect(noKey).toMatchObject({ recommendation: "kill_switch", ai: { used: false, note: expect.stringMatching(/no Claude API key/) } });
+      expect(noKey).toMatchObject({ recommendation: "kill_switch", ai: { used: false, note: expect.stringMatching(/no AI key/) } });
 
       await remote.putSecret("demo", "anthropic_api_key", "sk-ant-test-key-0000000000");
       reply = () => message({
@@ -327,6 +327,43 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     } finally {
       await s2.adminApp.close();
       await claude.close();
+    }
+  });
+
+  it("advisor via Groq when no Claude key: strict JSON schema, key only as a header, citations validated", async () => {
+    const seen: { headers: Record<string, unknown>; body: Record<string, unknown> }[] = [];
+    const groq = Fastify();
+    let canaryId = 0;
+    groq.post("/openai/v1/chat/completions", async (req) => {
+      seen.push({ headers: req.headers as Record<string, unknown>, body: req.body as Record<string, unknown> });
+      const content = JSON.stringify({
+        headline: "Credential store compromised",
+        incidents: [{ scope: "credential store", summary: "A decoy was used.", next_steps: ["Kill switch"],
+          claims: [{ text: "Decoy used", evidence_ids: [`alert:${canaryId}`] }, { text: "Invented", evidence_ids: ["ledger:0"] }] }],
+      });
+      return { id: "c1", model: "openai/gpt-oss-120b", choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content } }] };
+    });
+    await groq.listen({ host: "127.0.0.1", port: 0 });
+    const groqUrl = `http://127.0.0.1:${(groq.server.address() as AddressInfo).port}/openai/v1`;
+    const s2 = createBrokerServer({ pool: brokerPool, masterKey, env: { ...env, IX_ADVISOR_GROQ_BASE_URL: groqUrl }, adminToken });
+    const a2 = join(tmpdir(), `ixb-groq-${process.pid}.sock`);
+    await listenOnSocket(s2.adminApp, a2);
+    const adv = createRemoteBroker(socketPath, { adminSocketPath: a2, adminToken });
+    try {
+      await brokerPool.query("delete from credentials where ref = 'anthropic_api_key'");
+      await remote.putSecret("demo", "groq_api_key", "gsk_test_key_000000000000");
+      canaryId = (await appPool.query("insert into alerts (connector_id, kind, message) values (null, 'canary_triggered', 'decoy used from 203.0.113.9') returning id")).rows[0].id;
+      const r = await advise(appPool, { ai: true, narrate: (x) => adv.narrate(x) });
+      expect(r.recommendation).toBe("kill_switch");
+      expect(r.ai).toMatchObject({ used: true, model: "openai/gpt-oss-120b", kept: 1, dropped: 1 });
+      const req = seen.at(-1)!;
+      expect(req.body).toMatchObject({ model: "openai/gpt-oss-120b", response_format: { type: "json_schema", json_schema: { strict: true } } });
+      expect(req.headers.authorization).toBe("Bearer gsk_test_key_000000000000");
+      expect(JSON.stringify(req.body)).not.toContain("gsk_test");
+      expect(JSON.stringify(req.body.messages)).toContain("<evidence_pack>");
+    } finally {
+      await s2.adminApp.close();
+      await groq.close();
     }
   });
 

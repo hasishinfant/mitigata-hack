@@ -24,7 +24,7 @@ Mitigata CyberForge · Problem Statement 05
    - **Foreign-IP detection** from the provider's own audit log.
    - **Incident mode:** audit logs poll every 2 min instead of 15.
 4. **Token binding.** DPoP-bound OAuth tokens: a stolen token is useless off the hub.
-5. **Incident advisor.** Fixed rules decide whether to recommend the kill switch. Claude explains why, and every claim must cite evidence.
+5. **Incident advisor.** Fixed rules decide whether to recommend the kill switch. An LLM (Claude, or Groq) explains why, and every claim must cite evidence.
 6. **One-click kill switch.** Disables everything, cancels runs and revokes tokens at the provider.
 7. **Capability registry.** For every connector and every security control: enforced, available, unsupported or not applicable.
 
@@ -208,7 +208,7 @@ ix canary create slack_webhook_prod --url --print
 | `ix posture` / `ix capabilities` | Security posture per connector |
 | `ix canary create` / `ix canary list` | Decoy credentials |
 | `ix incident start` / `stop` / `status` | Incident mode |
-| `ix advise` | Incident advisor |
+| `ix advise` | Incident advisor (AI key: `ix secret set anthropic_api_key` or `groq_api_key`) |
 | `ix rehearse` / `ix panic --yes` / `ix enable` | Kill switch |
 | `ix audit verify` / `ix audit log` | Tamper-evident ledger |
 

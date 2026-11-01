@@ -32,6 +32,7 @@ import { DenialLog } from "./limits.ts";
 import { canaryKey, containsCanary, makeCanary, makeCanaryUrl } from "./canary.ts";
 import { advisorPrompt, type Assessment } from "../security/advisor.ts";
 import { claudeNarrative } from "../advisor/claude.ts";
+import { GROQ_BASE_URL, groqNarrative } from "../advisor/groq.ts";
 import type { Clock } from "./retry.ts";
 import { chainSecretSources, dbSecretSource, deleteSecret, envSecretSource, listSecrets, putSecret, unseal } from "./secrets.ts";
 import { BrokerError, type BrokerRequest, type SecretSource } from "./types.ts";
@@ -322,7 +323,22 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     if (!a || !Array.isArray(a.findings) || !Array.isArray(a.evidence)) throw Object.assign(new Error("assessment is required"), { statusCode: 400 });
     const tenant = env.IX_ADVISOR_TENANT || "demo";
     const apiKey = await secrets.get(tenant, "anthropic_api_key");
-    if (!apiKey) throw Object.assign(new Error(`no Claude API key: ix secret set anthropic_api_key (tenant ${tenant})`), { statusCode: 409 });
+    if (!apiKey) {
+      // No Claude key: use Groq if its key is stored.
+      const groqKey = await secrets.get(tenant, "groq_api_key");
+      if (!groqKey) throw Object.assign(new Error(`no AI key: ix secret set anthropic_api_key (or groq_api_key) (tenant ${tenant})`), { statusCode: 409 });
+      const gBase = env.IX_ADVISOR_GROQ_BASE_URL || GROQ_BASE_URL;
+      const gHost = new URL(gBase).host;
+      const { system, user } = advisorPrompt(a);
+      try {
+        const r = await groqNarrative({ apiKey: groqKey, baseURL: gBase, model: env.IX_ADVISOR_GROQ_MODEL, system, user });
+        await audit({ action: "advisor", method: "POST", host: gHost, path: "/chat/completions", decision: r.refusal ? `error: refusal (${r.refusal})` : "allow" });
+        return r;
+      } catch (e) {
+        await audit({ action: "advisor", method: "POST", host: gHost, path: "/chat/completions", decision: `error: ${(e as Error).name}` });
+        throw Object.assign(new Error(`Groq call failed: ${(e as Error).message.slice(0, 200)}`), { statusCode: 502 });
+      }
+    }
     const baseURL = env.IX_ADVISOR_BASE_URL || undefined;
     const host = baseURL ? new URL(baseURL).host : "api.anthropic.com";
     const { system, user } = advisorPrompt(a);
