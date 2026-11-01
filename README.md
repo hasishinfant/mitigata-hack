@@ -4,7 +4,9 @@
 
 Mitigata CyberForge · Problem Statement 05
 
-▶ **[Watch the 22-second demo](docs/media/integratex-demo.mp4)**
+[![IntegrateX demo video: click to play](docs/media/integratex-demo.jpg)](docs/media/integratex-demo.mp4)
+
+▶ **[Watch the 22-second demo](docs/media/integratex-demo.mp4)** · [Pitch deck](docs/IntegrateX.pptx)
 
 ---
 
@@ -249,7 +251,3 @@ npx pnpm@10.28.0 test        # 230 tests, including the end-to-end demo rehearsa
 npx pnpm@10.28.0 lint
 npx tsc --noEmit
 ```
-
-## Pitch deck
-
-[IntegrateX pitch deck (8 slides, PowerPoint)](docs/IntegrateX.pptx)
