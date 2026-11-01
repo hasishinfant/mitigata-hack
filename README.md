@@ -4,9 +4,7 @@
 
 Mitigata CyberForge · Problem Statement 05
 
-[![IntegrateX demo video: click to play](docs/media/integratex-demo.jpg)](docs/media/integratex-demo.mp4)
-
-▶ **[Watch the 22-second demo](docs/media/integratex-demo.mp4)** · [Pitch deck](docs/IntegrateX.pptx) · [Demo script](docs/DEMO.md)
+▶ **[Watch the 22-second demo](docs/media/integratex-demo.mp4)**
 
 ---
 
@@ -247,7 +245,11 @@ ix canary create slack_webhook_prod --url --print
 ## Quality
 
 ```sh
-npx pnpm@10.28.0 test        # 227 tests, including the end-to-end demo rehearsal
+npx pnpm@10.28.0 test        # 230 tests, including the end-to-end demo rehearsal
 npx pnpm@10.28.0 lint
 npx tsc --noEmit
 ```
+
+## Pitch deck
+
+[IntegrateX pitch deck (8 slides, PowerPoint)](docs/IntegrateX.pptx)
