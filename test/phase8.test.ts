@@ -17,7 +17,7 @@ const posture = (id: string, risk: Posture["risk"]): Posture => ({
   revoke_hint: null,
   limits: { max_age_days: null, idle_disable_days: null },
   data: { store_raw: false, retention_days: null },
-  violations_7d: 0, violation_entries_7d: 0, token_binding: "n/a",
+  violations_7d: 0, violation_entries_7d: 0, token_binding: "n/a", ip_allowlist: { provider: null, hub_egress: [], check: "none", outside: [] }, detection_rules: 0,
   last_violation: null,
   risk,
   flags: risk === "high" ? [{ level: "high", message: "over-privileged scope" }] : [],

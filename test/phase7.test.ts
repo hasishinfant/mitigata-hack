@@ -47,7 +47,7 @@ describe("scope assessment and flags", () => {
       connector_id: "x", source: "s", status: "enabled", auth_type: "none", streams: [], credentials: [],
       reach: { allowed_hosts: [], allowed_paths: [], read_only_post: [], methods: ["GET"], max_requests_per_run: 1, max_records_per_run: 1 },
       scopes: { ...assessScopes(null), source: "unknown" }, revocable_by_api: false, provider_ip_restriction: "unknown", revoke_hint: null,
-      limits: { max_age_days: null, idle_disable_days: null }, data: { store_raw: false, retention_days: null }, violations_7d: 0, violation_entries_7d: 0, token_binding: "n/a", last_violation: null,
+      limits: { max_age_days: null, idle_disable_days: null }, data: { store_raw: false, retention_days: null }, violations_7d: 0, violation_entries_7d: 0, token_binding: "n/a", ip_allowlist: { provider: null, hub_egress: [], check: "none", outside: [] }, detection_rules: 0, last_violation: null,
     });
     expect(flags).toEqual([]);
   });

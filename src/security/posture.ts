@@ -4,6 +4,7 @@
 import type pg from "pg";
 import { loadActiveConnector } from "../store/connectors.ts";
 import { assessScopes, type ScopeAssessment } from "./scopes.ts";
+import { ipIn, parseRanges, splitRanges } from "../config/ipranges.ts";
 
 export type Level = "high" | "medium" | "low";
 export type Flag = { level: Level; message: string };
@@ -29,6 +30,14 @@ export type Posture = {
   provider_ip_restriction: "yes" | "no" | "unknown";
   /** dpop: tokens are bound to a key only the broker holds (RFC 9449); none: a stolen token works anywhere; n/a: static key. */
   token_binding: "dpop" | "none" | "n/a";
+  /** IP allow-listing: the provider's allow-list for this credential, the hub's egress IPs, and whether they fit. */
+  ip_allowlist: {
+    provider: string[] | null; // credential.provider_ip_allowlist
+    hub_egress: string[]; // IX_EGRESS_IPS
+    check: "ok" | "hub_outside" | "open" | "egress_unknown" | "none";
+    outside: string[]; // hub egress entries not covered by the provider allow-list
+  };
+  detection_rules: number; // stream detect rules (e.g. foreign-IP use in the provider's audit log)
   revoke_hint: string | null;
   limits: { max_age_days: number | null; idle_disable_days: number | null };
   data: { store_raw: boolean; retention_days: number | null };
@@ -43,6 +52,16 @@ const RANK: Record<Level, number> = { low: 1, medium: 2, high: 3 };
 
 import { credentialRefs } from "../config/load.ts";
 export { credentialRefs };
+
+/** Compare the provider's allow-list with the hub's egress IPs (IX_EGRESS_IPS, comma-separated IPs/CIDRs). */
+export function ipAllowlist(provider: string[] | undefined, egressEnv: string | undefined): Posture["ip_allowlist"] {
+  const hub = splitRanges([egressEnv ?? ""]).entries;
+  if (!provider) return { provider: null, hub_egress: hub, check: "none", outside: [] };
+  const ranges = parseRanges(provider);
+  if (!hub.length) return { provider: ranges.entries, hub_egress: hub, check: ranges.any ? "open" : "egress_unknown", outside: [] };
+  const outside = hub.filter((e) => !ipIn(ranges, e.split("/")[0]!));
+  return { provider: ranges.entries, hub_egress: hub, check: outside.length ? "hub_outside" : ranges.any ? "open" : "ok", outside };
+}
 
 const days = (from: string | null, now: number) => (from ? Math.floor((now - Date.parse(from)) / 86_400_000) : null);
 
@@ -66,8 +85,14 @@ export function deriveFlags(p: Omit<Posture, "risk" | "flags">): Flag[] {
   if (p.auth_type !== "none") {
     if (p.token_binding === "none")
       flags.push({ level: "low", message: "OAuth token not sender-constrained (no DPoP): a stolen token works anywhere until it expires" });
+    const ipa = p.ip_allowlist;
+    if (ipa.check === "hub_outside")
+      flags.push({ level: "high", message: `hub egress ${ipa.outside.join(", ")} is outside the provider's IP allow-list: the provider will reject the hub's calls` });
+    if (ipa.check === "open") flags.push({ level: "medium", message: "provider IP allow-list includes /0: it allows every IP" });
+    if (ipa.check === "egress_unknown") flags.push({ level: "low", message: "IX_EGRESS_IPS not set: can't verify the hub is inside the provider's allow-list" });
     if (p.provider_ip_restriction === "no") flags.push({ level: "medium", message: "token works from any IP: a stolen copy is usable anywhere" });
-    if (p.provider_ip_restriction === "unknown") flags.push({ level: "low", message: "provider IP restriction unknown" });
+    if (p.provider_ip_restriction === "unknown")
+      flags.push({ level: "low", message: "provider IP restriction unknown: declare credential.provider_ip_allowlist once it is set at the provider" });
     if (p.revocable_by_api !== true) flags.push({ level: "low", message: "manual revocation only (panic can't revoke it for you)" });
     if (s.granted === null) flags.push({ level: "low", message: "provider did not report granted scopes" });
   }
@@ -131,7 +156,9 @@ export async function getPosture(pool: pg.Pool, id: string, env: Record<string, 
     credentials,
     scopes: { ...scopes, source: scopeSource },
     revocable_by_api: conn.credential?.revocable_by_api ?? revocableMeta ?? (a.type === "oauth2_client_credentials" && a.revocation_url ? true : a.type === "none" ? false : "unknown"),
-    provider_ip_restriction: conn.credential?.provider_ip_restriction ?? "unknown",
+    provider_ip_restriction: conn.credential?.provider_ip_allowlist ? "yes" : (conn.credential?.provider_ip_restriction ?? "unknown"),
+    ip_allowlist: ipAllowlist(conn.credential?.provider_ip_allowlist, env.IX_EGRESS_IPS),
+    detection_rules: conn.streams.reduce((n, s) => n + (s.detect?.length ?? 0), 0),
     token_binding: a.type === "oauth2_client_credentials" ? (a.dpop ? "dpop" : "none") : "n/a",
     revoke_hint: conn.credential?.revoke_hint ?? null,
     limits: { max_age_days: conn.credential?.max_age_days ?? null, idle_disable_days: conn.credential?.idle_disable_days ?? null },

@@ -157,6 +157,19 @@ Limits:
   - **Outside the hub:** `--url` decoys look like webhooks pointing at the hub's `/hooks/...` listener. Using one alarms with the caller's IP and user agent, and the dashboard shows a red banner. Use `--print` to plant copies in fake files.
   - The leak check ignores decoys.
   - Limit: a decoy API key tried directly at a real provider is only detected if that provider reports it. In production the listener must be reachable at `IX_CANARY_BASE_URL`; in dev the API binds to localhost.
+- **IP allow-listing (enforced by the provider, verified and watched by IntegrateX).** The control that defeats a stolen token used elsewhere is the provider's IP allow-list (Okta network zones, GitHub's IP allow list, and so on). IntegrateX makes it checkable:
+  - **Declare the hub's egress IPs:** `IX_EGRESS_IPS=198.51.100.10,10.0.0.0/8` in `.env`. These are the IPs to register at each provider.
+  - **Declare what's set at the provider:** `credential.provider_ip_allowlist: [198.51.100.0/24]`. The posture card checks the hub's egress IPs are inside it (if not, the provider will reject the hub's calls; high flag), and flags open lists (`/0`) and undeclared egress.
+  - **Detect use from elsewhere:** `detect` rules on a stream that reads a provider's audit log. For example:
+    ```yaml
+    detect:
+      - name: hub OAuth client used from outside the hub
+        match: { "actor.alternateId": "${env.OKTA_CLIENT_ID}" }   # field names: verify against your tenant's log
+        ip_path: client.ipAddress
+        allowed_ips: ["${env.IX_EGRESS_IPS}"]
+    ```
+    Matching records from other IPs raise a `foreign_ip_use` alert and are listed in that sync's receipt.
+  - Limit: IntegrateX can't set the provider's allow-list itself, because connectors are read-only. It only declares, verifies and detects.
 - **The app database role cannot undo the kill switch.** It can disable and pause connectors, but cannot re-enable a disabled one or change the active config version (column grants plus a trigger). `ix enable` goes through the broker.
 - **Signed configs.** Configs are registered through the broker, which signs each version (an HMAC keyed from the master key). At request time it only honours versions it signed, so a rogue config row can't point a stored secret at a new host.
   - This holds even if someone writes that row straight into the database.

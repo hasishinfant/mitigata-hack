@@ -168,6 +168,11 @@ async function showPosture(id) {
       el("div", {}, "Granted scopes"), el("div", {}, ...scopeEls),
       el("div", {}, "Revocable by API"), el("div", {}, String(p.revocable_by_api)),
       el("div", {}, "Provider IP restriction"), el("div", {}, p.provider_ip_restriction),
+      el("div", {}, "IP allow-list"), el("div", { class: p.ip_allowlist.check === "hub_outside" ? "scope-bad" : p.ip_allowlist.check === "ok" ? "" : "scope-extra" },
+        p.ip_allowlist.provider
+          ? `provider allows ${p.ip_allowlist.provider.join(", ")} · hub egress ${p.ip_allowlist.hub_egress.join(", ") || "not declared (IX_EGRESS_IPS)"} · ${p.ip_allowlist.check === "ok" ? "hub is inside ✓" : p.ip_allowlist.check.replace("_", " ")}`
+          : "none declared: a stolen token works from any IP"),
+      el("div", {}, "Detection rules"), el("div", {}, p.detection_rules ? `${p.detection_rules} (foreign-IP use is alerted)` : "none"),
       el("div", {}, "Token binding"), el("div", { class: p.token_binding === "none" ? "scope-extra" : "" }, p.token_binding === "dpop" ? "DPoP: token works only with the broker's in-memory key" : p.token_binding === "none" ? "none: a stolen token works anywhere until it expires" : "n/a (static key)"),
       el("div", {}, "Policy violations (7d)"),
       el("div", {}, p.violation_entries_7d !== p.violations_7d ? `${p.violations_7d} (${p.violation_entries_7d} ledger entries)` : String(p.violations_7d)),

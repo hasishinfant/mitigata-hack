@@ -146,3 +146,32 @@ describe("credential canaries", () => {
     expect(containsCanary(k, "ghp_" + "a".repeat(36))).toBe(false);
   });
 });
+
+describe("IP allow-listing", () => {
+  it("IPs and CIDRs (v4, v6, comma-separated); allow-list vs hub egress", async () => {
+    const { ipIn, parseRanges, splitRanges } = await import("../src/config/ipranges.ts");
+    const { ipAllowlist } = await import("../src/security/posture.ts");
+    const r = parseRanges(["198.51.100.10, 10.0.0.0/8", "2001:db8::/32"]);
+    expect(r.entries).toEqual(["198.51.100.10", "10.0.0.0/8", "2001:db8::/32"]);
+    expect([ipIn(r, "198.51.100.10"), ipIn(r, "10.20.30.40"), ipIn(r, "2001:db8::1"), ipIn(r, "203.0.113.7"), ipIn(r, "not-an-ip")]).toEqual([true, true, true, false, false]);
+    expect(splitRanges(["10.0.0.0/33", "1.2.3", "::1/129", "8.8.8.8"])).toEqual({ entries: ["8.8.8.8"], invalid: ["10.0.0.0/33", "1.2.3", "::1/129"] });
+    expect(parseRanges(["0.0.0.0/0"]).any).toBe(true);
+
+    expect(ipAllowlist(undefined, "198.51.100.10").check).toBe("none");
+    expect(ipAllowlist(["198.51.100.0/24"], "198.51.100.10")).toMatchObject({ check: "ok", outside: [] });
+    expect(ipAllowlist(["198.51.100.0/24"], "198.51.100.10, 203.0.113.9")).toMatchObject({ check: "hub_outside", outside: ["203.0.113.9"] });
+    expect(ipAllowlist(["0.0.0.0/0"], "198.51.100.10").check).toBe("open");
+    expect(ipAllowlist(["198.51.100.0/24"], undefined).check).toBe("egress_unknown");
+  });
+
+  it("config: invalid ranges are errors, /0 is a warning, a contradiction is an error", async () => {
+    const { validateConfigText } = await import("../src/config/validate.ts");
+    const { readFileSync } = await import("node:fs");
+    const base = readFileSync("test/fixtures/configs/mock-github-members.yaml", "utf8");
+    const v = (cred: string) => validateConfigText(base.replace("credential: { max_age_days: 90, idle_disable_days: 14 }", cred), { env: { MOCK_PORT: "1" } });
+    expect(v("credential: { provider_ip_allowlist: [198.51.100.0/24] }").errors).toEqual([]);
+    expect(v("credential: { provider_ip_allowlist: [198.51.100.0/40] }").errors[0]?.message).toMatch(/not an IP address or CIDR range/);
+    expect(v("credential: { provider_ip_allowlist: [0.0.0.0/0] }").warnings.map((w) => w.message)).toContain("the allow-list includes /0: it allows every IP");
+    expect(v("credential: { provider_ip_allowlist: [198.51.100.1], provider_ip_restriction: \"no\" }").errors[0]?.message).toMatch(/contradicts/);
+  });
+});

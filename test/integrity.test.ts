@@ -41,7 +41,7 @@ function fakeBroker(respond: (url: URL, n: number) => Reply) {
 }
 
 function memStore() {
-  const s = { watermark: undefined as string | undefined, checkpoint: null as Checkpoint | null, pages: [] as PageCommit[], runs: [] as FinishRun[] };
+  const s = { watermark: undefined as string | undefined, checkpoint: null as Checkpoint | null, pages: [] as PageCommit[], runs: [] as FinishRun[], alerts: [] as { kind: string; message: string }[] };
   const store: RunStore = {
     async startRun() {},
     async commitPage(p) {
@@ -68,7 +68,9 @@ function memStore() {
     },
     async pause() {},
     async resume() {},
-    async raiseAlert() {},
+    async raiseAlert(_c, kind, message) {
+      s.alerts.push({ kind, message });
+    },
   };
   return { s, store };
 }
@@ -319,5 +321,41 @@ describe("incremental watermark", () => {
     const { s, store } = memStore();
     expect((await run(incConn(), broker, store)).status).toBe("failed");
     expect(s.watermark).toBeUndefined();
+  });
+});
+
+describe("detection rules: our credential used from outside the hub", () => {
+  it("records matching the rule from IPs outside allowed_ips raise foreign_ip_use and land in the receipt", async () => {
+    const conn = connector(`  - name: logs
+    entity: event
+    request: { method: GET, path: /logs }
+    records_path: $
+    pagination: { type: none }
+    detect:
+      - name: hub client used from outside the hub
+        match: { "actor.alternateId": client-1, eventType: token.grant }
+        ip_path: client.ipAddress
+        allowed_ips: ["198.51.100.10, 10.0.0.0/8"]
+    mapping:
+      id: { path: uuid, required: true }
+      type: { path: eventType, required: true }`);
+    const ev = (uuid: string, actor: string, ip: string, type = "token.grant") => ({ uuid, eventType: type, actor: { alternateId: actor }, client: { ipAddress: ip } });
+    const { broker } = fakeBroker(() => ({
+      body: [
+        ev("e1", "client-1", "198.51.100.10"), // the hub itself
+        ev("e2", "client-1", "10.1.2.3"), // inside a declared range
+        ev("e3", "client-1", "203.0.113.7"), // stolen token, attacker's IP
+        ev("e4", "client-1", "203.0.113.7"),
+        ev("e5", "someone-else", "203.0.113.7"), // other actors are not our credential
+        ev("e6", "client-1", "203.0.113.8", "user.login"), // not the event type the rule is about
+      ],
+    }));
+    const { s, store } = memStore();
+    const r = await run(conn, broker, store);
+    expect(r.status).toBe("success");
+    expect(r.detections).toEqual([{ rule: "hub client used from outside the hub", hits: 2, ips: { "203.0.113.7": 2 }, sample_ids: ["e3", "e4"] }]);
+    expect(s.alerts).toEqual([{ kind: "foreign_ip_use", message: 'logs: "hub client used from outside the hub": 2 event(s) from outside the allowed IPs: 203.0.113.7 (2); e.g. e3, e4' }]);
+    const receipt = s.runs.at(-1)!.publication!.receipt as { detections: unknown[] };
+    expect(receipt.detections).toEqual(r.detections);
   });
 });

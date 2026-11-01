@@ -16,6 +16,7 @@ import { createPaginator, type PageRequest } from "./paginate/index.ts";
 import { diffSchema, ShapeCollector, type SchemaEvidence, type Shape } from "./fingerprint.ts";
 import { DEFAULT_MAX_QUARANTINE_RATIO, evaluateIntegrity, type Decision } from "./integrity.ts";
 import { NOT_CLAIMED } from "./receipt.ts";
+import { ipIn, parseRanges } from "../config/ipranges.ts";
 
 export type RunTrigger = "manual" | "schedule" | "api";
 export type RunStatus = "running" | "success" | "partial" | "failed" | "auth_failed" | "degraded" | "paused";
@@ -126,8 +127,12 @@ export type RunSummary = {
   published?: number; // records promoted to the common tables by this run
   receiptId?: number;
   receiptDigest?: string;
+  detections?: DetectionHit[];
   lastError?: string;
 };
+
+/** A detection rule that fired in this run: records matching the rule from IPs outside its allow-list. */
+export type DetectionHit = { rule: string; hits: number; ips: Record<string, number>; sample_ids: string[] };
 
 export class RunFailure extends Error {
   status: RunStatus;
@@ -252,6 +257,9 @@ export async function runStream(opts: {
   const pages: PageEvidence[] = [];
   const shapes = new ShapeCollector();
   let newest: string | undefined; // newest timestamp among accepted records (freshness evidence)
+  // Detection rules (e.g. "our credential used from an IP that isn't the hub", in a provider's own audit log).
+  const rules = (stream.detect ?? []).map((d) => ({ ...d, ranges: parseRanges(d.allowed_ips) }));
+  const hits = new Map<string, DetectionHit>();
   const inc = stream.incremental;
   const runStart = new Date();
   let incrementalFrom: string | undefined;
@@ -323,6 +331,17 @@ export async function runStream(opts: {
       const quarantined: QuarantineItem[] = [];
       for (const raw of raws) {
         shapes.add(raw);
+        for (const rule of rules) {
+          if (!Object.entries(rule.match).every(([p, want]) => String(resolvePath(raw, p) ?? "\u0000") === String(want))) continue;
+          const ip = resolvePath(raw, rule.ip_path);
+          if (typeof ip !== "string" || ipIn(rule.ranges, ip)) continue;
+          const h = hits.get(rule.name) ?? { rule: rule.name, hits: 0, ips: {}, sample_ids: [] };
+          h.hits++;
+          h.ips[ip] = (h.ips[ip] ?? 0) + 1;
+          const id = resolvePath(raw, stream.mapping.id?.path === undefined ? "id" : Array.isArray(stream.mapping.id.path) ? stream.mapping.id.path[0]! : stream.mapping.id.path);
+          if (h.sample_ids.length < 5 && id !== undefined) h.sample_ids.push(String(id));
+          hits.set(rule.name, h);
+        }
         const r = mapRecord(raw, stream.entity, stream.mapping);
         stats.records++;
         for (const f of r.present) stats.hits[f] = (stats.hits[f] ?? 0) + 1;
@@ -469,6 +488,7 @@ export async function runStream(opts: {
     },
     freshness: { newest_record_at: newest ?? null, age_seconds: newest ? Math.max(0, Math.round((finishedAt.getTime() - Date.parse(newest)) / 1000)) : null },
     watermark: { before: cp?.cursorValue ?? null, proposed: watermark ?? null, held: summary.watermarkHeld ?? null },
+    detections: [...hits.values()],
     decision: verdict.decision,
     reasons: verdict.reasons,
     // Facts: observed and recorded by IntegrateX. Inferences: conclusions drawn from them. Not claimed: see NOT_CLAIMED.
@@ -503,6 +523,13 @@ export async function runStream(opts: {
     summary.receiptDigest = finished.digest;
     // Anchor the digest in the broker's hash-chained ledger. Not fatal: an unanchored receipt is reported as such.
     await broker.anchorReceipt?.(finished.receiptId).catch((e: Error) => log.warn({ ...ctx, receipt: finished.receiptId, err: e.message }, "receipt not anchored"));
+  }
+  if (hits.size) {
+    summary.detections = [...hits.values()];
+    for (const h of hits.values()) {
+      const ips = Object.entries(h.ips).sort((a, b) => b[1] - a[1]).map(([ip, n]) => `${ip} (${n})`).join(", ");
+      await store.raiseAlert(connectorId, "foreign_ip_use", `${stream.name}: "${h.rule}": ${h.hits} event(s) from outside the allowed IPs: ${ips}; e.g. ${h.sample_ids.join(", ")}`);
+    }
   }
   if (summary.status === "degraded" || summary.status === "auth_failed")
     await store.raiseAlert(connectorId, summary.status, `${stream.name}: ${summary.lastError}`);

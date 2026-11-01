@@ -119,6 +119,19 @@ export const StreamSchema = z.strictObject({
     })
     .optional(),
   mapping: z.record(z.string(), FieldSpecSchema),
+  // Detection rules over the records this stream fetches (typically a provider's audit log): a record matching every
+  // `match` field whose IP (`ip_path`) is outside `allowed_ips` raises a foreign_ip_use alert. E.g. "our client id
+  // appears in the provider's log from an IP that isn't the hub": a stolen credential being used elsewhere.
+  detect: z
+    .array(
+      z.strictObject({
+        name: z.string().min(1).max(120),
+        match: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
+        ip_path: z.string().min(1),
+        allowed_ips: z.array(z.string().min(1)).min(1), // IPs / CIDRs; comma-separated entries allowed (${env.IX_EGRESS_IPS})
+      }),
+    )
+    .optional(),
   // Integrity limits for publication (T7/T8). Over a limit, the sync is held for review instead of published.
   expect: z
     .strictObject({
@@ -183,6 +196,9 @@ export const ConnectorSchema = z.strictObject({
       max_age_days: posInt.optional(),
       idle_disable_days: posInt.optional(),
       provider_ip_restriction: z.enum(["yes", "no", "unknown"]).optional(),
+      // The IP allow-list configured AT THE PROVIDER for this credential (Okta network zone, GitHub IP allow list...).
+      // The provider enforces it; IntegrateX checks the hub's egress (IX_EGRESS_IPS) is inside it and flags open lists.
+      provider_ip_allowlist: z.array(z.string().min(1)).min(1).optional(),
       scopes_header: z.string().optional(), // response header listing the token's granted scopes, if the provider sends one
       revocable_by_api: z.boolean().optional(), // can the hub revoke this credential itself (OAuth revocation)?
       revoke_hint: z.string().max(300).optional(), // where a human revokes it, printed by `ix panic`

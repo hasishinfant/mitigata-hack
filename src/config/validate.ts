@@ -1,5 +1,6 @@
 // Config validation (B-2): YAML syntax -> interpolation -> Zod structure -> cross-field/policy rules.
 // Every issue carries a dotted path and a 1-based line:col in the source file.
+import { parseRanges, splitRanges } from "./ipranges.ts";
 import { createHash } from "node:crypto";
 import { LineCounter, isMap, isScalar, isSeq, parseDocument, visit, type Document } from "yaml";
 import { methodAllowed, hostAllowed, pathAllowed } from "../broker/policy.ts";
@@ -333,6 +334,15 @@ function semanticChecks(cfg: ConnectorConfig, add: Add): void {
         add("error", [...sp, "request", "params"], `param ${k} looks like a credential; configure it in connection.auth`, k);
 
     checkPath(add, [...sp, "records_path"], st.records_path);
+    (st.detect ?? []).forEach((d, di) => {
+      const dp: P = [...sp, "detect", di];
+      checkPath(add, [...dp, "ip_path"], d.ip_path);
+      for (const k of Object.keys(d.match)) checkPath(add, [...dp, "match"], k);
+      const { entries, invalid } = splitRanges(d.allowed_ips);
+      for (const x of invalid) add("error", [...dp, "allowed_ips"], `"${x}" is not an IP address or CIDR range`);
+      if (!entries.length && !invalid.length) add("error", [...dp, "allowed_ips"], "allowed_ips is empty");
+      if (!Object.keys(d.match).length) add("warning", [...dp, "match"], "no match fields: every record with an outside IP will alert");
+    });
 
     const pg = st.pagination;
     const pp: P = [...sp, "pagination"];
@@ -428,5 +438,13 @@ function policyWarnings(cfg: ConnectorConfig, add: Add): void {
     add("warning", [], "authenticated connector without a credential block (max_age_days, idle_disable_days, scopes)");
   if (cfg.credential?.provider_ip_restriction === "no")
     add("warning", ["credential", "provider_ip_restriction"], "token is usable from any IP; a stolen copy works anywhere");
+  const allow = cfg.credential?.provider_ip_allowlist;
+  if (allow) {
+    const { invalid } = splitRanges(allow);
+    for (const x of invalid) add("error", ["credential", "provider_ip_allowlist"], `"${x}" is not an IP address or CIDR range`);
+    if (parseRanges(allow).any) add("warning", ["credential", "provider_ip_allowlist"], "the allow-list includes /0: it allows every IP");
+    if (cfg.credential?.provider_ip_restriction === "no")
+      add("error", ["credential", "provider_ip_restriction"], "provider_ip_restriction: no contradicts provider_ip_allowlist");
+  }
 }
 
