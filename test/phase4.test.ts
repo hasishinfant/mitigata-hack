@@ -212,7 +212,8 @@ describe.skipIf(!hasDb)("Phase 4 on mocks", () => {
     const raw = (await brokerPool.query("select ciphertext, wrapped_dek from credentials")).rows[0];
     expect(Buffer.concat([raw.ciphertext, raw.wrapped_dek]).toString("latin1")).not.toContain(MOCK_TOKENS.visionOne);
 
-    const { id } = await registerConnector(regPool(), read("connectors/coverage/trendmicro-visionone-alerts.yaml"), { env });
+    // The secret was stored before any connector used it: its first hosts are an explicit approval.
+    const { id } = await registerConnector(regPool(), read("connectors/coverage/trendmicro-visionone-alerts.yaml"), { env, confirmHosts: true });
     const conn = await loadActiveConnector(pool, id, env);
     const broker = createLocalBroker({ getConnector: () => conn, secrets: dbSecretSource(brokerPool, mk) });
     expect((await runWith(conn, broker)).status).toBe("success");

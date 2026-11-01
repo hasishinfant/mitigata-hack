@@ -19,7 +19,7 @@ import { resolveConnector } from "../config/load.ts";
 import { validateConfigText } from "../config/validate.ts";
 import { testConnection } from "../engine/testConnection.ts";
 import { log } from "../log.ts";
-import { credentialRefs } from "../security/posture.ts";
+import { credentialRefs } from "../config/load.ts";
 import { ConnectorConfigError, loadSignedConnector, registerConnector, setConnectorEnabled } from "../store/connectors.ts";
 import { createLocalBroker, type LocalBroker } from "./client.ts";
 import { httpCall } from "./http.ts";
@@ -27,11 +27,13 @@ import { ADMIN_HEADER } from "./remote.ts";
 import { hostAllowed } from "./policy.ts";
 import { configSigKey, signConfig, verifyConfigSig } from "./configSig.ts";
 import { appendLedger, verifyLedger } from "./ledger.ts";
+import { DenialLog } from "./limits.ts";
 import type { Clock } from "./retry.ts";
 import { chainSecretSources, dbSecretSource, deleteSecret, envSecretSource, listSecrets, putSecret } from "./secrets.ts";
 import { BrokerError, type BrokerRequest, type SecretSource } from "./types.ts";
 
-const CONFIG_TTL_MS = 2000; // a disable or re-registration takes effect within 2 s
+const CONFIG_TTL_MS = 2000;
+const NOTIFY_LOCK = 74_201_107; // advisory lock: alert deliveries are serialised so throttle counts are exact // a disable or re-registration takes effect within 2 s
 const REF_RE = /^[a-z][a-z0-9_]{1,63}$/;
 const TENANT_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
@@ -47,6 +49,11 @@ export type BrokerServerOptions = {
   alertHosts?: string[];
   /** Token required on every admin-socket call. Without it the admin routes are disabled (503). */
   adminToken?: string;
+  /** Alert delivery throttle (request socket): per connector and overall, per window. */
+  notifyLimit?: { perConnector: number; total: number; windowMs: number };
+  /** Window for summarising repeated denials in the ledger (default 60 s). */
+  denialWindowMs?: number;
+  now?: () => number;
 };
 
 
@@ -74,11 +81,17 @@ export function createBrokerServer(opts: BrokerServerOptions) {
   const audit = (e: Parameters<typeof appendLedger>[1]) => appendLedger(opts.pool, e);
 
   const cache = new Map<string, { conn: ResolvedConnector; at: number }>();
+  const lastHash = new Map<string, string>(); // config hash each connector's cached token was minted under
   async function getConnector(id: string): Promise<ResolvedConnector | undefined> {
     const hit = cache.get(id);
     if (hit && Date.now() - hit.at < CONFIG_TTL_MS) return hit.conn;
     try {
       const conn = await loadSignedConnector(opts.pool, id, (cid, v, h, sig) => verifyConfigSig(sigKey, cid, v, h, sig), env);
+      // A new approved version (scopes, token URL) must not reuse a token minted for the old one. The broker
+      // notices this itself, so workers need no way to flush its caches.
+      const prev = lastHash.get(id);
+      if (prev && prev !== conn.configHash) broker.forget(id);
+      lastHash.set(id, conn.configHash);
       cache.set(id, { conn, at: Date.now() });
       return conn;
     } catch (e) {
@@ -102,12 +115,24 @@ export function createBrokerServer(opts: BrokerServerOptions) {
   const alertHosts = opts.alertHosts ?? (env.IX_ALERT_WEBHOOK_HOSTS ?? "hooks.slack.com").split(",").map((h) => h.trim()).filter(Boolean);
 
   const broker: LocalBroker = createLocalBroker({ getConnector, secrets, audit, onScopes, clock: opts.clock, random: opts.random });
+  /** Connector-scoped: its token, its config cache and its own secret values. Global: everything. */
   const forget = (id?: string) => {
-    broker.forget(id);
+    if (id) {
+      const conn = cache.get(id)?.conn;
+      broker.forget(id);
+      cache.delete(id);
+      if (conn) store.forget(conn.metadata.tenant, [...credentialRefs(conn), ...(conn.alerts?.slack_webhook_ref ? [conn.alerts.slack_webhook_ref] : [])]);
+      return;
+    }
+    broker.forget();
     store.forget();
-    if (id) cache.delete(id);
-    else cache.clear();
+    cache.clear();
   };
+
+  const now = opts.now ?? Date.now;
+  const denials = new DenialLog(audit, opts.denialWindowMs ?? 60_000, now);
+  const nl = opts.notifyLimit ?? { perConnector: 10, total: 60, windowMs: 10 * 60_000 };
+
 
   const makeApp = () => {
     const a = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
@@ -130,12 +155,6 @@ export function createBrokerServer(opts: BrokerServerOptions) {
 
   app.get("/v1/credential-info/:id", async (req) => broker.credentialInfo((req.params as { id: string }).id));
 
-  // Dropping caches only makes the broker re-read signed configs and secrets: harmless to expose.
-  app.post("/v1/forget", async (req) => {
-    forget((req.body as { connectorId?: string } | undefined)?.connectorId);
-    return { ok: true };
-  });
-
   // ---- admin socket: API and CLI, with the admin token ----
   const adminApp = makeApp();
   const want = opts.adminToken ? Buffer.from(opts.adminToken) : undefined;
@@ -145,9 +164,20 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     const h = req.headers[ADMIN_HEADER];
     const got = Buffer.from(typeof h === "string" ? h : "");
     if (got.length !== want.length || !timingSafeEqual(got, want)) {
-      await audit({ action: "admin", path: req.url.split("?")[0] ?? null, decision: "deny: bad or missing broker admin token" });
+      // Bounded: one row per window plus a summary count, not one serialized ledger write per bad request.
+      await denials.record("admin-token", { action: "admin", path: req.url.split("?")[0] ?? null, decision: "deny: bad or missing broker admin token" });
       return reply.code(401).send({ error: { kind: "error", message: "broker admin token required" } });
     }
+  });
+  adminApp.addHook("onClose", async () => denials.close());
+
+  // Cache invalidation is admin-only: from a worker it would be a lever to force token re-minting
+  // and secret re-reads. Without connectorId: everything (used after panic, secret changes, tests).
+  adminApp.post("/v1/forget", async (req) => {
+    const id = (req.body as { connectorId?: unknown } | undefined)?.connectorId;
+    if (id !== undefined && typeof id !== "string") throw Object.assign(new Error("connectorId must be a string"), { statusCode: 400 });
+    forget(id);
+    return { ok: true, scope: id ? "connector" : "all" };
   });
 
   adminApp.post("/v1/connectors", async (req) => {
@@ -161,7 +191,10 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     forget(r.id);
     await audit({
       connectorId: r.id, action: "register",
-      decision: `${r.changed ? `allow: v${r.version}` : `allow: v${r.version} unchanged`}${r.newHosts?.length ? `; secrets now also sent to ${r.newHosts.join(", ")} (confirmed)` : ""}`,
+      decision:
+        `${r.changed ? `allow: v${r.version}` : `allow: v${r.version} unchanged`}` +
+        `${r.firstBinding?.length ? `; first binding of stored secret(s) ${r.firstBinding.join(", ")}` : ""}` +
+        `${r.newHosts?.length ? `; secrets now also sent to ${r.newHosts.join(", ")} (confirmed)` : ""}`,
     });
     return r;
   });
@@ -279,35 +312,83 @@ export function createBrokerServer(opts: BrokerServerOptions) {
     return { revocations, purged };
   });
 
-  // Alert delivery. The webhook URL is a secret (it embeds a token), so only the broker sends it, only to an
-  // allowed host, and the ledger records the host but never the path.
+  // Alert delivery (request socket: the scheduler needs it). The webhook URL is a secret (it embeds a token), so only
+  // the broker sends it, only to an allowed host, and the ledger records the host but never the path.
+  // The caller names an alert row, not a message: the broker reads the row, builds the text itself, and marks it
+  // delivered in the same transaction that holds the row lock. Delivery is AT LEAST ONCE: concurrent or repeated calls
+  // for a delivered row are refused, but if the webhook accepts the message and the broker then crashes or loses the
+  // database before committing, the row is still pending and is sent again (Slack webhooks take no idempotency key).
+  // The throttle counts deliveries recorded in the alerts table, so it survives a broker restart. Over the limit the
+  // alert stays pending and the scheduler retries later.
+  // Limits: the broker does not check where an alert row came from. The app role can insert rows, so a compromised
+  // worker can queue forged alerts; the throttle bounds the send rate, not the queue, and forged rows ahead of real
+  // ones in the queue use up the throttle first.
+  const throttled = async (connectorId: string | null, scope: string) => {
+    await denials.record(connectorId ? `notify:${connectorId}` : "notify:all", { connectorId, action: "alert", decision: `deny: alert rate limit (${scope})` });
+    return Object.assign(new Error(`alert rate limit reached (${scope}); try again later`), { statusCode: 429 });
+  };
   app.post("/v1/notify", async (req) => {
-    const { connectorId, text } = req.body as { connectorId: string; text: string };
-    if (typeof text !== "string" || !text) throw Object.assign(new Error("text is required"), { statusCode: 400 });
-    let conn: ResolvedConnector | undefined;
+    const alertId = Number((req.body as { alertId?: unknown } | undefined)?.alertId);
+    if (!Number.isSafeInteger(alertId) || alertId <= 0) throw Object.assign(new Error("alertId is required"), { statusCode: 400 });
+    const client = await opts.pool.connect();
     try {
-      conn = await loadSignedConnector(opts.pool, connectorId, (cid, v, h, sig) => verifyConfigSig(sigKey, cid, v, h, sig), env);
+      await client.query("begin");
+      await client.query("select pg_advisory_xact_lock($1)", [NOTIFY_LOCK]); // one delivery at a time: exact throttle counts
+      const row = (await client.query("select id, connector_id, kind, message, delivered from alerts where id = $1 for update", [alertId])).rows[0] as
+        | { id: number; connector_id: string | null; kind: string; message: string; delivered: boolean }
+        | undefined;
+      if (!row) throw Object.assign(new Error(`alert ${alertId} not found`), { statusCode: 404 });
+      if (row.delivered) throw Object.assign(new Error(`alert ${alertId} was already delivered`), { statusCode: 409 });
+      const done = async (delivered: boolean, channel: string, detail: string) => {
+        await client.query("update alerts set delivered = $2, channel = $3, delivered_at = case when $2 then now() end where id = $1", [alertId, delivered || channel === "none", channel]);
+        await client.query("commit");
+        return { delivered, channel, detail };
+      };
+      if (!row.connector_id) return await done(false, "none", "alert has no connector");
+      const sent = (
+        await client.query(
+          `select count(*)::int as total, count(*) filter (where connector_id = $1)::int as mine from alerts
+           where channel = 'slack' and delivered and delivered_at > now() - make_interval(secs => $2)`,
+          [row.connector_id, nl.windowMs / 1000],
+        )
+      ).rows[0] as { total: number; mine: number };
+      if (sent.total >= nl.total) throw await throttled(null, "all connectors");
+      if (sent.mine >= nl.perConnector) throw await throttled(row.connector_id, "per connector");
+
+      let conn: ResolvedConnector;
+      try {
+        conn = await loadSignedConnector(opts.pool, row.connector_id, (cid, v, h, sig) => verifyConfigSig(sigKey, cid, v, h, sig), env);
+      } catch (e) {
+        throw new BrokerError("policy_denied", (e as Error).message);
+      }
+      const connectorId = conn.metadata.id;
+      const ref = conn.alerts?.slack_webhook_ref;
+      if (!ref) return await done(false, "none", "connector has no alerts.slack_webhook_ref");
+      const hook = await secrets.get(conn.metadata.tenant, ref);
+      if (!hook) throw new BrokerError("secret_missing", `secret "${ref}" is not set (ix secret set ${ref})`);
+      let url: URL;
+      try {
+        url = new URL(hook);
+      } catch {
+        throw new BrokerError("policy_denied", `secret "${ref}" is not a URL`);
+      }
+      const local = ["localhost", "127.0.0.1"].includes(url.hostname);
+      if ((url.protocol !== "https:" && !(url.protocol === "http:" && local)) || !hostAllowed(url.hostname, alertHosts)) {
+        await audit({ connectorId, action: "alert", method: "POST", host: url.host, path: "[webhook]", decision: `deny: webhook host ${url.hostname} not in IX_ALERT_WEBHOOK_HOSTS` });
+        throw new BrokerError("policy_denied", `webhook host ${url.hostname} is not an allowed alert host`);
+      }
+      const text = `:rotating_light: [IntegrateX] ${connectorId} · ${row.kind}: ${row.message}`.slice(0, 3000);
+      const res = await httpCall("POST", url, { "content-type": "application/json", "user-agent": "IntegrateX/0.1" }, { timeoutMs: 10_000, maxBytes: 64 * 1024, body: JSON.stringify({ text }) });
+      await audit({ connectorId, action: "alert", method: "POST", host: url.host, path: "[webhook]", status: res.status, decision: res.status < 300 ? "allow" : `error: HTTP ${res.status}` });
+      const ok = res.status >= 200 && res.status < 300;
+      if (!ok) throw Object.assign(new Error(`webhook answered HTTP ${res.status}`), { statusCode: 502 });
+      return await done(true, "slack", `HTTP ${res.status}`);
     } catch (e) {
-      throw new BrokerError("policy_denied", (e as Error).message);
+      await client.query("rollback").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
     }
-    const ref = conn.alerts?.slack_webhook_ref;
-    if (!ref) return { delivered: false, channel: "none", detail: "connector has no alerts.slack_webhook_ref" };
-    const hook = await secrets.get(conn.metadata.tenant, ref);
-    if (!hook) throw new BrokerError("secret_missing", `secret "${ref}" is not set (ix secret set ${ref})`);
-    let url: URL;
-    try {
-      url = new URL(hook);
-    } catch {
-      throw new BrokerError("policy_denied", `secret "${ref}" is not a URL`);
-    }
-    const local = ["localhost", "127.0.0.1"].includes(url.hostname);
-    if ((url.protocol !== "https:" && !(url.protocol === "http:" && local)) || !hostAllowed(url.hostname, alertHosts)) {
-      await audit({ connectorId, action: "alert", method: "POST", host: url.host, path: "[webhook]", decision: `deny: webhook host ${url.hostname} not in IX_ALERT_WEBHOOK_HOSTS` });
-      throw new BrokerError("policy_denied", `webhook host ${url.hostname} is not an allowed alert host`);
-    }
-    const res = await httpCall("POST", url, { "content-type": "application/json", "user-agent": "IntegrateX/0.1" }, { timeoutMs: 10_000, maxBytes: 64 * 1024, body: JSON.stringify({ text: text.slice(0, 3000) }) });
-    await audit({ connectorId, action: "alert", method: "POST", host: url.host, path: "[webhook]", status: res.status, decision: res.status < 300 ? "allow" : `error: HTTP ${res.status}` });
-    return { delivered: res.status >= 200 && res.status < 300, channel: "slack", detail: `HTTP ${res.status}` };
   });
 
   return { app, adminApp, broker, forget };

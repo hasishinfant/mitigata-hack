@@ -11,6 +11,9 @@ import { configSigKey, signConfig, verifyConfigSig } from "../src/broker/configS
 import { createRemoteBroker, type RemoteBroker } from "../src/broker/remote.ts";
 import { createBrokerServer, listenOnSocket } from "../src/broker/server.ts";
 import { BrokerError } from "../src/broker/types.ts";
+import { appendLedger } from "../src/broker/ledger.ts";
+import { DenialLog } from "../src/broker/limits.ts";
+import { getPosture } from "../src/security/posture.ts";
 import { assertNoBrokerSecrets, withoutBrokerSecrets } from "../src/envfiles.ts";
 import { runConnector } from "../src/engine/runner.ts";
 import { scanForSecrets } from "../src/security/leakcheck.ts";
@@ -135,6 +138,132 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     expect(await ledger()).toContainEqual(expect.objectContaining({ action: "admin", path: "/v1/connectors", decision: "deny: bad or missing broker admin token" }));
     // Request-socket routes still work for workers.
     expect(await onRequestSocket.ping()).toBe(true);
+  });
+
+  describe("secret-to-host binding", () => {
+    const gh = () => fixture("mock-github-members.yaml");
+    const at = (yaml: string, host: string, id?: string) => {
+      let y = yaml.replace("allowed_hosts: [localhost]", `allowed_hosts: [localhost, ${host}]`);
+      if (id) y = y.replace("id: mock-github-members", `id: ${id}`);
+      return y;
+    };
+
+    it("1. a secret stored before its first connector: the first binding must be confirmed, and is ledgered", async () => {
+      await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer);
+      await expect(remote.register(gh(), "add")).rejects.toMatchObject({ statusCode: 409, message: expect.stringMatching(/first approved use of stored secret\(s\) mock_bearer: localhost/) });
+      expect((await appPool.query("select count(*)::int n from connectors")).rows[0].n).toBe(0);
+      expect(await remote.register(gh(), "add", "test", { confirmHosts: true })).toMatchObject({ version: 1, firstBinding: ["mock_bearer"] });
+      expect((await ledger()).map((e) => e.decision)).toContain("allow: v1; first binding of stored secret(s) mock_bearer; secrets now also sent to localhost (confirmed)");
+    });
+
+    it("no stored value yet: registering first needs no confirmation (nothing to send)", async () => {
+      expect(await remote.register(gh(), "add")).toEqual({ id: "mock-github-members", version: 1, changed: true });
+      await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer); // now bound to this config's hosts
+      await expect(remote.register(at(gh(), "evil.example.net", "other"), "add")).rejects.toMatchObject({ statusCode: 409 });
+    });
+
+    it("2 + 3. a removed connector's kept secret is unbound again: re-use, at any host, must be confirmed", async () => {
+      await remote.register(gh(), "add");
+      await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer);
+      await remote.removeConnector("mock-github-members"); // secret kept
+      expect((await remote.listSecrets("demo")).map((s) => s.ref)).toEqual(["mock_bearer"]);
+      await expect(remote.register(at(gh(), "evil.example.net", "thief"), "add")).rejects.toMatchObject({
+        statusCode: 409, message: expect.stringMatching(/first approved use of stored secret\(s\) mock_bearer: evil\.example\.net, localhost/),
+      });
+      // Same host as before is refused too: host history is rebuilt from active configs, not stored (yet).
+      await expect(remote.register(gh(), "add")).rejects.toMatchObject({ statusCode: 409 });
+      expect((await appPool.query("select count(*)::int n from connectors")).rows[0].n).toBe(0);
+    });
+
+    it("4. a shared secret: same hosts need nothing; a new host for either connector needs confirmation", async () => {
+      await remote.register(gh(), "add");
+      await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer);
+      expect(await remote.register(gh().replace("id: mock-github-members", "id: second-members"), "add")).toMatchObject({ changed: true });
+      expect((await remote.register(gh().replace("id: mock-github-members", "id: second-members"), "add").catch((e) => e)).statusCode).toBe(409); // already exists
+      await expect(remote.register(at(gh(), "evil.example.net", "second-members"), "update")).rejects.toMatchObject({ statusCode: 409, message: expect.stringMatching(/would send secret\(s\) mock_bearer to new host/) });
+      await expect(remote.register(at(gh(), "evil.example.net"), "update")).rejects.toMatchObject({ statusCode: 409 });
+    });
+  });
+
+  it("cache invalidation is admin-only and connector-scoped; a new config version drops the old token by itself", async () => {
+    // Not on the worker's socket.
+    const workerSide = createRemoteBroker(socketPath, { adminSocketPath: socketPath, adminToken });
+    await expect(workerSide.forget("mock-okta-oauth")).rejects.toMatchObject({ statusCode: 404 });
+    await expect(workerSide.forget()).rejects.toMatchObject({ statusCode: 404 });
+
+    const okta = fixture("mock-okta-oauth.yaml")
+      .replace("client_auth: private_key_jwt", "client_auth: client_secret_post")
+      .replace("    private_key_ref: mock_private_key\n", "")
+      .replace("    key_id: mock-kid-1\n", "");
+    await remote.register(okta, "add");
+    await remote.register(fixture("mock-github-members.yaml"), "add");
+    await remote.putSecret("demo", "mock_client_id", MOCK_TOKENS.clientId);
+    await remote.putSecret("demo", "mock_client_secret", MOCK_TOKENS.clientSecret);
+    await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer);
+    const call = (id: string, path: string) => remote.request({ connectorId: id, method: "GET", url: `http://localhost:${port()}${path}` });
+    const tokenCalls = () => mock.calls.filter((c) => c.path.endsWith("/token")).length;
+    await call("mock-okta-oauth", "/api/v1/users");
+    expect(tokenCalls()).toBe(1);
+    await call("mock-okta-oauth", "/api/v1/users");
+    expect(tokenCalls()).toBe(1); // cached
+
+    await remote.forget("mock-github-members"); // another connector: okta's token survives
+    await call("mock-okta-oauth", "/api/v1/users");
+    expect(tokenCalls()).toBe(1);
+    await remote.forget("mock-okta-oauth"); // its own: re-minted
+    await call("mock-okta-oauth", "/api/v1/users");
+    expect(tokenCalls()).toBe(2);
+    await remote.forget(); // global
+    await call("mock-okta-oauth", "/api/v1/users");
+    expect(tokenCalls()).toBe(3);
+
+    // New approved version: the broker notices on its next config load and mints a fresh token.
+    await remote.register(okta.replace("max_requests_per_run: 20", "max_requests_per_run: 19"), "update");
+    await new Promise((r) => setTimeout(r, 2100)); // broker config cache TTL
+    await call("mock-okta-oauth", "/api/v1/users");
+    expect(tokenCalls()).toBe(4);
+  });
+
+  it("a flood of bad admin tokens writes a bounded number of ledger rows, with a count", async () => {
+    let t = 1_000_000;
+    const s2 = createBrokerServer({ pool: brokerPool, masterKey, env, adminToken, now: () => t, denialWindowMs: 60_000 });
+    const a2 = join(tmpdir(), `ixb-flood-${process.pid}.sock`);
+    await listenOnSocket(s2.adminApp, a2);
+    try {
+      const bad = createRemoteBroker(socketPath, { adminSocketPath: a2, adminToken: "wrong-token" });
+      for (let i = 0; i < 50; i++) await expect(bad.listSecrets()).rejects.toMatchObject({ statusCode: 401 });
+      t += 61_000; // next window: the summary for the first is written before the new denial
+      await expect(bad.listSecrets()).rejects.toMatchObject({ statusCode: 401 });
+    } finally {
+      await s2.adminApp.close(); // flushes pending summaries
+    }
+    const counted = (await appPool.query("select coalesce(sum(records), 0)::int n from audit_ledger where seq > $1 and action = 'admin'", [ledgerStart])).rows[0].n;
+    expect(counted).toBe(51); // exact: 1 + 49 + 1
+    const rows = (await ledger()).filter((e) => e.action === "admin");
+    expect(rows.map((e) => e.decision)).toEqual([
+      "deny: bad or missing broker admin token",
+      "deny: bad or missing broker admin token (and 49 more within 60 s, summarised)",
+      "deny: bad or missing broker admin token",
+    ]);
+  });
+
+  it("summarised denials keep exact counts: posture reports denied requests, not ledger rows", async () => {
+    const id = `posture-count-${randomBytes(3).toString("hex")}`; // its own id: posture counts are not scoped to this test
+    await remote.register(fixture("mock-github-members.yaml").replace("id: mock-github-members", `id: ${id}`), "add");
+    const t = 5_000_000;
+    const log = new DenialLog((e) => appendLedger(brokerPool, e), 60_000, () => t);
+    const deny = { connectorId: id, action: "alert", decision: "deny: alert rate limit (per connector)" };
+    for (let i = 0; i < 51; i++) await log.record(`notify:${id}`, deny);
+    await log.close();
+    const rows = (await appPool.query("select records, decision from audit_ledger where seq > $1 and action = 'alert' order by seq", [ledgerStart])).rows;
+    expect(rows).toEqual([
+      { records: 1, decision: "deny: alert rate limit (per connector)" },
+      { records: 50, decision: "deny: alert rate limit (per connector) (and 50 more within 60 s, summarised)" },
+    ]);
+    const p = await getPosture(appPool, id, env);
+    expect(p).toMatchObject({ violations_7d: 51, violation_entries_7d: 2 });
+    // The count is inside the hash chain: editing it breaks verification.
+    expect((await remote.verifyLedger()).ok).toBe(true);
   });
 
   it("a config that would send an existing secret to a new host needs --confirm-hosts", async () => {
@@ -274,12 +403,81 @@ describe.skipIf(!hasDb)("broker process over a Unix socket", () => {
     const put = await app.inject({ method: "PUT", url: "/v1/secrets/mock_api_key", headers: h, payload: { value: MOCK_TOKENS.apiKey } });
     expect(put.json()).toEqual({ stored: true, tenant: "demo", ref: "mock_api_key", chars: MOCK_TOKENS.apiKey.length });
     expect(put.body).not.toContain(MOCK_TOKENS.apiKey);
-    const reg = await app.inject({ method: "POST", url: "/v1/connectors", headers: { ...h, "content-type": "text/yaml" }, payload: fixture("mock-nvd-cves.yaml") });
+    // Secret stored first: registering needs an explicit host approval (409, then ?confirm_hosts=1).
+    const unconfirmed = await app.inject({ method: "POST", url: "/v1/connectors", headers: { ...h, "content-type": "text/yaml" }, payload: fixture("mock-nvd-cves.yaml") });
+    expect(unconfirmed.statusCode).toBe(409);
+    expect(unconfirmed.json().error).toMatch(/first approved use of stored secret\(s\) mock_api_key: localhost.*--confirm-hosts/);
+    const reg = await app.inject({ method: "POST", url: "/v1/connectors?confirm_hosts=1", headers: { ...h, "content-type": "text/yaml" }, payload: fixture("mock-nvd-cves.yaml") });
     expect(reg.statusCode).toBe(201);
+    expect(reg.json()).toMatchObject({ firstBinding: ["mock_api_key"], newHosts: ["localhost"] });
     const bad = await app.inject({ method: "POST", url: "/v1/connectors", headers: { ...h, "content-type": "text/yaml" }, payload: fixture("bad-host.yaml") });
     expect(bad.statusCode).toBe(422);
     const test = await app.inject({ method: "POST", url: "/v1/connectors/mock-nvd-cves/test", headers: h });
     expect(test.json()).toMatchObject({ ok: true, connectorId: "mock-nvd-cves" });
+  });
+
+  it("builder save: registered but secret storage failed -> state explained, retry stores it without a new version", async () => {
+    // @ts-expect-error plain browser script (no module types); it sets globalThis.ixSaveConnector
+    await import("../src/api/public/save-flow.js");
+    const save = (globalThis as unknown as { ixSaveConnector: (o: unknown) => Promise<any> }).ixSaveConnector;
+    const admin = "admin-token-for-test-123456";
+    const app = buildApi({ pool: appPool, env, adminToken: admin, broker: remote, admin: remote });
+    let failSecrets = 1; // the first secret PUT fails, e.g. broker unreachable for a moment
+    const api = async (path: string, o: { method: string; headers: Record<string, string>; body?: string }) => {
+      if (path.startsWith("/v1/secrets/") && failSecrets-- > 0) throw new Error("broker is not running on /tmp/ix-broker-admin.sock");
+      const r = await app.inject({ method: o.method as "PUT", url: path, headers: o.headers, payload: o.body });
+      const body = r.json();
+      if (r.statusCode >= 400) throw new Error(body.error);
+      return body;
+    };
+    const lines: string[] = [];
+    const run = () =>
+      save({
+        api, headers: (x = {}) => ({ authorization: `Bearer ${admin}`, ...x }), confirm: () => { throw new Error("no host approval expected"); },
+        log: (l: string) => lines.push(l), yaml: fixture("mock-github-members.yaml"), id: "mock-github-members", tenant: "demo",
+        secrets: [{ ref: "mock_bearer", value: MOCK_TOKENS.bearer }],
+      });
+
+    const first = await run();
+    expect(first).toMatchObject({ state: "registered_without_secrets", reg: { version: 1, changed: true }, stored: [], failed: [{ ref: "mock_bearer" }] });
+    expect(lines.join("\n")).toMatch(/mock-github-members v1 registered and signed/);
+    expect(lines.join("\n")).toMatch(/secret "mock_bearer" was NOT stored: broker is not running/);
+    expect(lines.join("\n")).toMatch(/v1 is registered, but "mock_bearer" is not stored\. Runs will fail \(auth_failed\).*press Save again.*no new version/);
+    expect(await remote.listSecrets("demo")).toEqual([]);
+    // In that state a run fails clearly; it does not look healthy.
+    const conn = await loadActiveConnector(appPool, "mock-github-members", env);
+    expect((await runConnector({ connector: conn, broker: remote, store: createPgRunStore(appPool) }))[0]).toMatchObject({ status: "auth_failed" });
+
+    lines.length = 0;
+    const retry = await run(); // same text: no new version, only the missing secret is sent, no host approval needed
+    expect(retry).toMatchObject({ state: "ok", reg: { version: 1, changed: false }, stored: ["mock_bearer"], failed: [] });
+    expect(lines).toEqual(expect.arrayContaining([expect.stringMatching(/v1 unchanged \(no new version\)/), expect.stringMatching(/secret "mock_bearer" stored encrypted/)]));
+    expect((await appPool.query("select count(*)::int n from connector_versions where connector_id = 'mock-github-members'")).rows[0].n).toBe(1);
+    expect((await remote.listSecrets("demo")).map((x) => x.ref)).toEqual(["mock_bearer"]);
+    expect((await runConnector({ connector: conn, broker: remote, store: createPgRunStore(appPool) }))[0]).toMatchObject({ status: "success" });
+  });
+
+  it("builder save: a stored-but-unbound secret asks for host approval; declining registers nothing", async () => {
+    // @ts-expect-error plain browser script (no module types); it sets globalThis.ixSaveConnector
+    await import("../src/api/public/save-flow.js");
+    const save = (globalThis as unknown as { ixSaveConnector: (o: unknown) => Promise<any> }).ixSaveConnector;
+    const admin = "admin-token-for-test-123456";
+    const app = buildApi({ pool: appPool, env, adminToken: admin, broker: remote, admin: remote });
+    const api = async (path: string, o: { method: string; headers: Record<string, string>; body?: string }) => {
+      const r = await app.inject({ method: o.method as "PUT", url: path, headers: o.headers, payload: o.body });
+      if (r.statusCode >= 400) throw new Error(r.json().error);
+      return r.json();
+    };
+    await remote.putSecret("demo", "mock_bearer", MOCK_TOKENS.bearer); // kept from an earlier connector
+    const asked: string[] = [];
+    const opts = (answer: boolean) => ({
+      api, headers: (x = {}) => ({ authorization: `Bearer ${admin}`, ...x }), confirm: (q: string) => (asked.push(q), answer),
+      log: () => {}, yaml: fixture("mock-github-members.yaml"), id: "mock-github-members", tenant: "demo", secrets: [],
+    });
+    expect(await save(opts(false))).toEqual({ state: "declined" });
+    expect(asked[0]).toMatch(/first approved use of stored secret\(s\) mock_bearer: localhost/);
+    expect((await appPool.query("select count(*)::int n from connectors")).rows[0].n).toBe(0);
+    expect(await save(opts(true))).toMatchObject({ state: "ok", reg: { version: 1, firstBinding: ["mock_bearer"] } });
   });
 
   it("remove: connector, its config versions, runs and records are gone; secret is kept", async () => {

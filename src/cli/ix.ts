@@ -345,7 +345,7 @@ program
       console.log(`    granted scopes:  ${sc.granted ? sc.granted.map((g) => (sc.forbidden.includes(g) || sc.writeLike.includes(g) ? red(g) : sc.extra.includes(g) ? yellow(g) : g)).join(" ") : dim("not reported by provider")}${sc.granted ? dim(` (${sc.source})`) : ""}`);
       console.log(`    revocable by API: ${p.revocable_by_api}   provider IP restriction: ${p.provider_ip_restriction}`);
       if (p.revoke_hint) console.log(`    revoke at: ${p.revoke_hint}`);
-      console.log(`  policy violations (7d): ${p.violations_7d}${p.last_violation ? dim(`  last: ${String(p.last_violation.ts).slice(0, 19)} ${p.last_violation.decision}`) : ""}`);
+      console.log(`  policy violations (7d): ${p.violations_7d}${p.violation_entries_7d !== p.violations_7d ? dim(` (${p.violation_entries_7d} ledger entries)`) : ""}${p.last_violation ? dim(`  last: ${String(p.last_violation.ts).slice(0, 19)} ${p.last_violation.decision}`) : ""}`);
       if (p.flags.length) {
         console.log(dim("  flags"));
         for (const f of p.flags) console.log(`    ${LEVEL_PAINT[f.level](f.level.padEnd(6))} ${f.message}`);

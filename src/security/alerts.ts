@@ -15,7 +15,11 @@ export async function raiseAlertOnce(pool: pg.Pool, connectorId: string, kind: s
 
 export type DeliveryReport = { sent: number; noChannel: number; failed: number };
 
-/** Deliver pending alerts through the broker. Failed deliveries are retried on the next call. */
+/**
+ * Deliver pending alerts through the broker. The broker reads each row itself, sends it and marks it delivered;
+ * this side only picks the ids. Failed or throttled deliveries stay pending and are retried next call.
+ * At least once: a crash between the webhook accepting a message and the commit resends it.
+ */
 export async function deliverAlerts(pool: pg.Pool, admin: BrokerAdmin, limit = 20): Promise<DeliveryReport> {
   const rows = (
     await pool.query(
@@ -32,9 +36,7 @@ export async function deliverAlerts(pool: pg.Pool, admin: BrokerAdmin, limit = 2
       continue;
     }
     try {
-      const r = await admin.notify(a.connector_id, `:rotating_light: [IntegrateX] ${a.connector_id} · ${a.kind}: ${a.message}`);
-      const done = r.delivered || r.channel === "none";
-      await pool.query("update alerts set delivered = $2, channel = $3, delivered_at = case when $2 then now() end where id = $1", [a.id, done, r.channel]);
+      const r = await admin.notify(a.id);
       if (r.delivered) report.sent++;
       else if (r.channel === "none") report.noChannel++;
       else report.failed++;

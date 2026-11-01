@@ -26,6 +26,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
   "/style.css": { file: "style.css", type: "text/css; charset=utf-8" },
   "/builder.js": { file: "builder.js", type: "text/javascript; charset=utf-8" },
+  "/save-flow.js": { file: "save-flow.js", type: "text/javascript; charset=utf-8" },
 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 

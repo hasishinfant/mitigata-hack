@@ -31,7 +31,8 @@ export type Posture = {
   revoke_hint: string | null;
   limits: { max_age_days: number | null; idle_disable_days: number | null };
   data: { store_raw: boolean; retention_days: number | null };
-  violations_7d: number;
+  violations_7d: number; // denied requests (a summarised ledger row stands for several)
+  violation_entries_7d: number; // ledger rows those denials occupy
   last_violation: { ts: string; decision: string } | null;
   risk: Level;
   flags: Flag[];
@@ -93,7 +94,8 @@ export async function getPosture(pool: pg.Pool, id: string, env: Record<string, 
   const revocableMeta = meta.find((m) => m.revocable_by_api !== null)?.revocable_by_api as boolean | undefined;
   const v = (
     await pool.query(
-      `select count(*) filter (where ts > now() - interval '7 days')::int as n,
+      `select coalesce(sum(coalesce(records, 1)) filter (where ts > now() - interval '7 days'), 0)::int as n,
+              count(*) filter (where ts > now() - interval '7 days')::int as entries,
               (array_agg(ts order by seq desc))[1] as ts, (array_agg(decision order by seq desc))[1] as decision
        from audit_ledger where connector_id = $1 and decision like 'deny%'`,
       [id],
@@ -131,6 +133,7 @@ export async function getPosture(pool: pg.Pool, id: string, env: Record<string, 
     limits: { max_age_days: conn.credential?.max_age_days ?? null, idle_disable_days: conn.credential?.idle_disable_days ?? null },
     data: { store_raw: conn.data?.store_raw ?? false, retention_days: conn.data?.retention_days ?? null },
     violations_7d: v?.n ?? 0,
+    violation_entries_7d: v?.entries ?? 0,
     last_violation: v?.ts ? { ts: v.ts, decision: v.decision } : null,
   };
   const flags = deriveFlags(base);

@@ -47,7 +47,7 @@ describe("scope assessment and flags", () => {
       connector_id: "x", source: "s", status: "enabled", auth_type: "none", streams: [], credentials: [],
       reach: { allowed_hosts: [], allowed_paths: [], read_only_post: [], methods: ["GET"], max_requests_per_run: 1, max_records_per_run: 1 },
       scopes: { ...assessScopes(null), source: "unknown" }, revocable_by_api: false, provider_ip_restriction: "unknown", revoke_hint: null,
-      limits: { max_age_days: null, idle_disable_days: null }, data: { store_raw: false, retention_days: null }, violations_7d: 0, last_violation: null,
+      limits: { max_age_days: null, idle_disable_days: null }, data: { store_raw: false, retention_days: null }, violations_7d: 0, violation_entries_7d: 0, last_violation: null,
     });
     expect(flags).toEqual([]);
   });
@@ -65,6 +65,7 @@ describe.skipIf(!hasDb)("breach features", () => {
   const socketPath = join(tmpdir(), `ixb7-${process.pid}.sock`);
   const adminSocketPath = join(tmpdir(), `ixb7a-${process.pid}.sock`);
   const adminToken = randomBytes(16).toString("hex");
+  const masterKey = randomBytes(32);
 
   beforeAll(async () => {
     mock = buildMock();
@@ -73,7 +74,7 @@ describe.skipIf(!hasDb)("breach features", () => {
     appPool = createPool(testUrl("DATABASE_URL_APP"));
     adminPool = createPool(testUrl("DATABASE_URL_ADMIN"));
     brokerPool = createPool(testUrl("DATABASE_URL_BROKER"));
-    server = createBrokerServer({ pool: brokerPool, masterKey: randomBytes(32), env, alertHosts: ["localhost"], adminToken });
+    server = createBrokerServer({ pool: brokerPool, masterKey, env, alertHosts: ["localhost"], adminToken });
     await listenOnSocket(server.app, socketPath);
     await listenOnSocket(server.adminApp, adminSocketPath);
     remote = createRemoteBroker(socketPath, { adminSocketPath, adminToken });
@@ -238,6 +239,51 @@ describe.skipIf(!hasDb)("breach features", () => {
     const ledger = JSON.stringify((await appPool.query("select * from audit_ledger where action = 'alert'")).rows);
     expect(ledger).toContain('"path":"[webhook]"');
     expect(ledger).not.toContain(new URL(hook).pathname);
+  });
+
+  it("notify sends only pending alert rows, refuses already-delivered ones, throttled from delivery history (survives a broker restart)", async () => {
+    const hook = `http://localhost:${env.MOCK_PORT}/services/T0001/B0001/${randomBytes(12).toString("hex")}`;
+    await remote.register(ghWith(GH_CRED, "alerts: { slack_webhook_ref: slack_secops }\n"), "add");
+    await remote.register(ghWith(GH_CRED, "alerts: { slack_webhook_ref: slack_secops }\n").replace("id: mock-github-members", "id: other-members"), "add");
+    await remote.putSecret("demo", "slack_secops", hook);
+    const alert = async (cid: string, msg: string) =>
+      Number((await appPool.query("insert into alerts (connector_id, kind, message) values ($1, 'test', $2) returning id", [cid, msg])).rows[0].id);
+    const limit = { perConnector: 2, total: 3, windowMs: 60_000 };
+    const start = async () => {
+      const srv = createBrokerServer({ pool: brokerPool, masterKey, env, alertHosts: ["localhost"], notifyLimit: limit });
+      const sock = join(tmpdir(), `ixb7n-${process.pid}-${randomBytes(3).toString("hex")}.sock`);
+      await listenOnSocket(srv.app, sock);
+      return { srv, worker: createRemoteBroker(sock) }; // request socket: what the scheduler (or a compromised worker) reaches
+    };
+
+    let { srv, worker } = await start();
+    try {
+      const a1 = await alert("mock-github-members", "one");
+      expect(await worker.notify(a1)).toMatchObject({ delivered: true, channel: "slack" });
+      await expect(worker.notify(a1)).rejects.toMatchObject({ statusCode: 409, message: expect.stringMatching(/already delivered/) }); // never twice
+      await expect(worker.notify(999_999)).rejects.toMatchObject({ statusCode: 404 }); // no row, no message
+      expect((await worker.notify(await alert("mock-github-members", "two"))).delivered).toBe(true);
+      await expect(worker.notify(await alert("mock-github-members", "three"))).rejects.toMatchObject({ statusCode: 429, message: expect.stringMatching(/per connector/) });
+      expect((await worker.notify(await alert("other-members", "four"))).delivered).toBe(true);
+      await expect(worker.notify(await alert("other-members", "five"))).rejects.toMatchObject({ statusCode: 429, message: expect.stringMatching(/all connectors/) });
+    } finally {
+      await srv.app.close();
+    }
+    // A restarted broker reads the same delivery history: still throttled.
+    ({ srv, worker } = await start());
+    try {
+      await expect(worker.notify(await alert("other-members", "six"))).rejects.toMatchObject({ statusCode: 429 });
+      expect(await deliverAlerts(appPool, worker)).toEqual({ sent: 0, noChannel: 0, failed: 3 });
+    } finally {
+      await srv.app.close();
+    }
+    // The broker built the text from the rows; throttled alerts are still pending for the next tick.
+    expect(mock.slack.map((m) => m.text)).toEqual([
+      ":rotating_light: [IntegrateX] mock-github-members · test: one",
+      ":rotating_light: [IntegrateX] mock-github-members · test: two",
+      ":rotating_light: [IntegrateX] other-members · test: four",
+    ]);
+    expect((await appPool.query("select message from alerts where not delivered order by id")).rows.map((r) => r.message)).toEqual(["three", "five", "six"]);
   });
 
   it("alert webhook pointing at a non-allowed host is refused and retried later", async () => {

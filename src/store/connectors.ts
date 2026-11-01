@@ -14,20 +14,25 @@ export class ConnectorConfigError extends Error {
   }
 }
 
-export type RegisterResult = { id: string; version: number; changed: boolean; newHosts?: string[] };
+export type RegisterResult = { id: string; version: number; changed: boolean; newHosts?: string[]; firstBinding?: string[] };
 
 const hostsOf = (cfg: ConnectorConfig) => cfg.policy.allowed_hosts.map((h) => h.toLowerCase());
 
 /**
  * Secret-to-host binding. A stored secret may only be sent to hosts some approved config already sends it to.
- * A new or updated config that would send an existing secret ref to a new host is refused unless the operator
- * confirms it (ix add/update --confirm-hosts). Returns the newly reached hosts.
+ * Refused unless the operator confirms (ix add/update --confirm-hosts), and the ledger records the approval:
+ *   - a config that would send a secret already in use to a new host;
+ *   - the first binding of a secret that is stored but used by no approved connector (stored before its first
+ *     registration, or kept when its connector was removed): with no approved hosts to compare against, the
+ *     first hosts are an explicit decision, not a default.
+ * A ref with no stored value and no prior use needs no confirmation: there is nothing to send yet.
+ * Limit: host history is rebuilt from active configs, not stored; persistent bindings need a new table.
  */
 async function checkSecretHosts(
   c: pg.PoolClient, cfg: ConnectorConfig, env: Record<string, string | undefined> | undefined, confirm: boolean,
-): Promise<string[]> {
+): Promise<{ newHosts: string[]; firstBinding: string[] }> {
   const refs = credentialRefs(cfg);
-  if (!refs.length) return [];
+  if (!refs.length) return { newHosts: [], firstBinding: [] };
   const rows = (
     await c.query(
       `select k.id, v.config_yaml from connectors k join connector_versions v on v.connector_id = k.id and v.version = k.active_version
@@ -45,22 +50,37 @@ async function checkSecretHosts(
       known.set(ref, set);
     }
   }
+  const unbound = refs.filter((r) => !known.has(r));
+  const stored = unbound.length
+    ? new Set(
+        (await c.query("select ref from credential_meta where tenant_id = $1 and ref = any($2)", [cfg.metadata.tenant, unbound])).rows.map(
+          (r) => r.ref as string,
+        ),
+      )
+    : new Set<string>();
+  const firstBinding = unbound.filter((r) => stored.has(r)).sort();
   const added = new Set<string>();
+  const moved: string[] = []; // refs already in use that this config would send somewhere new
   for (const ref of refs) {
     const prior = known.get(ref);
-    if (!prior) continue; // first use of this ref: nothing to protect yet
-    for (const h of hostsOf(cfg)) if (!prior.has(h)) added.add(h);
+    if (prior) {
+      const fresh = hostsOf(cfg).filter((h) => !prior.has(h));
+      if (fresh.length) moved.push(ref);
+      fresh.forEach((h) => added.add(h));
+    } else if (stored.has(ref)) hostsOf(cfg).forEach((h) => added.add(h));
   }
   const newHosts = [...added].sort();
-  if (newHosts.length && !confirm)
+  if (newHosts.length && !confirm) {
+    const why = [
+      ...(moved.length ? [`would send secret(s) ${moved.join(", ")} to new host(s)`] : []),
+      ...(firstBinding.length ? [`would be the first approved use of stored secret(s) ${firstBinding.join(", ")}`] : []),
+    ];
     throw Object.assign(
-      new Error(
-        `this config would send existing secret(s) ${refs.filter((r) => known.has(r)).join(", ")} to new host(s) ${newHosts.join(", ")}. ` +
-          "If that is intended, re-run with --confirm-hosts (API: ?confirm_hosts=1)",
-      ),
+      new Error(`this config ${why.join(" and ")}: ${newHosts.join(", ")}. If that is intended, re-run with --confirm-hosts (API: ?confirm_hosts=1)`),
       { statusCode: 409 },
     );
-  return newHosts;
+  }
+  return { newHosts, firstBinding };
 }
 
 export async function registerConnector(
@@ -86,7 +106,8 @@ export async function registerConnector(
       throw Object.assign(new Error(`connector ${id} already exists; use "ix update"`), { statusCode: 409 });
     if (opts.mustExist && !existing.rowCount) throw Object.assign(new Error(`connector ${id} does not exist; use "ix add"`), { statusCode: 404 });
     await c.query("insert into tenants (id, name) values ($1, $1) on conflict do nothing", [tenant]);
-    const newHosts = await checkSecretHosts(c, res.config!, opts.env, opts.confirmHosts === true);
+    const { newHosts, firstBinding } = await checkSecretHosts(c, res.config!, opts.env, opts.confirmHosts === true);
+    const approved = { ...(newHosts.length ? { newHosts } : {}), ...(firstBinding.length ? { firstBinding } : {}) };
     if (existing.rowCount) {
       const cur = await c.query(
         "select v.config_hash from connector_versions v join connectors k on k.id = v.connector_id and k.active_version = v.version where k.id = $1",
@@ -97,7 +118,7 @@ export async function registerConnector(
         // Same config: (re-)approve it if the broker is registering and the stored signature is missing or stale.
         if (opts.sign)
           await c.query("update connector_versions set broker_sig = $3 where connector_id = $1 and version = $2", [id, version, opts.sign(id, version, res.configHash)]);
-        return { id, version, changed: false };
+        return { id, version, changed: false, ...approved };
       }
     } else {
       await c.query("insert into connectors (id, tenant_id, source) values ($1, $2, $3)", [id, tenant, source]);
@@ -110,7 +131,7 @@ export async function registerConnector(
       [id, version, yamlText, res.configHash, opts.createdBy ?? "cli", opts.sign ? opts.sign(id, version, res.configHash) : null],
     );
     await c.query("update connectors set active_version = $2, source = $3 where id = $1", [id, version, source]);
-    return { id, version, changed: true, ...(newHosts.length ? { newHosts } : {}) };
+    return { id, version, changed: true, ...approved };
   });
 }
 

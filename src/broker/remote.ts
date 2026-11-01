@@ -21,7 +21,8 @@ export interface BrokerAdmin {
   forget(connectorId?: string): Promise<void>;
   ping(): Promise<boolean>;
   panic(opts: { purgeSecrets?: boolean; actor?: string }): Promise<{ revocations: { connectorId: string; revoked: boolean; detail: string }[]; purged: number }>;
-  notify(connectorId: string, text: string): Promise<{ delivered: boolean; channel: string; detail: string }>;
+  /** Deliver one pending alert row; the broker reads it, builds the text and marks it delivered. */
+  notify(alertId: number): Promise<{ delivered: boolean; channel: string; detail: string }>;
   /** Re-enable a disabled connector (broker-only: the app DB role can disable but not re-enable). */
   enableConnector(id: string): Promise<{ id: string; status: string }>;
   removeConnector(id: string, opts?: { purgeSecrets?: boolean }): Promise<{ removed: boolean; records: number; secrets?: { deleted: string[]; kept_shared: string[] } }>;
@@ -107,11 +108,11 @@ export function createRemoteBroker(
     testInline: (yaml) => admin<ConnectionTest>("POST", "/v1/test-inline", { yaml }),
     verifyLedger: () => admin<LedgerCheck>("GET", "/v1/ledger/verify"),
     panic: (o) => admin("POST", "/v1/panic", o),
-    notify: (connectorId, text) => call("POST", "/v1/notify", { connectorId, text }),
+    notify: (alertId) => call("POST", "/v1/notify", { alertId }),
     enableConnector: (id) => admin("POST", `/v1/connectors/${encodeURIComponent(id)}/enable`, {}),
     removeConnector: (id, o) => admin("DELETE", `/v1/connectors/${encodeURIComponent(id)}${o?.purgeSecrets ? "?purge_secrets=1" : ""}`),
     forget: async (connectorId) => {
-      await call("POST", "/v1/forget", { connectorId });
+      await admin("POST", "/v1/forget", { connectorId });
     },
     ping: async () => {
       try {

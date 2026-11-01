@@ -78,7 +78,7 @@ export async function listSecrets(pool: pg.Pool, tenant?: string) {
   ).rows;
 }
 
-export function dbSecretSource(pool: pg.Pool, masterKey: Buffer): SecretSource & { forget(): void } {
+export function dbSecretSource(pool: pg.Pool, masterKey: Buffer): SecretSource & { forget(tenant?: string, refs?: string[]): void } {
   const cache = new Map<string, { value: string; at: number }>();
   const TTL = 60_000;
   return {
@@ -94,8 +94,10 @@ export function dbSecretSource(pool: pg.Pool, masterKey: Buffer): SecretSource &
       cache.set(key, { value, at: Date.now() });
       return value;
     },
-    forget() {
-      cache.clear();
+    /** Drop cached values: only these refs of one tenant, or everything. */
+    forget(tenant?: string, refs?: string[]) {
+      if (tenant && refs) for (const r of refs) cache.delete(`${tenant}/${r}`);
+      else cache.clear();
     },
   };
 }

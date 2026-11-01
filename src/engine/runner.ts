@@ -199,8 +199,6 @@ export async function runStream(opts: {
     req = paginator.start({ url: base, ...(stream.request.body ? { body: structuredClone(stream.request.body) } : {}) });
   }
   let maxCursor: string | undefined;
-  let minQuarantined: string | undefined; // earliest cursor among quarantined records
-  let quarantinedWithoutCursor = 0; // quarantined records we can't place in time
   let completed = false;
 
   const summary: RunSummary = {
@@ -253,14 +251,10 @@ export async function runStream(opts: {
         const r = mapRecord(raw, stream.entity, stream.mapping);
         stats.records++;
         for (const f of r.present) stats.hits[f] = (stats.hits[f] ?? 0) + 1;
-        // Watermark candidates: only records we accepted. A quarantined record caps the watermark just
-        // below its own cursor, so it is fetched again once the mapping is fixed instead of being skipped forever.
-        if (inc) {
+        // Watermark candidates: only records we accepted.
+        if (inc && r.ok) {
           const c = cursorOf(raw, inc.cursor_field);
-          if (r.ok) {
-            if (c && (!maxCursor || Date.parse(c) > Date.parse(maxCursor))) maxCursor = c;
-          } else if (!c) quarantinedWithoutCursor++;
-          else if (!minQuarantined || Date.parse(c) < Date.parse(minQuarantined)) minQuarantined = c;
+          if (c && (!maxCursor || Date.parse(c) > Date.parse(maxCursor))) maxCursor = c;
         }
         if (r.ok) {
           // Data minimisation: raw payloads are kept only if the config opts in, and always secret-redacted.
@@ -327,26 +321,19 @@ export async function runStream(opts: {
     }
   }
 
-  // Watermark rules (incremental streams). Advance only when:
+  // Watermark rules (incremental streams). Advance only after a clean run:
   //   - every page was seen (no cap hit, no pagination anomaly, no failure);
-  //   - the run is not degraded (schema drift: the mapping may be silently dropping data);
-  //   - no quarantined record is missing its cursor (we couldn't tell where it sits).
-  // And never past a quarantined record: stop 1 ms before the earliest one.
-  if (inc && completed && maxCursor && (summary.status === "success" || summary.status === "partial")) {
-    let candidate: string | undefined = maxCursor;
-    let held: string | undefined;
-    if (quarantinedWithoutCursor > 0) {
-      candidate = undefined;
-      held = `${quarantinedWithoutCursor} quarantined record(s) have no ${inc.cursor_field}`;
-    } else if (minQuarantined && Date.parse(minQuarantined) <= Date.parse(maxCursor)) {
-      candidate = new Date(Date.parse(minQuarantined) - 1).toISOString();
-      held = `capped before the earliest quarantined record (${minQuarantined})`;
+  //   - nothing was quarantined: the previous watermark is kept and the window is replayed next run
+  //     (upserts absorb the duplicates). We don't try to place the watermark "just before" a bad record:
+  //     that depends on the provider's timestamp precision and whether its filter is inclusive;
+  //   - the run is not degraded (schema drift: the mapping may be silently dropping data).
+  if (inc && completed && summary.status === "partial" && summary.recordsQuarantined > 0) {
+    summary.watermarkHeld = `${summary.recordsQuarantined} record(s) quarantined; watermark kept so the window is replayed`;
+  } else if (inc && completed && maxCursor && summary.status === "success") {
+    if (!cp?.cursorValue || Date.parse(maxCursor) > Date.parse(cp.cursorValue)) {
+      await store.saveWatermark(connectorId, stream.name, maxCursor);
+      summary.watermark = maxCursor;
     }
-    if (candidate && (!cp?.cursorValue || Date.parse(candidate) > Date.parse(cp.cursorValue))) {
-      await store.saveWatermark(connectorId, stream.name, candidate);
-      summary.watermark = candidate;
-    }
-    if (held) summary.watermarkHeld = held;
   } else if (inc && summary.status === "degraded") summary.watermarkHeld = "run degraded (schema drift): watermark not advanced";
   if (summary.watermarkHeld && summary.status !== "degraded") summary.lastError = `${summary.lastError ?? ""}${summary.lastError ? "; " : ""}watermark held: ${summary.watermarkHeld}`;
 

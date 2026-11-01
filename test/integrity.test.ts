@@ -3,7 +3,7 @@
 //   - pagination that stops without proof of the last page (cycle, repeated page, missing total) is a failure;
 //   - the incremental watermark only moves for complete, non-degraded runs, and never past a quarantined record.
 import { describe, expect, it } from "vitest";
-import type { Broker, BrokerRequest } from "../src/broker/types.ts";
+import { BrokerError, type Broker, type BrokerRequest } from "../src/broker/types.ts";
 import { resolveConnector, type ResolvedConnector } from "../src/config/load.ts";
 import { validateConfigText } from "../src/config/validate.ts";
 import { extractRecords, runStream, RunFailure, type Checkpoint, type FieldStats, type FinishRun, type PageCommit, type RunStore } from "../src/engine/runner.ts";
@@ -204,29 +204,34 @@ describe("incremental watermark", () => {
     expect(s.watermark).toBe("2026-01-03T00:00:00.000Z");
   });
 
-  it("never moves past a quarantined record: the next run fetches it again", async () => {
-    const bad = ev(2, { eventType: undefined }); // no type -> quarantined
-    let body: unknown[] = [ev(1), bad, ev(3)];
+  it("a run with quarantined records keeps the previous watermark; the window is replayed", async () => {
+    let body: unknown[] = [ev(1)];
     const { broker, calls } = fakeBroker(() => ({ body }));
     const { s, store } = memStore();
+    await run(incConn(), broker, store);
+    expect(s.watermark).toBe("2026-01-01T00:00:00.000Z");
+
+    const bad = ev(2, { eventType: undefined }); // no type -> quarantined
+    body = [bad, ev(3)];
     const r1 = await run(incConn(), broker, store);
     expect(r1.status).toBe("partial");
-    expect(s.watermark).toBe("2026-01-01T23:59:59.999Z"); // 1 ms before the quarantined record
-    expect(r1.lastError).toMatch(/watermark held: capped before the earliest quarantined record/);
+    expect(s.watermark).toBe("2026-01-01T00:00:00.000Z"); // unchanged, even though ev(3) was accepted
+    expect(r1.lastError).toMatch(/watermark held: 1 record\(s\) quarantined/);
+
     body = [{ ...bad, eventType: "login" }, ev(3)]; // provider (or mapping) fixed
     const r2 = await run(incConn(), broker, store);
-    expect(calls[1]!.searchParams.get("since")).toBe("2026-01-01T23:59:59.999Z");
-    expect(r2.status).toBe("success");
+    expect(calls[2]!.searchParams.get("since")).toBe("2026-01-01T00:00:00.000Z"); // same window as the bad run
+    expect(r2).toMatchObject({ status: "success", recordsOk: 2 });
     expect(s.watermark).toBe("2026-01-03T00:00:00.000Z");
   });
 
-  it("a quarantined record without a cursor holds the watermark", async () => {
+  it("holds the watermark whatever the quarantined record's cursor looks like", async () => {
     const { broker } = fakeBroker(() => ({ body: [ev(1), { uuid: "u9", eventType: "login", published: "not a date" }, { uuid: "u8" }] }));
     const { s, store } = memStore();
     const r = await run(incConn(), broker, store);
     expect(r.status).toBe("partial");
     expect(s.watermark).toBeUndefined();
-    expect(r.watermarkHeld).toMatch(/have no published/);
+    expect(r.watermarkHeld).toMatch(/2 record\(s\) quarantined/);
   });
 
   it("a degraded (schema drift) run does not advance the watermark", async () => {
@@ -243,7 +248,73 @@ describe("incremental watermark", () => {
     expect(r.watermarkHeld).toMatch(/degraded/);
   });
 
-  it("a failed or capped run does not advance the watermark", async () => {
+  // Paged incremental stream: cursor pagination, newest record on the last page.
+  const pagedConn = (maxRequests = 20) => {
+    const c = connector(`  - name: logs
+    entity: event
+    request: { method: GET, path: /logs }
+    records_path: items
+    pagination: { type: cursor, token_path: next, token_param: c }
+    incremental: { cursor_field: published, param: since, template: "{{cursor}}" }
+    mapping:
+      id: { path: uuid, required: true }
+      type: { path: eventType, required: true }`);
+    c.runtime.maxRequestsPerRun = maxRequests;
+    return c;
+  };
+  const page = (n: number, next?: string): Reply => ({ body: { items: [ev(n)], ...(next ? { next } : {}) } });
+  const seeded = () => {
+    const m = memStore();
+    m.s.watermark = "2025-12-31T00:00:00.000Z";
+    return m;
+  };
+
+  it("pagination anomaly: watermark held", async () => {
+    const { broker } = fakeBroker((u) => (u.searchParams.get("c") ? page(2, "A") : page(1, "A"))); // A -> A
+    const { s, store } = seeded();
+    const r = await run(pagedConn(), broker, store);
+    expect(r.status).toBe("failed");
+    expect(r.lastError).toMatch(/same cursor/);
+    expect(s.watermark).toBe("2025-12-31T00:00:00.000Z");
+  });
+
+  it("max_requests_per_run reached: watermark held (next run continues from the checkpoint)", async () => {
+    const { broker } = fakeBroker((u) => {
+      const c = Number(u.searchParams.get("c") ?? 0);
+      return page((c % 8) + 1, String(c + 1)); // endless, distinct pages
+    });
+    const { s, store } = seeded();
+    const r = await run(pagedConn(3), broker, store);
+    expect(r).toMatchObject({ status: "partial", lastError: expect.stringMatching(/max_requests_per_run \(3\)/) });
+    expect(s.watermark).toBe("2025-12-31T00:00:00.000Z");
+    expect(s.checkpoint?.nextUrl).toContain("c=3");
+  });
+
+  it("worker interruption mid-run (network gone, or a crash while committing): watermark held; the resumed run advances it", async () => {
+    let down = true;
+    const { broker } = fakeBroker((u) => {
+      const c = u.searchParams.get("c");
+      if (c === "B" && down) throw new BrokerError("network", "network error: ECONNRESET");
+      return c === "B" ? page(3) : c === "A" ? page(2, "B") : page(1, "A");
+    });
+    const { s, store } = seeded();
+    const r1 = await run(pagedConn(), broker, store);
+    expect(r1.status).toBe("failed");
+    expect(s.watermark).toBe("2025-12-31T00:00:00.000Z"); // pages 1-2 committed, watermark untouched
+    down = false;
+    const r2 = await run(pagedConn(), broker, store);
+    expect(r2).toMatchObject({ status: "success", resumed: true });
+    expect(s.watermark).toBe("2026-01-03T00:00:00.000Z");
+
+    // A crash inside the page commit (process dies / DB gone) never reaches the watermark step either.
+    const m = seeded();
+    const crashing: RunStore = { ...m.store, commitPage: async (p) => (p.checkpoint === null ? Promise.reject(new Error("connection terminated")) : m.store.commitPage(p)) };
+    const { broker: b2 } = fakeBroker((u) => (u.searchParams.get("c") ? page(5) : page(4, "A")));
+    expect((await run(pagedConn(), b2, crashing)).status).toBe("failed");
+    expect(m.s.watermark).toBe("2025-12-31T00:00:00.000Z");
+  });
+
+  it("a failed run (wrong envelope) does not advance the watermark", async () => {
     const { broker } = fakeBroker(() => ({ body: { not: "an array" } }));
     const { s, store } = memStore();
     expect((await run(incConn(), broker, store)).status).toBe("failed");

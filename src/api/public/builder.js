@@ -281,28 +281,18 @@ $("b-register").addEventListener("click", async () => {
     const yaml = yamlBox.value;
     const id = /^\s*metadata:.*\bid:\s*"?([a-z0-9-]+)/m.exec(yaml)?.[1] || val("id");
     const tenant = val("tenant") || "demo";
-    for (const input of $("b-secrets").querySelectorAll("input")) {
-      if (!input.value) {
-        log(`secret "${input.dataset.ref}": no value entered, using the stored one if it exists`);
-        continue;
-      }
-      const r = await api(`/v1/secrets/${encodeURIComponent(input.dataset.ref)}?tenant=${encodeURIComponent(tenant)}`, {
-        method: "PUT", headers: adminHeaders({ "content-type": "application/json" }), body: JSON.stringify({ value: input.value }),
-      });
-      input.value = "";
-      log(`✔ secret "${r.ref}" stored encrypted in the broker (${r.chars} chars)`, "ok");
-    }
-    let reg;
-    try {
-      reg = await api("/v1/connectors", { method: "POST", headers: adminHeaders({ "content-type": "text/yaml" }), body: yaml });
-    } catch (e) {
-      if (!/already exists/.test(e.message)) throw e;
-      reg = await api(`/v1/connectors/${encodeURIComponent(id)}`, { method: "PUT", headers: adminHeaders({ "content-type": "text/yaml" }), body: yaml });
-    }
-    registeredId = reg.id;
-    log(`✔ ${reg.id} v${reg.version} ${reg.changed ? "registered and signed by the broker" : "unchanged"}`, "ok");
+    const inputs = [...$("b-secrets").querySelectorAll("input")];
+    const res = await globalThis.ixSaveConnector({
+      api, headers: adminHeaders, confirm: (q) => confirm(q), log, yaml, id, tenant,
+      secrets: inputs.map((i) => ({ ref: i.dataset.ref, value: i.value })),
+    });
+    if (res.state === "declined") return;
+    for (const i of inputs) if (res.stored.includes(i.dataset.ref)) i.value = ""; // unsent values stay for the retry
+    registeredId = res.reg.id;
+    refresh();
+    if (res.state === "registered_without_secrets") return; // the log already explains the state and the retry
     log("testing (auth + first page + 3 mapped records)…");
-    logTest(await api(`/v1/connectors/${encodeURIComponent(reg.id)}/test`, { method: "POST", headers: adminHeaders() }));
+    logTest(await api(`/v1/connectors/${encodeURIComponent(res.reg.id)}/test`, { method: "POST", headers: adminHeaders() }));
     $("b-run").disabled = false;
     refresh();
   } catch (e) {
