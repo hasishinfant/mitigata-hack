@@ -8,7 +8,7 @@ import { validateConfigText, type Issue } from "../config/validate.ts";
 import { createRemoteBroker, type RemoteBroker } from "../broker/remote.ts";
 import { verifyLedger } from "../broker/ledger.ts";
 import { loadAdminEnv } from "../envfiles.ts";
-import { runConnector } from "../engine/runner.ts";
+import { ConnectorBusy, runConnector } from "../engine/runner.ts";
 import { testConnection, type ConnectionTest } from "../engine/testConnection.ts";
 import { createPool, type Pool } from "../store/db.ts";
 import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "../store/connectors.ts";
@@ -163,7 +163,15 @@ program
   .action(
     action(async (id: string, opts: { stream?: string[] }) => {
       const conn = await loadActiveConnector(db(), id);
-      const results = await runConnector({ connector: conn, broker: broker(), store: createPgRunStore(db()), streams: opts.stream });
+      let results;
+      try {
+        results = await runConnector({ connector: conn, broker: broker(), store: createPgRunStore(db()), streams: opts.stream });
+      } catch (e) {
+        if (!(e instanceof ConnectorBusy)) throw e;
+        console.log(yellow(`⏳ ${e.message}`));
+        process.exitCode = 2;
+        return;
+      }
       for (const r of results) {
         console.log(
           `${r.stream.padEnd(12)} ${paint(r.status).padEnd(tty ? 21 : 12)} requests=${r.requests} ok=${r.recordsOk} quarantined=${r.recordsQuarantined}` +

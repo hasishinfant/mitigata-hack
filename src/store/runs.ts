@@ -5,6 +5,7 @@ import { withTx } from "./db.ts";
 import { insertQuarantine } from "./quarantine.ts";
 import { upsertRecords } from "./upsert.ts";
 import { raiseAlertOnce } from "../security/alerts.ts";
+import { acquireRunLock } from "./runLock.ts";
 
 export function createPgRunStore(pool: pg.Pool): RunStore {
   return {
@@ -115,6 +116,8 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
     async raiseAlert(connectorId, kind, message) {
       await raiseAlertOnce(pool, connectorId, kind, message, 1);
     },
+
+    lockConnector: (connectorId) => acquireRunLock(pool, connectorId),
   };
 }
 

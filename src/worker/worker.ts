@@ -5,7 +5,7 @@ import type pg from "pg";
 import { createLocalBroker } from "../broker/client.ts";
 import type { Broker, SecretSource } from "../broker/types.ts";
 import type { ResolvedConnector } from "../config/load.ts";
-import { runConnector, type RunSummary } from "../engine/runner.ts";
+import { ConnectorBusy, runConnector, type RunSummary } from "../engine/runner.ts";
 import { log } from "../log.ts";
 import { loadActiveConnector } from "../store/connectors.ts";
 import { createPgRunStore } from "../store/runs.ts";
@@ -29,6 +29,11 @@ export function createWorker(opts: { pool: pg.Pool; broker?: Broker; secrets?: S
         log.info({ connector: conn.metadata.id, stream: r.stream, status: r.status, ok: r.recordsOk, trigger: job.trigger }, "job done");
       return results;
     } catch (e) {
+      // Another run holds the connector's lock (e.g. an `ix run`): that run does the work; skip this job.
+      if (e instanceof ConnectorBusy) {
+        log.info({ connector: job.connectorId }, "job skipped: connector already running");
+        return [];
+      }
       // e.g. connector disabled or removed between enqueue and claim: nothing to do, not a crash.
       log.warn({ connector: job.connectorId, err: (e as Error).message }, "job skipped");
       return [];

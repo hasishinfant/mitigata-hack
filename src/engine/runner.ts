@@ -57,6 +57,20 @@ export interface RunStore {
   pause(connectorId: string, until: Date, reason: string): Promise<void>;
   resume(connectorId: string): Promise<void>;
   raiseAlert(connectorId: string, kind: string, message: string): Promise<void>;
+  /**
+   * Single-flight: take the connector's run lock for the whole run, or null if another run holds it.
+   * Optional so pure in-memory stores (tests) can omit it; the Postgres store always provides it.
+   */
+  lockConnector?(connectorId: string): Promise<{ release(): Promise<void> } | null>;
+}
+
+/** Another run of this connector (worker, `ix run`, ...) holds its run lock. Nothing was done. */
+export class ConnectorBusy extends Error {
+  connectorId: string;
+  constructor(connectorId: string) {
+    super(`connector ${connectorId} is already running (a worker or another ix run holds its run lock); nothing done`);
+    this.connectorId = connectorId;
+  }
 }
 
 export type RunSummary = {
@@ -372,6 +386,24 @@ async function maybeOpenBreaker(conn: ResolvedConnector, store: RunStore, summar
 }
 
 export async function runConnector(opts: {
+  connector: ResolvedConnector;
+  broker: Broker;
+  store: RunStore;
+  streams?: string[];
+  trigger?: RunTrigger;
+}): Promise<RunSummary[]> {
+  const { connector: conn, store } = opts;
+  // Every executor goes through here, so every run is single-flight per connector.
+  const lock = store.lockConnector ? await store.lockConnector(conn.metadata.id) : undefined;
+  if (lock === null) throw new ConnectorBusy(conn.metadata.id);
+  try {
+    return await runLocked(opts);
+  } finally {
+    await lock?.release(); // also on failure or throw
+  }
+}
+
+async function runLocked(opts: {
   connector: ResolvedConnector;
   broker: Broker;
   store: RunStore;

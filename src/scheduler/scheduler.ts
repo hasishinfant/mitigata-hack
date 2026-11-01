@@ -1,6 +1,8 @@
 // Scheduler: turns each connector's `schedule.every` (+ jitter) into queued runs.
 // State lives in connectors.next_run_at, so restarts don't lose or double schedules.
 // A Postgres advisory lock makes sure only one scheduler acts per tick, even with several running.
+// The scheduler only enqueues; it never executes a run. Execution (worker, `ix run`, and any future recovery job)
+// goes through runConnector, which takes the per-connector run lock (store/runLock.ts).
 import type { PgBoss } from "pg-boss";
 import type pg from "pg";
 import { loadActiveConnector } from "../store/connectors.ts";
