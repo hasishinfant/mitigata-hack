@@ -97,5 +97,5 @@ dialog::backdrop { background: rgba(0, 0, 0, .6); }
 .advisor-incident { border-left: 3px solid var(--line); padding-left: 8px; margin: 6px 0; }
 
 .advisor-verdict { font-size: 1.35rem; font-weight: 700; margin: 0 0 .4rem; }
-.advisor-verdict.yes { color: #b42318; }
-.advisor-verdict.no { color: #1f7a5a; }
+.advisor-verdict.yes { color: var(--red); }
+.advisor-verdict.no { color: var(--green); }
