@@ -270,7 +270,7 @@ export function buildMock(opts: MockOptions = {}): Mock {
     oauth.tokenCalls++;
     const f = (req.body ?? {}) as Record<string, string>;
     if (f.grant_type !== "client_credentials") return reply.code(400).send({ error: "unsupported_grant_type" });
-    let clientOk = false;
+    let clientOk: boolean;
     const basic = req.headers.authorization?.startsWith("Basic ") ? Buffer.from(req.headers.authorization.slice(6), "base64").toString() : "";
     if (basic) {
       const [id, secret] = basic.split(":").map(decodeURIComponent);

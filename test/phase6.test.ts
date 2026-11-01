@@ -22,7 +22,7 @@ import { loadActiveConnector } from "../src/store/connectors.ts";
 import { createPgRunStore } from "../src/store/runs.ts";
 import { createWorker } from "../src/worker/worker.ts";
 import { buildMock, MOCK_TOKENS, type Mock } from "../mock/server.ts";
-import { clearData, hasDb, regPool, testUrl } from "./helpers/db.ts";
+import { clearData, hasDb, testUrl } from "./helpers/db.ts";
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, "fixtures/configs", name), "utf8");
 

@@ -56,7 +56,7 @@ function readTextFiles(paths: string[]): Target[] {
 function processEnvs(): { targets: Target[]; brokerVarHits: string[] } {
   const targets: Target[] = [];
   const brokerVarHits: string[] = [];
-  let ps = "";
+  let ps: string;
   try {
     // -E/e: print each process environment after its command line; -x: include processes without a terminal.
     ps = execFileSync("ps", process.platform === "darwin" ? ["-Exww", "-o", "pid=,command="] : ["exww", "-o", "pid=,args="], { encoding: "latin1", maxBuffer: 64 * 1024 * 1024 });

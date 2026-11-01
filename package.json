@@ -13,6 +13,7 @@
     "db:up": "docker compose up -d postgres",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
     "check:no-provider-code": "! grep -riE 'github|okta|nvd|cisa' src/engine src/broker",
     "dev": "tsx src/dev.ts",
     "dev:mock": "tsx src/dev.ts --mock",
@@ -35,10 +36,14 @@
     "zod": "^4.1.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.10",
+    "eslint": "^10.14.0",
+    "globals": "^17.13.0",
     "tsx": "^4.19.2",
     "typescript": "^5.8.0",
+    "typescript-eslint": "^8.72.1",
     "vitest": "^3.0.0"
   }
 }

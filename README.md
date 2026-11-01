@@ -20,6 +20,7 @@ chmod 600 .env .env.broker .env.admin
 createdb integratex
 npx tsx src/store/migrate.ts      # tables, DB roles, append-only audit ledger
 npx pnpm@10.28.0 test             # uses a separate integratex_test database
+npx pnpm@10.28.0 lint             # ESLint: TypeScript (typescript-eslint) + dashboard scripts; fails on errors
 ```
 
 **TLS on Homebrew Node:** if HTTPS calls fail with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, your Node build can't find a CA bundle. Add this to `~/.zshrc`:

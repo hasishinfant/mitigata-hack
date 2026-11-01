@@ -2,7 +2,6 @@
 // with risk flags. Reads config, credential metadata (via the credential_meta view: no ciphertext) and
 // the audit ledger. Uses the app DB role only.
 import type pg from "pg";
-import type { ResolvedConnector } from "../config/load.ts";
 import { loadActiveConnector } from "../store/connectors.ts";
 import { assessScopes, type ScopeAssessment } from "./scopes.ts";
 

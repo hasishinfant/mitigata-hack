@@ -32,7 +32,7 @@ export async function migrate(
         say(`applied ${file}`);
       } catch (err) {
         await client.query("rollback");
-        throw new Error(`migration ${file} failed: ${(err as Error).message}`);
+        throw new Error(`migration ${file} failed: ${(err as Error).message}`, { cause: err });
       }
     }
     for (const [role, password] of [["ix_app", rolePasswords.app], ["ix_broker", rolePasswords.broker]] as const) {
