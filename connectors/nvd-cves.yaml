@@ -65,3 +65,5 @@ credential:
 
 data: { store_raw: false, redact_secrets: true, retention_days: 90 }
 alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }
+# What NVD supports (capability registry): API keys cannot be IP-restricted; no audit log.
+capabilities: { ip_allowlist: unsupported, audit_log: unavailable }

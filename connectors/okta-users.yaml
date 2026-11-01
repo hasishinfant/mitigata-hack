@@ -63,3 +63,5 @@ credential:
 
 data: { store_raw: false, redact_secrets: true, retention_days: 30 }
 alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }
+# What Okta supports (capability registry). Okta: DPoP for OAuth service apps; network zones for IP restriction.
+capabilities: { dpop: supported, ip_allowlist: supported, audit_log: ingested }   # audit log: the okta-logs connector

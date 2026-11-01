@@ -175,3 +175,52 @@ describe("IP allow-listing", () => {
     expect(v("credential: { provider_ip_allowlist: [198.51.100.1], provider_ip_restriction: \"no\" }").errors[0]?.message).toMatch(/contradicts/);
   });
 });
+
+describe("capability registry", () => {
+  const load = async (file: string, edit: (y: string) => string = (y) => y) => {
+    const { readFileSync } = await import("node:fs");
+    const { validateConfigText } = await import("../src/config/validate.ts");
+    const { resolveConnector } = await import("../src/config/load.ts");
+    const v = validateConfigText(edit(readFileSync(`test/fixtures/configs/${file}`, "utf8")), { env: { MOCK_PORT: "1" } });
+    if (!v.config) throw new Error(JSON.stringify(v.errors));
+    return resolveConnector(v.config, v.configHash);
+  };
+
+  it("public source: credential controls are not applicable (not failures); egress and integrity are enforced", async () => {
+    const { capabilitiesOf } = await import("../src/security/capabilities.ts");
+    const c = capabilitiesOf(await load("cisa-kev.yaml"));
+    expect(Object.fromEntries(Object.entries(c).map(([k, v]) => [k, v.status]))).toEqual({
+      credential_broker: "not_applicable", egress_policy: "enforced", staged_integrity: "enforced", token_binding: "not_applicable",
+      ip_allowlist: "not_applicable", foreign_ip_detection: "not_applicable", revocation: "not_applicable", rotation_hygiene: "not_applicable",
+    });
+  });
+
+  it("static key vs OAuth: binding is n/a for a PAT, enforced with DPoP, AVAILABLE when the provider supports it", async () => {
+    const { capabilitiesOf } = await import("../src/security/capabilities.ts");
+    expect(capabilitiesOf(await load("mock-github-members.yaml")).token_binding.status).toBe("not_applicable");
+    const oauth = (extra: string) => (y: string) => y.replace("    scopes: [okta.users.read]\n", `    scopes: [okta.users.read]\n${extra}`);
+    expect(capabilitiesOf(await load("mock-okta-oauth.yaml", oauth("    dpop: true\n"))).token_binding.status).toBe("enforced");
+    const avail = await load("mock-okta-oauth.yaml", (y) => `${y}capabilities: { dpop: supported, ip_allowlist: supported, audit_log: ingested }\n`);
+    const c = capabilitiesOf(avail);
+    expect([c.token_binding.status, c.ip_allowlist.status, c.foreign_ip_detection.status, c.revocation.status]).toEqual(["available", "available", "monitored", "monitored"]);
+    expect(capabilitiesOf(await load("mock-okta-oauth.yaml")).token_binding.status).toBe("unknown");
+  });
+
+  it("posture flags only what can be acted on: unsupported controls raise no warning, available ones do", async () => {
+    const { deriveFlags } = await import("../src/security/posture.ts");
+    const { CONTROLS } = await import("../src/security/capabilities.ts");
+    const caps = (o: Record<string, string>) => Object.fromEntries(CONTROLS.map((k) => [k, { status: o[k] ?? "enforced", detail: "" }]));
+    const base = {
+      connector_id: "x", source: "s", status: "enabled", auth_type: "api_key", streams: [], credentials: [],
+      reach: { allowed_hosts: [], allowed_paths: [], read_only_post: [], methods: ["GET"], max_requests_per_run: 1, max_records_per_run: 1 },
+      scopes: { granted: [], expected: [], extra: [], missing: [], forbidden: [], writeLike: [], source: "unknown" as const },
+      revocable_by_api: true, provider_ip_restriction: "unknown" as const, revoke_hint: null, limits: { max_age_days: null, idle_disable_days: null },
+      data: { store_raw: false, retention_days: null }, violations_7d: 0, violation_entries_7d: 0, token_binding: "n/a" as const,
+      ip_allowlist: { provider: null, hub_egress: [], check: "none" as const, outside: [] }, detection_rules: 0, last_violation: null,
+    };
+    const msgs = (o: Record<string, string>) => deriveFlags({ ...base, capabilities: caps(o) as never }).map((f) => f.message);
+    expect(msgs({ ip_allowlist: "unsupported" }).join()).not.toMatch(/IP/);
+    expect(msgs({ ip_allowlist: "available" })).toContain("provider supports IP allow-lists but none is set: a stolen copy works from anywhere");
+    expect(msgs({ ip_allowlist: "unknown" }).join()).toMatch(/provider IP restriction unknown/);
+  });
+});

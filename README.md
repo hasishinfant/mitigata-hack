@@ -173,6 +173,9 @@ Limits:
     ```
     Matching records from other IPs raise a `foreign_ip_use` alert and are listed in that sync's receipt.
   - Limit: IntegrateX can't set the provider's allow-list itself, because connectors are read-only. It only declares, verifies and detects.
+- **Capability registry.** `ix capabilities`, or the **Capabilities** button on the dashboard, shows every connector against every security control: credential broker, egress policy, staged integrity, token binding, IP allow-list, foreign-IP detection, revocation and rotation hygiene. Each one is **enforced / monitored** (in force), **AVAILABLE** (the provider supports it but it isn't enabled), **unknown** (declare it), **unsupported** (the provider can't), or **n/a** (for example, a public source has no credential).
+  - Declare what a provider supports in `capabilities: { dpop, ip_allowlist, audit_log }`.
+  - Posture flags only what can be acted on. A public source like CISA isn't flagged for missing DPoP, and an "unsupported" IP allow-list isn't a warning.
 - **The app database role cannot undo the kill switch.** It can disable and pause connectors, but cannot re-enable a disabled one or change the active config version (column grants plus a trigger). `ix enable` goes through the broker.
 - **Signed configs.** Configs are registered through the broker, which signs each version (an HMAC keyed from the master key). At request time it only honours versions it signed, so a rogue config row can't point a stored secret at a new host.
   - This holds even if someone writes that row straight into the database.

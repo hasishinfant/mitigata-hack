@@ -253,6 +253,23 @@ async function resolveHeld(id, syncId, action) {
 }
 $("receipts-close").addEventListener("click", () => $("receipts").close());
 
+// ---------- capability registry ----------
+$("caps-open").addEventListener("click", async () => {
+  const m = await api("/v1/capabilities");
+  const label = { enforced: "ENFORCED", monitored: "monitored", available: "AVAILABLE", unknown: "unknown", unsupported: "unsupported", not_applicable: "n/a" };
+  const t = $("caps-table");
+  t.replaceChildren(
+    el("thead", {}, el("tr", {}, el("th", {}, "connector"), m.controls.map((c) => el("th", {}, c.replace(/_/g, " "))))),
+    el("tbody", {}, m.connectors.map((c) => el("tr", {},
+      el("td", {}, c.id),
+      c.capabilities
+        ? m.controls.map((k) => el("td", { class: `cap cap-${c.capabilities[k].status}`, title: c.capabilities[k].detail }, label[c.capabilities[k].status]))
+        : el("td", { class: "bad", colspan: String(m.controls.length) }, c.error || "unreadable")))),
+  );
+  $("caps").showModal();
+});
+$("caps-close").addEventListener("click", () => $("caps").close());
+
 // ---------- kill switch ----------
 $("panic").addEventListener("click", async () => {
   // Always ask for the token here: entering it is the confirmation for an emergency stop.

@@ -23,6 +23,8 @@ import { getHealth } from "../src/store/health.ts";
 import { createPgRunStore } from "../src/store/runs.ts";
 import { buildMock, MOCK_TOKENS, type Mock } from "../mock/server.ts";
 import { clearData, hasDb, testUrl } from "./helpers/db.ts";
+import { CONTROLS } from "../src/security/capabilities.ts";
+const NA_CAPS = Object.fromEntries(CONTROLS.map((c) => [c, { status: "not_applicable" as const, detail: "" }])) as Record<(typeof CONTROLS)[number], { status: "not_applicable"; detail: string }>;
 
 const fixture = (name: string) => readFileSync(join(import.meta.dirname, "fixtures/configs", name), "utf8");
 const DAY = 86_400_000;
@@ -47,7 +49,7 @@ describe("scope assessment and flags", () => {
       connector_id: "x", source: "s", status: "enabled", auth_type: "none", streams: [], credentials: [],
       reach: { allowed_hosts: [], allowed_paths: [], read_only_post: [], methods: ["GET"], max_requests_per_run: 1, max_records_per_run: 1 },
       scopes: { ...assessScopes(null), source: "unknown" }, revocable_by_api: false, provider_ip_restriction: "unknown", revoke_hint: null,
-      limits: { max_age_days: null, idle_disable_days: null }, data: { store_raw: false, retention_days: null }, violations_7d: 0, violation_entries_7d: 0, token_binding: "n/a", ip_allowlist: { provider: null, hub_egress: [], check: "none", outside: [] }, detection_rules: 0, last_violation: null,
+      limits: { max_age_days: null, idle_disable_days: null }, data: { store_raw: false, retention_days: null }, violations_7d: 0, violation_entries_7d: 0, token_binding: "n/a", ip_allowlist: { provider: null, hub_egress: [], check: "none", outside: [] }, detection_rules: 0, capabilities: NA_CAPS, last_violation: null,
     });
     expect(flags).toEqual([]);
   });

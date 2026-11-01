@@ -214,6 +214,14 @@ export const ConnectorSchema = z.strictObject({
   alerts: z
     .strictObject({ on_consecutive_failures: posInt.optional(), slack_webhook_ref: ref.optional() })
     .optional(),
+  // What the provider supports (capability registry): lets IntegrateX tell "not enabled" from "not possible".
+  capabilities: z
+    .strictObject({
+      dpop: z.enum(["supported", "unsupported"]).optional(),
+      ip_allowlist: z.enum(["supported", "unsupported"]).optional(),
+      audit_log: z.enum(["ingested", "available", "unavailable"]).optional(),
+    })
+    .optional(),
 });
 
 export type ConnectorConfig = z.infer<typeof ConnectorSchema>;

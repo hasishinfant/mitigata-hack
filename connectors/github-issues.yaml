@@ -57,3 +57,5 @@ credential:
 
 data: { store_raw: false, redact_secrets: true, retention_days: 30 }
 alerts: { on_consecutive_failures: 3, slack_webhook_ref: slack_secops }
+# What GitHub supports (capability registry). IP allow list and org audit log need GitHub Enterprise Cloud: verify your plan.
+capabilities: { ip_allowlist: supported, audit_log: available }

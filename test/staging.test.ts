@@ -191,5 +191,8 @@ describe.skipIf(!hasDb)("staged ingestion and integrity receipts", () => {
     expect((await app.inject({ method: "POST", url: `/v1/syncs/${r.syncId}/approve`, headers: { authorization: "Bearer admin-token-for-test-123456" } })).statusCode).toBe(404);
     const page = (await app.inject({ url: "/" })).body;
     expect(page).toContain('id="receipts"');
+    expect(page).toContain('id="caps"');
+    const caps = (await app.inject({ url: "/v1/capabilities" })).json();
+    expect(caps.connectors.find((c: { id: string }) => c.id === "stg-api").capabilities).toMatchObject({ staged_integrity: { status: "enforced" }, token_binding: { status: "not_applicable" } });
   });
 });

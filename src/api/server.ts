@@ -14,6 +14,7 @@ import { testConnection } from "../engine/testConnection.ts";
 import { enqueueRun } from "../scheduler/queue.ts";
 import { panic } from "../security/panic.ts";
 import { getPosture } from "../security/posture.ts";
+import { capabilityMatrix } from "../security/capabilities.ts";
 import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "../store/connectors.ts";
 import { getHealth } from "../store/health.ts";
 import { listQuarantine } from "../store/quarantine.ts";
@@ -107,6 +108,9 @@ export function buildApi(opts: ApiOptions) {
   });
 
   app.get("/v1/connectors/:id/posture", async (req) => getPosture(opts.pool, (req.params as { id: string }).id, env));
+  // Capability registry: which security controls are enforced / available / monitored / unsupported / not applicable.
+  app.get("/v1/capabilities", async () =>
+    capabilityMatrix((await opts.pool.query("select id from connectors order by id")).rows.map((r) => r.id as string), (id) => loadActiveConnector(opts.pool, id, env)));
 
   app.get("/v1/alerts", async (req) => {
     const limit = Math.min(Number((req.query as { limit?: string }).limit) || 50, 500);

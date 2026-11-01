@@ -1,7 +1,9 @@
+import { CONTROLS } from "../src/security/capabilities.ts";
 import { describe, expect, it, vi } from "vitest";
 import type { Pool } from "../src/store/db.ts";
 import type { Posture } from "../src/security/posture.ts";
 import { runRehearsal } from "../src/security/rehearsal.ts";
+const NA_CAPS = Object.fromEntries(CONTROLS.map((c) => [c, { status: "not_applicable" as const, detail: "" }])) as Record<(typeof CONTROLS)[number], { status: "not_applicable"; detail: string }>;
 
 const posture = (id: string, risk: Posture["risk"]): Posture => ({
   connector_id: id,
@@ -17,7 +19,7 @@ const posture = (id: string, risk: Posture["risk"]): Posture => ({
   revoke_hint: null,
   limits: { max_age_days: null, idle_disable_days: null },
   data: { store_raw: false, retention_days: null },
-  violations_7d: 0, violation_entries_7d: 0, token_binding: "n/a", ip_allowlist: { provider: null, hub_egress: [], check: "none", outside: [] }, detection_rules: 0,
+  violations_7d: 0, violation_entries_7d: 0, token_binding: "n/a", ip_allowlist: { provider: null, hub_egress: [], check: "none", outside: [] }, detection_rules: 0, capabilities: NA_CAPS,
   last_violation: null,
   risk,
   flags: risk === "high" ? [{ level: "high", message: "over-privileged scope" }] : [],

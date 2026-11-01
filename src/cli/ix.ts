@@ -14,6 +14,7 @@ import { createPool, type Pool } from "../store/db.ts";
 import { ConnectorConfigError, loadActiveConnector, setConnectorEnabled } from "../store/connectors.ts";
 import { panic } from "../security/panic.ts";
 import { getPosture, type Level } from "../security/posture.ts";
+import { capabilityMatrix } from "../security/capabilities.ts";
 import { runRehearsal } from "../security/rehearsal.ts";
 import { enqueueRun, startBoss } from "../scheduler/queue.ts";
 import { ENTITY_ALIASES, queryRecords } from "../store/query.ts";
@@ -224,6 +225,32 @@ canary
       const rows = await broker().listCanaries(opts.tenant);
       if (!rows.length) return console.log(dim("no decoys"));
       for (const c of rows) console.log(`${c.tenant}/${c.ref}  ${c.kind}  ${String(c.created_at).slice(0, 19)}`);
+    }),
+  );
+
+program
+  .command("capabilities")
+  .description("capability registry: each security control per connector (enforced / available / monitored / unsupported / n/a)")
+  .option("-v, --verbose", "show the detail for each cell")
+  .action(
+    action(async (opts: { verbose?: boolean }) => {
+      const ids = (await db().query("select id from connectors order by id")).rows.map((r) => r.id as string);
+      const m = await capabilityMatrix(ids, (id) => loadActiveConnector(db(), id));
+      const sym: Record<string, (s: string) => string> = {
+        enforced: (s) => green(s), monitored: (s) => green(s), available: (s) => yellow(s), unknown: (s) => yellow(s), unsupported: (s) => dim(s), not_applicable: (s) => dim(s),
+      };
+      const short: Record<string, string> = { enforced: "ENFORCED", monitored: "monitored", available: "AVAILABLE", unknown: "unknown", unsupported: "unsupported", not_applicable: "n/a" };
+      const w = 12;
+      console.log("".padEnd(20) + m.controls.map((c) => c.slice(0, w - 1).padEnd(w)).join(""));
+      for (const c of m.connectors) {
+        if (!c.capabilities) {
+          console.log(`${c.id.padEnd(20)}${red(c.error ?? "unreadable")}`);
+          continue;
+        }
+        console.log(c.id.padEnd(20) + m.controls.map((k) => sym[c.capabilities![k].status]!(short[c.capabilities![k].status]!.padEnd(w))).join(""));
+        if (opts.verbose) for (const k of m.controls) console.log(dim(`    ${k}: ${c.capabilities[k].detail}`));
+      }
+      console.log(dim("AVAILABLE = the provider supports it but it isn't enabled; unknown = declare it under capabilities: in the config"));
     }),
   );
 

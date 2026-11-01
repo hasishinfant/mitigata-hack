@@ -22,6 +22,7 @@
     </nav>
     <div class="right">
       <span id="updated" class="muted"></span>
+      <button id="caps-open">Capabilities</button>
       <button id="panic" class="danger" title="Emergency stop: disable every connector, wipe tokens, show the revocation checklist">Kill switch</button>
     </div>
   </header>
@@ -184,6 +185,12 @@
   <dialog id="posture">
     <div class="dialog-head"><strong id="posture-title"></strong><button id="posture-close">Close</button></div>
     <div id="posture-body"></div>
+  </dialog>
+
+  <dialog id="caps">
+    <div class="dialog-head"><strong>Capability registry: security controls per connector</strong><button id="caps-close">Close</button></div>
+    <p class="muted">enforced / monitored: in force · AVAILABLE: the provider supports it, enable it · unknown: declare it under <code>capabilities:</code> · unsupported / n/a: not possible or doesn't apply (not a failure)</p>
+    <div class="table-wrap"><table id="caps-table"></table></div>
   </dialog>
 
   <dialog id="receipts">

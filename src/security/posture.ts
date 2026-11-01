@@ -5,6 +5,7 @@ import type pg from "pg";
 import { loadActiveConnector } from "../store/connectors.ts";
 import { assessScopes, type ScopeAssessment } from "./scopes.ts";
 import { ipIn, parseRanges, splitRanges } from "../config/ipranges.ts";
+import { capabilitiesOf, type Capabilities } from "./capabilities.ts";
 
 export type Level = "high" | "medium" | "low";
 export type Flag = { level: Level; message: string };
@@ -38,6 +39,7 @@ export type Posture = {
     outside: string[]; // hub egress entries not covered by the provider allow-list
   };
   detection_rules: number; // stream detect rules (e.g. foreign-IP use in the provider's audit log)
+  capabilities: Capabilities;
   revoke_hint: string | null;
   limits: { max_age_days: number | null; idle_disable_days: number | null };
   data: { store_raw: boolean; retention_days: number | null };
@@ -83,16 +85,22 @@ export function deriveFlags(p: Omit<Posture, "risk" | "flags">): Flag[] {
       flags.push({ level: "medium", message: `${c.ref} unused for ${c.idle_days} days (idle limit ${p.limits.idle_disable_days})` });
   }
   if (p.auth_type !== "none") {
-    if (p.token_binding === "none")
-      flags.push({ level: "low", message: "OAuth token not sender-constrained (no DPoP): a stolen token works anywhere until it expires" });
+    const cap = p.capabilities;
+    if (p.token_binding === "none" && cap.token_binding.status !== "unsupported")
+      flags.push({ level: "low", message: `OAuth token not sender-constrained (no DPoP): a stolen token works anywhere until it expires${cap.token_binding.status === "available" ? "; the provider supports DPoP" : ""}` });
     const ipa = p.ip_allowlist;
     if (ipa.check === "hub_outside")
       flags.push({ level: "high", message: `hub egress ${ipa.outside.join(", ")} is outside the provider's IP allow-list: the provider will reject the hub's calls` });
     if (ipa.check === "open") flags.push({ level: "medium", message: "provider IP allow-list includes /0: it allows every IP" });
     if (ipa.check === "egress_unknown") flags.push({ level: "low", message: "IX_EGRESS_IPS not set: can't verify the hub is inside the provider's allow-list" });
     if (p.provider_ip_restriction === "no") flags.push({ level: "medium", message: "token works from any IP: a stolen copy is usable anywhere" });
-    if (p.provider_ip_restriction === "unknown")
-      flags.push({ level: "low", message: "provider IP restriction unknown: declare credential.provider_ip_allowlist once it is set at the provider" });
+    if (p.provider_ip_restriction === "unknown" && cap.ip_allowlist.status !== "unsupported")
+      flags.push({
+        level: cap.ip_allowlist.status === "available" ? "medium" : "low",
+        message: cap.ip_allowlist.status === "available"
+          ? "provider supports IP allow-lists but none is set: a stolen copy works from anywhere"
+          : "provider IP restriction unknown: declare credential.provider_ip_allowlist once it is set at the provider",
+      });
     if (p.revocable_by_api !== true) flags.push({ level: "low", message: "manual revocation only (panic can't revoke it for you)" });
     if (s.granted === null) flags.push({ level: "low", message: "provider did not report granted scopes" });
   }
@@ -159,6 +167,7 @@ export async function getPosture(pool: pg.Pool, id: string, env: Record<string, 
     provider_ip_restriction: conn.credential?.provider_ip_allowlist ? "yes" : (conn.credential?.provider_ip_restriction ?? "unknown"),
     ip_allowlist: ipAllowlist(conn.credential?.provider_ip_allowlist, env.IX_EGRESS_IPS),
     detection_rules: conn.streams.reduce((n, s) => n + (s.detect?.length ?? 0), 0),
+    capabilities: capabilitiesOf(conn),
     token_binding: a.type === "oauth2_client_credentials" ? (a.dpop ? "dpop" : "none") : "n/a",
     revoke_hint: conn.credential?.revoke_hint ?? null,
     limits: { max_age_days: conn.credential?.max_age_days ?? null, idle_disable_days: conn.credential?.idle_disable_days ?? null },
