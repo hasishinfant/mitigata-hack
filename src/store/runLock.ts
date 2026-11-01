@@ -8,13 +8,13 @@
 // Lock connections come from their own small pool, never the data pool: with N concurrent runs each holding a lock
 // connection and also needing data connections for page commits, a shared pool of size <= N would deadlock.
 //
-// Lock loss fails closed. If the lock's session dies mid-run (database restart, network, terminated backend), another
-// run may take the lock, so the original run must stop:
-//   - check() runs before every provider request: it pings the lock session and throws if it is gone;
-//   - every page-commit transaction (and the final watermark write) re-checks in pg_locks that the lock is still
-//     granted to this run's session, and aborts if not (see fenceQuery).
-// Residual window: the time between that fence check and the COMMIT of the same transaction (milliseconds; a new
-// run would also have to take the lock and fetch a page from the provider inside it).
+// Writes happen ON the lock-holding session (tx()). Page commits and the final status-plus-watermark transaction run
+// on the same connection that holds the lock. PostgreSQL releases a session advisory lock only when that session
+// ends, and ending a session rolls back any transaction still open on it. So a run's write either commits while it
+// still holds the lock, before any replacement can take it, or not at all. There is no gap between "checked the
+// lock" and "committed": a replacement can only get the lock after the old session, and its open transaction, are gone.
+//
+// check() pings the lock session before every provider request: an early stop, not the safety mechanism.
 import { createHash } from "node:crypto";
 import pg from "pg";
 import { log } from "../log.ts";
@@ -26,28 +26,20 @@ export function runLockKey(connectorId: string): string {
 
 export type RunLock = {
   connectorId: string;
-  /** Backend pid of the session holding the lock (for the commit-time fence). */
+  /** Backend pid of the session holding the lock (diagnostics, tests). */
   pid: number;
   key: string;
-  /** Throws LockLost if the lock's session is gone. */
+  /** Throws LockLost if the lock's session is gone. Early warning only. */
   check(): Promise<void>;
+  /**
+   * Run fn in a transaction on the lock-holding session. Throws LockLost (nothing committed) if the session is gone
+   * before or during it; any other error rolls back and is rethrown as is.
+   */
+  tx<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T>;
   release(): Promise<void>;
 };
 
 export class LockLost extends Error {}
-
-/**
- * SQL that returns a row only while `pid` still holds the advisory lock `key` (granted, session-level).
- * pg_locks shows a bigint advisory key as classid = high 32 bits, objid = low 32 bits, objsubid = 1.
- */
-export function fenceQuery(lock: Pick<RunLock, "pid" | "key">): { text: string; values: unknown[] } {
-  const k = BigInt(lock.key);
-  return {
-    text: `select 1 from pg_locks where locktype = 'advisory' and granted and pid = $1
-           and classid = $2::bigint::oid and objid = $3::bigint::oid and objsubid = 1`,
-    values: [lock.pid, BigInt.asUintN(32, k >> 32n).toString(), BigInt.asUintN(32, k).toString()],
-  };
-}
 
 const lockPools = new WeakMap<pg.Pool, pg.Pool>();
 function lockPoolFor(data: pg.Pool): pg.Pool {
@@ -112,6 +104,31 @@ export async function acquireRunLock(data: pg.Pool, connectorId: string): Promis
         }
       }
       throw new LockLost(`run lock for ${connectorId} was lost (its database session ended); stopping this run`);
+    },
+    async tx(fn) {
+      const gone = () => new LockLost(`run lock for ${connectorId} was lost (its database session ended); nothing was committed`);
+      if (released || lost) throw gone();
+      try {
+        await client.query("begin");
+      } catch {
+        lost = true;
+        throw gone();
+      }
+      try {
+        const out = await fn(client);
+        await client.query("commit");
+        return out;
+      } catch (e) {
+        // A failed COMMIT on a dead session means PostgreSQL rolled it back. If even ROLLBACK fails, the session is
+        // gone: report lock loss. Otherwise it was an ordinary error (bad data, a test hook): rolled back, rethrown.
+        try {
+          await client.query("rollback");
+        } catch {
+          lost = true;
+        }
+        if (lost) throw gone();
+        throw e;
+      }
     },
     async release() {
       if (released) return;

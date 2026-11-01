@@ -6,18 +6,31 @@ import { withTx } from "./db.ts";
 import { insertQuarantine } from "./quarantine.ts";
 import { upsertRecords } from "./upsert.ts";
 import { raiseAlertOnce } from "../security/alerts.ts";
-import { acquireRunLock, fenceQuery, LockLost, type RunLock } from "./runLock.ts";
+import { acquireRunLock, LockLost, type RunLock } from "./runLock.ts";
 
-export function createPgRunStore(pool: pg.Pool): RunStore {
+export type PgRunStoreOptions = {
+  /** Test hook: called inside a write transaction after its writes, just before COMMIT. */
+  beforeCommit?: (kind: "page" | "finish", connectorId: string) => Promise<void>;
+};
+
+export function createPgRunStore(pool: pg.Pool, opts: PgRunStoreOptions = {}): RunStore {
   const held = new Map<string, RunLock>(); // connector -> the run lock this store's run holds
-  /** Inside a transaction: is this connector's run lock still held by our run's session? */
-  const fenced = async (c: pgTypes.PoolClient, connectorId: string): Promise<boolean> => {
-    const lock = held.get(connectorId);
-    if (!lock) return true; // no lock taken through this store (e.g. a store used without runConnector)
-    const q = fenceQuery(lock);
-    return ((await c.query(q.text, q.values)).rowCount ?? 0) > 0;
-  };
   const LOST = "run lock lost (its database session ended); nothing more was committed";
+
+  /**
+   * A run's writes go through the lock-holding session when the run holds a lock (single-flight is then a property
+   * of the transaction itself: see runLock.ts), otherwise through the data pool (stores used without runConnector).
+   */
+  const write = async <T>(connectorId: string, fn: (c: pgTypes.PoolClient) => Promise<T>): Promise<T> => {
+    const lock = held.get(connectorId);
+    if (!lock) return withTx(pool, fn);
+    try {
+      return await lock.tx(fn);
+    } catch (e) {
+      if (e instanceof LockLost) throw new RunFailure("failed", LOST);
+      throw e;
+    }
+  };
 
   return {
     async startRun(r) {
@@ -28,9 +41,7 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
     },
 
     async commitPage(p: PageCommit) {
-      await withTx(pool, async (c) => {
-        // Fail closed: if another run may hold the lock now, this run commits nothing.
-        if (!(await fenced(c, p.connectorId))) throw new RunFailure("failed", LOST);
+      await write(p.connectorId, async (c) => {
         await upsertRecords(c, p.entity, p.records, {
           tenant: p.tenant, source: p.source, connectorId: p.connectorId, runId: p.runId, fetchedAt: p.fetchedAt,
         });
@@ -49,39 +60,42 @@ export function createPgRunStore(pool: pg.Pool): RunStore {
           );
         // Stream complete: clear the page position but keep the row (it holds the incremental watermark).
         else await c.query("update checkpoints set page_state = null, updated_at = now() where connector_id = $1 and stream = $2", [p.connectorId, p.stream]);
+        await opts.beforeCommit?.("page", p.connectorId);
       });
     },
 
-    // Status and watermark in one transaction. A crash or failed commit leaves neither: the run stays "running"
-    // (an abandoned run) with the old watermark, so the next run re-fetches the same window.
+    // Status and watermark in one transaction, on the lock session. If it fails (or the lock session dies before
+    // COMMIT), neither is saved. If the lock was lost, only the run's own history row is marked failed, through the
+    // data pool: no records, checkpoints, watermark or connector state, so it cannot interfere with a replacement run.
     async finishRun(r): Promise<FinishedRun> {
-      return withTx(pool, async (c) => {
-        let { status, lastError } = r;
-        let watermarkSaved = false;
-        if (r.watermark) {
-          if (await fenced(c, r.connectorId)) {
+      try {
+        return await write(r.connectorId, async (c) => {
+          if (r.watermark)
             // Only cursor_value: the page position (page_state) is left as the last page commit wrote it.
             await c.query(
               `insert into checkpoints (connector_id, stream, cursor_value, updated_at) values ($1, $2, $3, now())
                on conflict (connector_id, stream) do update set cursor_value = excluded.cursor_value, updated_at = now()`,
               [r.connectorId, r.stream, r.watermark],
             );
-            watermarkSaved = true;
-          } else {
-            status = "failed";
-            lastError = `${LOST}; watermark not advanced`;
-          }
-        }
-        // requests is authoritative here: failed requests never reach commitPage.
-        await c.query(
-          `update runs set status = $2, finished_at = now(), last_error = $3, requests = $4, retries = $5, rate_limited_ms = $6, field_stats = $7
-           where id = $1`,
-          [r.runId, status, lastError ?? null, r.requests, r.retries, r.rateLimitedMs, JSON.stringify(r.fieldStats)],
-        );
-        if (["success", "partial", "degraded"].includes(status))
-          await c.query("update connectors set last_success_at = now() where id = $1", [r.connectorId]);
-        return { status, ...(lastError !== undefined ? { lastError } : {}), watermarkSaved };
-      });
+          // requests is authoritative here: failed requests never reach commitPage.
+          await c.query(
+            `update runs set status = $2, finished_at = now(), last_error = $3, requests = $4, retries = $5, rate_limited_ms = $6, field_stats = $7
+             where id = $1`,
+            [r.runId, r.status, r.lastError ?? null, r.requests, r.retries, r.rateLimitedMs, JSON.stringify(r.fieldStats)],
+          );
+          if (["success", "partial", "degraded"].includes(r.status))
+            await c.query("update connectors set last_success_at = now() where id = $1", [r.connectorId]);
+          await opts.beforeCommit?.("finish", r.connectorId);
+          return { status: r.status, ...(r.lastError !== undefined ? { lastError: r.lastError } : {}), watermarkSaved: Boolean(r.watermark) };
+        });
+      } catch (e) {
+        if (!(e instanceof RunFailure && e.message === LOST)) throw e;
+        const lastError = `${LOST}; ${r.watermark ? "watermark not advanced; " : ""}run marked failed`;
+        await pool.query("update runs set status = 'failed', finished_at = now(), last_error = $2, requests = $3, retries = $4, rate_limited_ms = $5 where id = $1", [
+          r.runId, lastError, r.requests, r.retries, r.rateLimitedMs,
+        ]);
+        return { status: "failed", lastError, watermarkSaved: false };
+      }
     },
 
     async loadCheckpoint(connectorId, stream): Promise<Checkpoint | null> {

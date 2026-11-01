@@ -1,9 +1,10 @@
 // Run finalisation and lock loss against the real test database.
 //   - The success status and the new watermark are committed in one transaction: if it fails, neither is saved.
-//   - Losing the run lock mid-run fails the run closed: it commits no more pages and saves no watermark,
-//     even while another run (which took the lock) completes normally.
+//   - A run's writes are transactions on its lock-holding session. If that session is terminated while a write is
+//     open (after its statements, before COMMIT), PostgreSQL rolls it back; a replacement run that then takes the
+//     lock is the only one whose records, checkpoint and watermark remain. Deterministic: the old transaction is
+//     paused at a hook just before COMMIT while the test kills its session and runs the replacement.
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import type pg from "pg";
 import type { Broker } from "../src/broker/types.ts";
 import { runConnector } from "../src/engine/runner.ts";
 import { createPool, type Pool } from "../src/store/db.ts";
@@ -48,40 +49,6 @@ function broker(records: () => unknown[], gate?: Promise<void>, entered?: () => 
   return { b, calls };
 }
 
-/** A pool whose transactions fail at COMMIT once they have run a statement matching `when` (real rollback). */
-function failingCommitPool(real: pg.Pool, when: RegExp): pg.Pool {
-  return new Proxy(real, {
-    get(target, prop) {
-      if (prop !== "connect") {
-        const v = Reflect.get(target, prop, target); // pool.query() etc. use the real pool (and its own connect)
-        return typeof v === "function" ? v.bind(target) : v;
-      }
-      return async () => {
-        const client = await target.connect();
-        let armed = false;
-        return new Proxy(client, {
-          get(c, p) {
-            if (p !== "query") {
-              const v = Reflect.get(c, p, c);
-              return typeof v === "function" ? v.bind(c) : v;
-            }
-            return async (text: unknown, values?: unknown) => {
-              const sql = typeof text === "string" ? text : "";
-              if (when.test(sql)) armed = true;
-              if (sql === "commit" && armed) {
-                armed = false;
-                await c.query("rollback");
-                throw new Error("simulated failure at COMMIT (connection lost)");
-              }
-              return c.query(text as string, values as unknown[]);
-            };
-          },
-        });
-      };
-    },
-  }) as pg.Pool;
-}
-
 describe.skipIf(!hasDb)("run finalisation and lock loss", () => {
   let poolA: Pool;
   let poolB: Pool;
@@ -114,8 +81,13 @@ describe.skipIf(!hasDb)("run finalisation and lock loss", () => {
   it("the final transaction fails: neither the success status nor the new watermark is committed", async () => {
     const conn = await loadActiveConnector(poolA, ID, {});
     const p = broker(() => [ev("a", 1), ev("b", 3)]);
-    const store = createPgRunStore(failingCommitPool(poolA, /^\s*update runs set status = \$2, finished_at/));
-    await expect(runConnector({ connector: conn, broker: p.b, store })).rejects.toThrow(/simulated failure at COMMIT/);
+    // The final transaction (status + watermark, on the lock session) fails just before COMMIT and is rolled back.
+    const store = createPgRunStore(poolA, {
+      beforeCommit: async (kind) => {
+        if (kind === "finish") throw new Error("simulated failure before COMMIT");
+      },
+    });
+    await expect(runConnector({ connector: conn, broker: p.b, store })).rejects.toThrow(/simulated failure before COMMIT/);
 
     expect(await one("select status from runs where connector_id = $1", [ID])).toEqual({ status: "running" }); // not success
     expect((await one("select cursor_value from checkpoints where connector_id = $1", [ID]))?.cursor_value ?? null).toBeNull(); // not advanced
@@ -159,7 +131,7 @@ describe.skipIf(!hasDb)("run finalisation and lock loss", () => {
     expect((await one("select cursor_value from checkpoints where connector_id = $1", [ID])).cursor_value).toBe("2026-02-02T00:00:00.000Z");
   });
 
-  it("the watermark write itself is fenced: a lost lock at finalisation fails the run instead", async () => {
+  it("lock already lost at finalisation: no watermark, and only the run's own history row is marked failed", async () => {
     const store = createPgRunStore(poolA);
     const lock = await store.lockConnector!(ID);
     expect(lock).not.toBeNull();
@@ -172,10 +144,79 @@ describe.skipIf(!hasDb)("run finalisation and lock loss", () => {
       runId, connectorId: ID, stream: "logs", status: "success", requests: 1, retries: 0, rateLimitedMs: 0,
       fieldStats: { records: 1, hits: {} }, watermark: "2026-03-01T00:00:00.000Z",
     });
-    expect(done).toMatchObject({ status: "failed", watermarkSaved: false, lastError: expect.stringMatching(/run lock lost/) });
+    expect(done).toMatchObject({ status: "failed", watermarkSaved: false, lastError: expect.stringMatching(/run lock lost.*watermark not advanced/) });
+    expect(await one("select last_success_at from connectors where id = $1", [ID])).toEqual({ last_success_at: null });
     expect(await one("select status from runs where id = $1", [runId])).toEqual({ status: "failed" });
     expect(await one("select cursor_value from checkpoints where connector_id = $1", [ID])).toBeUndefined();
     await expect(lock!.check()).rejects.toThrow(/run lock lost/);
     await lock!.release(); // destroys the dead connection; no throw
+  });
+
+  /** Old run paused inside a write transaction on its lock session; returns controls for the test. */
+  async function pausedOldRun(kind: "page" | "finish", oldRecords: unknown[]) {
+    const conn = await loadActiveConnector(poolA, ID, {});
+    let paused!: () => void;
+    const atCommit = new Promise<void>((r) => (paused = r));
+    let resume!: () => void;
+    const gate = new Promise<void>((r) => (resume = r));
+    const store = createPgRunStore(poolA, {
+      beforeCommit: async (k) => {
+        if (k !== kind) return;
+        paused();
+        await gate; // writes are done, COMMIT not sent yet
+      },
+    });
+    const result = runConnector({ connector: conn, broker: broker(() => oldRecords).b, store });
+    await atCommit;
+    return { conn, result, resume };
+  }
+  async function replacementRun(conn: Awaited<ReturnType<typeof loadActiveConnector>>, records: unknown[]) {
+    for (let i = 0; i < 100; i++) {
+      const r = await runConnector({ connector: conn, broker: broker(() => records).b, store: createPgRunStore(poolB) }).catch((e) => {
+        if (/already running/.test((e as Error).message)) return undefined;
+        throw e;
+      });
+      if (r) return r;
+      await new Promise((res) => setTimeout(res, 20));
+    }
+    throw new Error("replacement never got the lock");
+  }
+
+  it("old lock session killed during a page commit (writes done, COMMIT pending): rolled back; only the replacement remains", async () => {
+    const old = await pausedOldRun("page", [ev("old-1", 8), ev("old-2", 9)]);
+    // The old transaction's rows are written but uncommitted: invisible to everyone else.
+    expect(Number((await one("select count(*) from events where connector_id = $1", [ID])).count)).toBe(0);
+    const pid = await lockHolderPid();
+    await adminPool.query("select pg_terminate_backend($1)", [pid]);
+
+    const [rep] = await replacementRun(old.conn, [ev("new-1", 2)]);
+    expect(rep).toMatchObject({ status: "success", watermark: "2026-02-02T00:00:00.000Z" });
+
+    old.resume(); // the old run tries to COMMIT on its dead session
+    const [o] = await old.result;
+    expect(o).toMatchObject({ status: "failed", lastError: expect.stringMatching(/run lock lost/) });
+    expect(o?.watermark).toBeUndefined();
+
+    expect((await poolA.query("select source_id from events where connector_id = $1 order by 1", [ID])).rows.map((r) => r.source_id)).toEqual(["new-1"]);
+    expect(await one("select cursor_value, page_state from checkpoints where connector_id = $1", [ID])).toEqual({ cursor_value: "2026-02-02T00:00:00.000Z", page_state: null });
+    const runRows = (await poolA.query("select status, records_ok from runs where connector_id = $1 order by started_at", [ID])).rows;
+    expect(runRows).toEqual([{ status: "failed", records_ok: 0 }, { status: "success", records_ok: 1 }]); // old page's counters rolled back too
+  });
+
+  it("old lock session killed during finalisation (status + watermark written, COMMIT pending): rolled back; the replacement's watermark stands", async () => {
+    // The old run's page committed while it held the lock; its finalisation (success + watermark day 9) is pending.
+    const old = await pausedOldRun("finish", [ev("old-1", 9)]);
+    await adminPool.query("select pg_terminate_backend($1)", [await lockHolderPid()]);
+
+    const [rep] = await replacementRun(old.conn, [ev("new-1", 2)]);
+    expect(rep).toMatchObject({ status: "success", watermark: "2026-02-02T00:00:00.000Z" });
+
+    old.resume();
+    const [o] = await old.result;
+    expect(o).toMatchObject({ status: "failed", lastError: expect.stringMatching(/run lock lost.*watermark not advanced/) });
+    // Day 9 never landed: the only watermark is the replacement's.
+    expect((await one("select cursor_value from checkpoints where connector_id = $1", [ID])).cursor_value).toBe("2026-02-02T00:00:00.000Z");
+    const statuses = (await poolA.query("select status from runs where connector_id = $1 order by started_at", [ID])).rows.map((r) => r.status);
+    expect(statuses).toEqual(["failed", "success"]);
   });
 });
