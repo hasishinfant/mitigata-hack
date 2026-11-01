@@ -16,6 +16,5 @@ streams:
       severity:    { const: critical }
       timestamp:   { path: dateAdded, transform: to_iso8601 }
       description: { concat: [vendorProject, { lit: " " }, product, { lit: ": " }, vulnerabilityName] }
-      attributes:  { pick: [dueDate, knownRansomwareCampaignUse, requiredAction] }
 schedule: { every: 24h }
 policy: { allowed_hosts: [www.cisa.gov], methods: [GET], max_records_per_run: 5000 }

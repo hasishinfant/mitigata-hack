@@ -741,10 +741,11 @@ program
   .option("--source <source>")
   .option("--since <iso>", "fetched at or after")
   .option("--type <type>", "event type")
+  .option("-s, --search <text>", "free-text search (any field, case-insensitive)")
   .option("-n, --limit <n>", "rows", "20")
   .option("--json")
   .action(
-    action(async (entityArg: string, opts: { source?: string; since?: string; type?: string; limit: string; json?: boolean }) => {
+    action(async (entityArg: string, opts: { source?: string; since?: string; type?: string; search?: string; limit: string; json?: boolean }) => {
       const entity = ENTITY_ALIASES[entityArg];
       if (!entity) throw new Error(`unknown entity "${entityArg}" (users, devices, events)`);
       const { total, rows } = await queryRecords(db(), entity, { ...opts, limit: Number(opts.limit) });
