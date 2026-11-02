@@ -20,10 +20,11 @@ export async function queryRecords(
   const params: unknown[] = [];
   const add = (sql: string, v: unknown) => {
     params.push(v);
-    where.push(sql.replace("?", `$${params.length}`));
+    where.push(sql.replace("?", `$${params.length}`).replace("$SAME", `$${params.length}`));
   };
   if (opts.tenant) add("tenant_id = ?", opts.tenant);
-  if (opts.source) add("source = ?", opts.source);
+  // "github" (the source) or "github-repos" (the connector that pulled it) both work.
+  if (opts.source) add("(source = ? or connector_id = $SAME)", opts.source);
   if (opts.since) add("fetched_at >= ?::timestamptz", opts.since);
   if (opts.type && entity === "event") add("type = ?", opts.type);
   // Free-text search over every column of the row, attributes included (case-insensitive substring).
