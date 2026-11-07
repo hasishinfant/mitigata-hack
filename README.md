@@ -6,7 +6,7 @@ Mitigata CyberForge · Problem Statement 05
 
 [![IntegrateX demo video: click to play](docs/media/integratex-demo.jpg)](docs/media/integratex-demo.mp4)
 
-▶ **[Watch the 22-second demo](docs/media/integratex-demo.mp4)** · [Pitch deck](docs/IntegrateX.pptx)
+▶ **[Watch the 80-second demo](docs/media/integratex-demo.mp4)** · [Pitch deck](docs/IntegrateX.pptx)
 
 ---
 
